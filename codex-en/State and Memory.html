@@ -1,0 +1,311 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>State and Memory</title>
+<link rel="stylesheet" href="assets/codeindex.css">
+</head>
+<body>
+<p><a href="index.html">← Back to overview</a></p>
+<h1>State and Memory</h1>
+
+<p>This group of crates handles all read/write access to Codex's "persistent state" in the local process: session thread metadata, generated memories, global message history, and the parent-child derivation topology graph between agents. You can think of it as everything the Codex CLI leaves behind after a conversation and can reuse next time. Technically it is 4 SQLite databases + a set of JSONL files + a git-baseline workspace, implemented with Rust async + sqlx.</p>
+
+<p>Five crates are involved:</p>
+<ul>
+<li><b>codex-rs/state</b> — The core state runtime, StateRuntime, holding 4 SQLite connection pools (state/logs/goals/memories), providing read/write APIs for thread metadata, goals, memory tasks, backfill, and log persistence.</li>
+<li><b>codex-rs/memories</b> — Memory read path (read sub-crate: injection, reference resolution, usage statistics) and write path (write sub-crate: two-phase memory extraction pipeline phase1/phase2 at startup).</li>
+<li><b>codex-rs/message-history</b> — Append and trim the global message history file history.jsonl, safe for cross-process concurrency.</li>
+<li><b>codex-rs/thread-store</b> — Storage-neutral thread persistence abstraction, ThreadStore trait + local file/SQLite implementation LocalThreadStore, managing rollout JSONL writes and thread metadata sync.</li>
+<li><b>codex-rs/agent-graph-store</b> — Storage-neutral trait for thread derivation parent-child topology + local implementation, directly reusing StateRuntime's spawn edge table underneath.</li>
+</ul>
+
+<h2>What Users / the System Can Do</h2>
+<ul>
+<li>Start a new session → state writes the threads table + thread-store creates rollout JSONL + message-history appends user input</li>
+<li>Continuously append output during a session → thread-store append_items writes rollout, state.touch_thread_updated_at updates timestamp</li>
+<li>End / resume a session → thread-store load_history reads rollout, state reads thread metadata</li>
+<li>Run the memory pipeline automatically at startup → memories/write phase1 extracts raw memory from old rollouts, phase2 consolidates into MEMORY.md</li>
+<li>List / search historical threads → state.list_threads / thread-store.search_threads</li>
+<li>Archive / delete / unarchive threads → corresponding thread-store operations + state sync</li>
+<li>Agent spawns a child agent → agent-graph-store records parent-child edge, state.upsert_thread_spawn_edge</li>
+<li>Record usage and prune memories → state.memories.record_stage1_output_usage / prune_stage1_outputs_for_retention</li>
+<li>Persist tracing logs → state.log_db acts as a tracing Layer that writes logs DB in the background in batches</li>
+</ul>
+
+<h2>Data Flow Overview</h2>
+
+<pre class="mermaid">
+graph TD
+    A[User starts a session] --> B[thread-store creates rollout JSONL]
+    B --> C[state writes threads table metadata]
+    A --> D[message-history appends history.jsonl]
+
+    E[Session appends output] --> F[thread-store append_items writes rollout]
+    F --> G[state touch_thread_updated_at updates timestamp]
+    F --> H[state log_db writes logs DB in background batches]
+
+    I[Session ends / next startup] --> J[thread-store load_history reads rollout]
+    J --> K[state reads thread metadata to restore session]
+
+    L[Startup memory pipeline] --> M[phase1: extract raw memory from old rollouts]
+    M --> N[state.memories stage1_outputs table]
+    N --> O[phase2: consolidate into MEMORY.md file]
+    O --> P[memories workspace git-baseline diff]
+
+    Q[List / search threads] --> R[state.list_threads queries threads table]
+    Q --> S[thread-store.search_threads searches rollout]
+
+    T[Agent spawns child agent] --> U[agent-graph-store upserts parent-child edge]
+    U --> V[state threads_spawn_edges table]
+
+    W[tracing log events] --> X[log_db Layer enqueues]
+    X --> Y[background batch INSERT into logs DB]
+</pre>
+
+<h2>Key Flow 1: StateRuntime Initialization (Opening 4 SQLite Databases)</h2>
+
+<p>StateRuntime::init is the entry point for all upper-layer state access. It opens the state, logs, goals, and memories SQLite databases in a fixed order; any failure rolls back already-opened connection pools. Each database follows the same three steps: create_if_missing + WAL mode → connection pool (max 5 connections) → run migrations. After opening, it also: ensures backfill_state has an initial row, reads the maximum updated_at/recency_at timestamps from the threads table and caches them in AtomicI64 (subsequent hot paths read directly from memory), and runs a logs DB startup maintenance (pruning excess logs).</p>
+
+<pre class="mermaid">
+graph TD
+    A1[StateRuntime::init] --> A2[Open state DB]
+    A2 -->|Failure| A3[Return error]
+    A2 -->|Success| A4[Open logs DB]
+    A4 -->|Failure| A3
+    A4 -->|Success| A5[Open goals DB]
+    A5 -->|Failure| A3
+    A5 -->|Success| A6[Open memories DB]
+    A6 -->|Failure| A3
+    A6 -->|Success| A7[ensure backfill_state initial row]
+    A7 -->|Failure| A3
+    A7 -->|Success| A8[Cache max threads timestamp]
+    A8 -->|Failure| A3
+    A8 -->|Success| A9[Run logs startup maintenance]
+    A9 --> A10[Return Arc StateRuntime]
+</pre>
+
+<p>Communication boundary: the four databases each have independent connection pools; logs is split into its own database to reduce write-lock contention with the main state database (WAL + busy_timeout 5s). The recovery path (recovery.rs) recognizes SQLite corruption errors and supports rebuilding after backup.</p>
+
+<h2>Key Flow 2: Memory Two-Stage Pipeline (phase1 + phase2)</h2>
+
+<p>This is the most complex data flow in the whole scenario. start_memories_startup_task is called when the root session starts, skipping temporary sessions, sessions without the MemoryTool feature enabled, and child-agent sessions. After passing the gate, it spawns a tokio task that runs phase1 and phase2 sequentially.</p>
+
+<p><b>Phase 1 (Extraction)</b>: Claim expired threads' stage-1 tasks from state.memories (based on updated_at time window + memory_mode=enabled + excluding the current thread). After claiming tasks, it concurrently (up to 8) calls the model to compress rollout history into a raw_memory + rollout_summary, and writes the results back to the stage1_outputs table on success. Task scheduling uses SQLite INSERT...ON CONFLICT as an optimistic lock claim, with lease/retry/backoff to avoid duplicate work across processes.</p>
+
+<p><b>Phase 2 (Consolidation)</b>: First claim a globally unique lock (memory_consolidate_global job), then prepare_memory_workspace (create a git baseline for the memories directory), fetch the phase2 input selection from the DB, rebuild raw_memories.md and rollout_summaries/, generate a workspace diff file, then spawn an independent consolidation agent (via ThreadManager starting a new thread) for the model to read the diff + raw memories and edit MEMORY.md. After the agent completes, reset the baseline and mark the job as succeeded.</p>
+
+<pre class="mermaid">
+graph TD
+    B1[start_memories_startup_task] --> B2{Temporary / disabled / child-agent?}
+    B2 -->|Yes| B3[Return immediately]
+    B2 -->|No| B4[Create memories dir + seed extensions]
+    B4 --> B5[phase1.prune cleans expired memories]
+    B5 --> B6{rate_limits_ok?}
+    B6 -->|No| B7[Skip count skipped_rate_limit]
+    B6 -->|Yes| B8[phase1.run]
+    B8 --> B9[Claim startup stage1 tasks]
+    B9 --> B10{Candidates exist?}
+    B10 -->|No| B11[Count skipped_no_candidates]
+    B10 -->|Yes| B12[Run model extraction of raw_memory concurrently]
+    B12 --> B13[Write stage1_outputs table]
+    B13 --> B14[phase2.run]
+    B14 --> B15[Claim global phase2 lock]
+    B15 -->|Failure| B16[Count skip]
+    B15 -->|Success| B17[Prepare git baseline workspace]
+    B17 --> B18[Fetch phase2 input selection]
+    B18 --> B19[Rebuild raw_memories.md + rollout_summaries]
+    B19 --> B20[Generate workspace diff]
+    B20 --> B21[Spawn consolidation agent to edit MEMORY.md]
+    B21 --> B22{Agent succeeded?}
+    B22 -->|No| B23[Mark job failed]
+    B22 -->|Yes| B24[Reset baseline + mark succeeded]
+</pre>
+
+<p>State machine: stage1 job has running/done/failed states, with lease_until/retry_at/retry_remaining fields controlling retries. phase2 is a global singleton job (memory_consolidate_global, job_key='global'); after success there is a 6-hour cooldown (PHASE2_SUCCESS_COOLDOWN_SECONDS). memory_mode has enabled/polluted states; polluted means the thread is marked for re-extraction.</p>
+
+<h2>Key Flow 3: Thread Persistence (thread-store + state Collaboration)</h2>
+
+<p>The ThreadStore trait is the storage-neutral thread persistence boundary, defining operations such as create/resume/append/persist/flush/shutdown/discard/load_history/read/list/search/update_metadata/archive/unarchive/delete. LocalThreadStore is the local implementation: rollout JSONL files serve as the durable replay format (readable without SQLite), while the SQLite state DB provides a queryable metadata index.</p>
+
+<p>LiveThread is the handle for an active thread, holding Arc<dyn ThreadStore> + ThreadMetadataSync. ThreadMetadataSync derives metadata updates from canonical rollout items (cwd, preview, first_user_message, title, git info) and writes them back to state in batches according to a throttling interval (5s). LiveThreadInitGuard is used for rollback during session initialization: when dropped, it discards the live writer without forcing a flush.</p>
+
+<pre class="mermaid">
+graph TD
+    C1[LiveThread.create] --> C2[thread-store create_thread]
+    C2 --> C3[Create rollout JSONL file]
+    C2 --> C4[ThreadMetadataSync.for_create initial metadata]
+    C4 --> C5[state upsert_thread writes threads table]
+    C6[Session appends output] --> C7[thread-store append_items]
+    C7 --> C8[RolloutRecorder writes JSONL]
+    C7 --> C9[ThreadMetadataSync observes rollout item]
+    C9 --> C10{Throttle interval reached?}
+    C10 -->|No| C11[Hold patch]
+    C10 -->|Yes| C12[state update_thread_metadata]
+    C13[Session ends] --> C14[thread-store shutdown_thread]
+    C14 --> C15[Flush residual + close writer]
+    C16[Resume session] --> C17[thread-store load_history]
+    C17 --> C18[Read rollout JSONL to restore history]
+</pre>
+
+<p>Communication boundary: append_items only writes the rollout and does not infer metadata; metadata patches are explicitly issued by the upper layer via update_thread_metadata after observation. This keeps the storage implementation simple and leaves policy in the live layer.</p>
+
+<h2>Key Flow 4: Message History File (history.jsonl)</h2>
+
+<p>message-history is an independent, global, append-only JSONL file (~/.codex/history.jsonl), one line per {session_id, ts, text}. append_entry uses O_APPEND + a single write syscall for atomicity, plus an advisory file lock + retries (10 times, 100ms interval) to avoid cross-process interleaving from multiple TUI processes. After writing, it enforces_history_limit inside the lock: if the file exceeds max_bytes, old lines are dropped from the beginning and trimmed to the soft cap (80%) to avoid immediate re-trimming next time.</p>
+
+<pre class="mermaid">
+graph TD
+    D1[append_entry] --> D2{persistence=None?}
+    D2 -->|Yes| D3[Return immediately]
+    D2 -->|No| D4[Build JSON line + \n]
+    D4 --> D5[Open file O_APPEND 0o600]
+    D5 --> D6[spawn_blocking to acquire lock]
+    D6 --> D7{try_lock succeeded?}
+    D7 -->|WouldBlock| D8{Retry < 10?}
+    D8 -->|Yes| D9[Sleep 100ms return to D7]
+    D8 -->|No| D10[Error WouldBlock]
+    D7 -->|Success| D11[seek End + write_all]
+    D11 --> D12[enforce_history_limit trim]
+    D12 --> D13[Return Ok]
+</pre>
+
+<h2>Key Flow 5: Agent Spawn Topology (agent-graph-store)</h2>
+
+<p>The AgentGraphStore trait defines operations for thread derivation parent-child edges: upsert edge, update status, list direct children, BFS list all descendants. LocalAgentGraphStore directly delegates to StateRuntime's methods of the same name; underneath it is the state DB's threads_spawn_edges table. Each child thread has at most one incoming edge; list_descendants is sorted by depth-first then thread id for stable output, making it easy for the upper layer to merge live in-memory state with persistent state.</p>
+
+<h2>Key Flow 6: Tracing Log Persistence (log_db Layer)</h2>
+
+<p>The log_db module is a tracing_subscriber::Layer that captures tracing events, formats them into LogEntry, sends them through a bounded mpsc queue (capacity 512) to a background task, and INSERTs them into the logs DB in batches (128 entries/batch or 2s interval). This keeps the logging path off the business hot path. state also prunes logs per thread_id bucket (max 10MiB / 1000 lines per bucket) and runs maintenance once at startup.</p>
+
+<h2>Module Inventory</h2>
+
+<dl>
+<dt>state (StateRuntime)</dt>
+<dd>Unifies 4 SQLite databases + backfill + thread metadata + goals + memory task scheduling into a single runtime entry point. Input: codex_home path + provider; Output: Arc&lt;StateRuntime&gt;, readable/writable for all persistent state.</dd>
+<dt>state.log_db</dt>
+<dd>Turns the tracing event stream into batched rows in the logs DB. Input: tracing Event; Output: logs table INSERT.</dd>
+<dt>state.runtime.memories (MemoryStore)</dt>
+<dd>Turns memory extraction/consolidation task scheduling into state-machine mutations on the jobs and stage1_outputs tables. Input: thread updated_at timestamps; Output: task claim/success/failure state machine.</dd>
+<dt>memories/write</dt>
+<dd>Turns old rollout history into the MEMORY.md file. Input: rollout JSONL + model inference; Output: raw_memories.md, rollout_summaries/, and MEMORY.md under the memories/ directory.</dd>
+<dt>memories/read</dt>
+<dd>Turns agent reads of memory files into usage statistics + reference resolution. Input: bash command string / model output citation; Output: MemoriesUsageKind tag + MemoryCitation struct.</dd>
+<dt>thread-store</dt>
+<dd>Turns the session lifecycle (create/append/flush/shutdown/resume) into rollout JSONL files + threads table metadata. Input: CreateThreadParams/RolloutItem; Output: persisted rollout + StoredThread metadata.</dd>
+<dt>message-history</dt>
+<dd>Turns a user input text into one line of history.jsonl. Input: text + conversation_id; Output: appended to the global JSONL file.</dd>
+<dt>agent-graph-store</dt>
+<dd>Turns agent derivation relationships into parent-child edges in the threads_spawn_edges table. Input: parent/child ThreadId + status; Output: persisted topology edge.</dd>
+</dl>
+
+<h2>Notes</h2>
+<ul>
+<li>The four SQLite database filenames are fixed: state_5.sqlite / logs_2.sqlite / goals_1.sqlite / memories_1.sqlite, located under codex_home. The CODEX_SQLITE_HOME environment variable can override the home directory.</li>
+<li>All databases use WAL + synchronous=Normal + busy_timeout=5s + incremental auto-vacuum, balancing performance and crash safety.</li>
+<li>stage1 task claim uses a single INSERT...ON CONFLICT...WHERE SQL statement as an optimistic lock, avoiding application-level locks and remaining cross-process safe.</li>
+<li>The memory workspace uses a git baseline repository for diffs, so the phase2 agent can see signals of "which memories were deleted".</li>
+<li>ThreadMetadataSync throttling (5s) avoids hitting SQLite on every append, reducing write amplification.</li>
+<li>history.jsonl uses O_APPEND + single write + advisory lock; POSIX guarantees atomic writes up to PIPE_BUF bytes, making it cross-process safe.</li>
+<li>LocalThreadStore's rollout JSONL is a compatibility layer readable without SQLite; SQLite is only an acceleration index for queries, preserving SQLite-less repair capability by design.</li>
+</ul>
+
+<script>window.__sourceMap = {
+  "A": {"file":"codex-rs/thread-store/src/local/create_thread.rs","startLine":1,"endLine":45},
+  "B": {"file":"codex-rs/thread-store/src/local/create_thread.rs","startLine":1,"endLine":45},
+  "C": {"file":"codex-rs/state/src/runtime/threads.rs","startLine":493,"endLine":498},
+  "D": {"file":"codex-rs/message-history/src/lib.rs","startLine":98,"endLine":183},
+  "E": {"file":"codex-rs/thread-store/src/local/live_writer.rs","startLine":1,"endLine":206},
+  "F": {"file":"codex-rs/thread-store/src/local/live_writer.rs","startLine":1,"endLine":206},
+  "G": {"file":"codex-rs/state/src/runtime/threads.rs","startLine":615,"endLine":630},
+  "H": {"file":"codex-rs/state/src/log_db.rs","startLine":1,"endLine":60},
+  "I": {"file":"codex-rs/thread-store/src/local/read_thread.rs","startLine":1,"endLine":1323},
+  "J": {"file":"codex-rs/thread-store/src/local/read_thread.rs","startLine":1,"endLine":1323},
+  "K": {"file":"codex-rs/state/src/runtime/threads.rs","startLine":8,"endLine":48},
+  "L": {"file":"codex-rs/memories/write/src/start.rs","startLine":22,"endLine":79},
+  "M": {"file":"codex-rs/memories/write/src/phase1.rs","startLine":70,"endLine":108},
+  "N": {"file":"codex-rs/state/src/runtime/memories.rs","startLine":148,"endLine":200},
+  "O": {"file":"codex-rs/memories/write/src/phase2.rs","startLine":46,"endLine":100},
+  "P": {"file":"codex-rs/memories/write/src/workspace.rs","startLine":13,"endLine":46},
+  "Q": {"file":"codex-rs/state/src/runtime/threads.rs","startLine":399,"endLine":452},
+  "R": {"file":"codex-rs/state/src/runtime/threads.rs","startLine":399,"endLine":452},
+  "S": {"file":"codex-rs/thread-store/src/local/search_threads.rs","startLine":1,"endLine":232},
+  "T": {"file":"codex-rs/agent-graph-store/src/store.rs","startLine":15,"endLine":53},
+  "U": {"file":"codex-rs/agent-graph-store/src/local.rs","startLine":31,"endLine":80},
+  "V": {"file":"codex-rs/state/src/runtime/threads.rs","startLine":80,"endLine":106},
+  "W": {"file":"codex-rs/state/src/log_db.rs","startLine":1,"endLine":60},
+  "X": {"file":"codex-rs/state/src/log_db.rs","startLine":1,"endLine":60},
+  "Y": {"file":"codex-rs/state/src/runtime/logs.rs","startLine":6,"endLine":11},
+  "A1": {"file":"codex-rs/state/src/runtime.rs","startLine":172,"endLine":179},
+  "A2": {"file":"codex-rs/state/src/runtime.rs","startLine":200,"endLine":210},
+  "A3": {"file":"codex-rs/state/src/runtime.rs","startLine":206,"endLine":209},
+  "A4": {"file":"codex-rs/state/src/runtime.rs","startLine":211,"endLine":219},
+  "A5": {"file":"codex-rs/state/src/runtime.rs","startLine":220,"endLine":228},
+  "A6": {"file":"codex-rs/state/src/runtime.rs","startLine":229,"endLine":245},
+  "A7": {"file":"codex-rs/state/src/runtime.rs","startLine":247,"endLine":264},
+  "A8": {"file":"codex-rs/state/src/runtime.rs","startLine":265,"endLine":295},
+  "A9": {"file":"codex-rs/state/src/runtime.rs","startLine":306,"endLine":311},
+  "A10": {"file":"codex-rs/state/src/runtime.rs","startLine":296,"endLine":313},
+  "B1": {"file":"codex-rs/memories/write/src/start.rs","startLine":22,"endLine":29},
+  "B2": {"file":"codex-rs/memories/write/src/start.rs","startLine":30,"endLine":35},
+  "B3": {"file":"codex-rs/memories/write/src/start.rs","startLine":34,"endLine":35},
+  "B4": {"file":"codex-rs/memories/write/src/start.rs","startLine":51,"endLine":59},
+  "B5": {"file":"codex-rs/memories/write/src/phase1.rs","startLine":111,"endLine":120},
+  "B6": {"file":"codex-rs/memories/write/src/guard.rs","startLine":9,"endLine":13},
+  "B7": {"file":"codex-rs/memories/write/src/guard.rs","startLine":39,"endLine":44},
+  "B8": {"file":"codex-rs/memories/write/src/phase1.rs","startLine":70,"endLine":78},
+  "B9": {"file":"codex-rs/state/src/runtime/memories.rs","startLine":148,"endLine":200},
+  "B10": {"file":"codex-rs/state/src/runtime/memories.rs","startLine":148,"endLine":200},
+  "B11": {"file":"codex-rs/memories/write/src/phase1.rs","startLine":79,"endLine":86},
+  "B12": {"file":"codex-rs/memories/write/src/phase1.rs","startLine":88,"endLine":95},
+  "B13": {"file":"codex-rs/state/src/runtime/memories.rs","startLine":823,"endLine":904},
+  "B14": {"file":"codex-rs/memories/write/src/phase2.rs","startLine":46,"endLine":57},
+  "B15": {"file":"codex-rs/state/src/runtime/memories.rs","startLine":1041,"endLine":1178},
+  "B16": {"file":"codex-rs/state/src/runtime/memories.rs","startLine":1041,"endLine":1178},
+  "B17": {"file":"codex-rs/memories/write/src/workspace.rs","startLine":13,"endLine":20},
+  "B18": {"file":"codex-rs/state/src/runtime/memories.rs","startLine":427,"endLine":584},
+  "B19": {"file":"codex-rs/memories/write/src/storage.rs","startLine":13,"endLine":42},
+  "B20": {"file":"codex-rs/memories/write/src/workspace.rs","startLine":26,"endLine":37},
+  "B21": {"file":"codex-rs/memories/write/src/runtime.rs","startLine":292,"endLine":340},
+  "B22": {"file":"codex-rs/memories/write/src/phase2.rs","startLine":46,"endLine":100},
+  "B23": {"file":"codex-rs/state/src/runtime/memories.rs","startLine":1270,"endLine":1311},
+  "B24": {"file":"codex-rs/state/src/runtime/memories.rs","startLine":1214,"endLine":1270},
+  "C1": {"file":"codex-rs/thread-store/src/live_thread.rs","startLine":87,"endLine":90},
+  "C2": {"file":"codex-rs/thread-store/src/local/create_thread.rs","startLine":1,"endLine":45},
+  "C3": {"file":"codex-rs/thread-store/src/local/live_writer.rs","startLine":1,"endLine":206},
+  "C4": {"file":"codex-rs/thread-store/src/thread_metadata_sync.rs","startLine":52,"endLine":90},
+  "C5": {"file":"codex-rs/state/src/runtime/threads.rs","startLine":493,"endLine":498},
+  "C6": {"file":"codex-rs/thread-store/src/live_thread.rs","startLine":87,"endLine":90},
+  "C7": {"file":"codex-rs/thread-store/src/local/live_writer.rs","startLine":1,"endLine":206},
+  "C8": {"file":"codex-rs/thread-store/src/local/live_writer.rs","startLine":1,"endLine":206},
+  "C9": {"file":"codex-rs/thread-store/src/thread_metadata_sync.rs","startLine":51,"endLine":90},
+  "C10": {"file":"codex-rs/thread-store/src/thread_metadata_sync.rs","startLine":51,"endLine":90},
+  "C11": {"file":"codex-rs/thread-store/src/thread_metadata_sync.rs","startLine":51,"endLine":90},
+  "C12": {"file":"codex-rs/state/src/runtime/threads.rs","startLine":717,"endLine":870},
+  "C13": {"file":"codex-rs/thread-store/src/live_thread.rs","startLine":87,"endLine":90},
+  "C14": {"file":"codex-rs/thread-store/src/live_thread.rs","startLine":87,"endLine":90},
+  "C15": {"file":"codex-rs/thread-store/src/local/live_writer.rs","startLine":1,"endLine":206},
+  "C16": {"file":"codex-rs/thread-store/src/live_thread.rs","startLine":87,"endLine":90},
+  "C17": {"file":"codex-rs/thread-store/src/local/read_thread.rs","startLine":1,"endLine":1323},
+  "C18": {"file":"codex-rs/thread-store/src/local/read_thread.rs","startLine":1,"endLine":1323},
+  "D1": {"file":"codex-rs/message-history/src/lib.rs","startLine":98,"endLine":112},
+  "D2": {"file":"codex-rs/message-history/src/lib.rs","startLine":103,"endLine":111},
+  "D3": {"file":"codex-rs/message-history/src/lib.rs","startLine":107,"endLine":111},
+  "D4": {"file":"codex-rs/message-history/src/lib.rs","startLine":121,"endLine":135},
+  "D5": {"file":"codex-rs/message-history/src/lib.rs","startLine":137,"endLine":149},
+  "D6": {"file":"codex-rs/message-history/src/lib.rs","startLine":153,"endLine":180},
+  "D7": {"file":"codex-rs/message-history/src/lib.rs","startLine":156,"endLine":167},
+  "D8": {"file":"codex-rs/message-history/src/lib.rs","startLine":156,"endLine":173},
+  "D9": {"file":"codex-rs/message-history/src/lib.rs","startLine":168,"endLine":169},
+  "D10": {"file":"codex-rs/message-history/src/lib.rs","startLine":175,"endLine":179},
+  "D11": {"file":"codex-rs/message-history/src/lib.rs","startLine":160,"endLine":165},
+  "D12": {"file":"codex-rs/message-history/src/lib.rs","startLine":189,"endLine":240},
+  "D13": {"file":"codex-rs/message-history/src/lib.rs","startLine":180,"endLine":183}
+}</script>
+
+<aside id="source-panel"><div id="source-header"></div><div id="monaco-container"></div></aside>
+<script src="assets/codeindex-runtime.js"></script>
+<script src="assets/codeindex.js"></script>
+</body>
+</html>

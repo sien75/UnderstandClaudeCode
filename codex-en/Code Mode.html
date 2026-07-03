@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Code Mode (code-mode)</title>
+<link rel="stylesheet" href="assets/codeindex.css">
+</head>
+<body>
+<p><a href="index.html">← Back to overview</a></p>
+<h1>Code Mode (code-mode)</h1>
+
+<p>Code mode gives the model a "code-writing sub-brain." In normal chat the model can only call one tool at a time (shell, file read, MCP…), wait for the result, and then decide the next step. In code mode the model instead calls a tool named <code>exec</code> and drops a piece of JavaScript source into it. The JS runs in an isolated V8 sandbox where a global <code>tools</code> object is mounted—the same tools the model already has access to. So the model can loop, branch, assemble, call multiple tools in parallel, store intermediate variables, and finish the job like a script, then feed the accumulated text/image output back to the model.</p>
+
+<p>From the user's perspective, code mode requires no extra button presses in the IDE/editor. It is transparent to the user—an "enhanced tool-calling" capability for the model. When the model decides "this needs several tools combined with logical branches," it calls <code>exec</code> to write a JS snippet. The script may finish quickly (returning the result in one go) or run for a while—in which case <code>exec</code> first "yields" some intermediate output, and the model then calls the <code>wait</code> tool to keep pulling subsequent output until the script ends. What the user sees is the model working and reporting progress; under the hood it is JS orchestrating everything.</p>
+
+<p>This capability is implemented by three collaborating crates (this module covers only the data flow inside these three crates):</p>
+<ul>
+<li><strong>code-mode-protocol</strong> (protocol layer): defines cross-boundary data types and traits—<code>ExecuteRequest</code>/<code>WaitRequest</code>, <code>RuntimeResponse</code>, <code>CodeModeSession</code>/<code>CodeModeSessionProvider</code>/<code>CodeModeSessionDelegate</code> traits, plus tool-description generation (<code>build_exec_tool_description</code> renders enabled_tools into JS declarations for the model). Pure data/contracts, no runtime logic.</li>
+<li><strong>code-mode</strong> (core implementation): <code>CodeModeService</code> implements <code>CodeModeSession</code> and manages the cell lifecycle (one exec call = one cell). Internally <code>CellActor</code> is a tokio async actor that orchestrates between the "V8 thread" and "host callbacks"; the <code>runtime</code> submodule runs a V8 isolate on a dedicated OS thread, installs global functions, executes JS modules, and passes tool calls made from JS back to the actor over a channel.</li>
+<li><strong>code-mode-host</strong> (host binary): currently just an empty <code>main.rs</code> (<code>fn main(){}</code>). It is a placeholder for a future "remote host process"—the protocol comments on <code>CodeModeSessionProvider</code> say implementations can share a remote host across processes. The provider actually used today is <code>InProcessCodeModeSessionProvider</code> (in the code-mode crate), meaning cells run inside the Codex process itself.</li>
+</ul>
+
+<p>Boundary note (these files are outside this module's scope, but data flows through them): the Codex main process (<code>core</code> crate) <code>tools/code_mode/execute_handler.rs</code> is the entry point for the <code>exec</code> tool. It calls <code>parse_exec_source</code> to parse the source, constructs an <code>ExecuteRequest</code>, and calls <code>CodeModeSession::execute</code>; <code>tools/code_mode/wait_handler.rs</code> handles the <code>wait</code> tool; <code>tools/code_mode/delegate.rs</code>'s <code>CodeModeDispatchBroker</code> implements <code>CodeModeSessionDelegate</code> and dispatches nested tool calls (<code>invoke_tool</code>) from the code-mode runtime to real Codex tools (shell, MCP, file reads, etc.). In other words: <code>tools.foo()</code> inside the JS sandbox → runtime <code>RuntimeEvent::ToolCall</code> → cell actor → <code>ServiceCellHost::invoke_tool</code> → <code>delegate.invoke_tool</code> → real core tool → result returns the same way → <code>resolve_tool_response</code> stuffs the result back into the JS Promise. This is the core communication boundary of code mode.</p>
+
+<h2>Data flow: one exec call from entry to exit</h2>
+
+<p>The diagram below shows how JS source enters the sandbox, how tool calls inside the sandbox reach the host, how output yielding and final termination work, and the error/termination paths. Node labels are in plain English; source locations are in the sourceMap at the end of the page.</p>
+
+<pre class="mermaid">
+graph TD
+    A["Model calls exec tool and passes JS source"] --> B{"parse_exec_source parses the first-line pragma"}
+    B -->|"pragma invalid/empty"| B1["Return error to model, flow ends"]
+    B -->|"success or no pragma"| C["Assemble ExecuteRequest (source + tool table + yield_time)"]
+    C --> D["CodeModeService::execute allocates cell_id"]
+    D --> E["start_cell: create CellActor and register in cells table"]
+    E -->|"already shutting_down or duplicate cell_id"| E1["Return error to model"]
+    E -->|"normal"| F["CellActor::prepare: create channel + spawn V8 thread"]
+    F --> G["spawn_runtime: initialize V8 platform + create isolate"]
+    G -->|"ICU/V8 init failed"| G1["send_result emits error result, runtime ends"]
+    G -->|"success"| H["install_globals: install tools/text/image/store/load/notify/setTimeout/exit/yield_control"]
+    H --> I["evaluate_main_module: compile and execute JS module"]
+    I -->|"compile/instantiation throws"| G1
+    I -->|"JS finishes synchronously or exit()"| X["RuntimeResponse::Result returns final result"]
+    I -->|"JS returns a Promise (async)"| J{"JS is running: what is it doing?"}
+    J -->|"calling tools.xxx"| K["tool_callback: create PromiseResolver, emit ToolCall event"]
+    K --> L["CellActor receives ToolCall → spawn_tool"]
+    L --> M["ServiceCellHost::invoke_tool → delegate.invoke_tool back to core to run real tool"]
+    M --> N["Tool result returns as RuntimeCommand::ToolResponse/ToolError"]
+    N --> O["resolve_tool_response: resolve/reject JS Promise"]
+    O --> J
+    J -->|"calling text/image/notify"| P["Emit ContentItem/Notify event, actor accumulates output"]
+    J -->|"calling yield_control or yield timeout"| Q["CellEvent::Yielded: hand accumulated output to model"]
+    P --> Q
+    Q --> R["RuntimeResponse::Yielded returned for this exec call"]
+    R --> S{"Script still running?"}
+    S -->|"yes, model calls wait(cell_id)"| T["CodeModeService::wait → CellHandle::observe"]
+    T --> Q
+    S -->|"no, script ended naturally"| V["RuntimeEvent::Result: commit stored_value_writes + error_text"]
+    V --> W["CellEvent::Completed"]
+    W --> X
+    X --> Y["host.closed: remove from cells table + delegate.cell_closed notifies host to clean up"]
+    S -->|"model asks to terminate wait(terminate)/shutdown"| Z["begin_termination: cancel token + isolate.terminate_execution"]
+    Z --> AA["V8 forcibly interrupts, unfinished callbacks are cleaned up"]
+    AA --> BB["CellEvent::Terminated"]
+    BB --> CC["RuntimeResponse::Terminated returned"]
+    CC --> Y
+    S -->|"wait called but cell no longer exists"| DD["WaitOutcome::MissingCell: return not-found result"]
+    S -->|"runtime thread exits unexpectedly"| V2["Completed with error text 'runtime ended unexpectedly'"]
+    V2 --> Y
+    DD --> Y
+</pre>
+
+<h2>Module breakdown (one sentence each)</h2>
+
+<dl>
+<dt>code-mode-protocol / description.rs</dt>
+<dd>Turns the "tool table the model can use" into the "exec tool description + TS declarations shown to the model." Input: enabled_defs of tools; Output: an assembled tool-description string (containing <code>declare const tools: {...}</code>). Also responsible for <code>parse_exec_source</code> parsing the first-line <code>// @exec: {...}</code> pragma, and for rendering JSON Schema into TypeScript types so the model understands tool input/output shapes.</dd>
+<dt>code-mode-protocol / session.rs + runtime.rs + response.rs</dt>
+<dd>Defines cross-boundary contract types. Inputs/outputs are business semantics: <code>ExecuteRequest</code> = a request to "run this JS"; <code>RuntimeResponse::Yielded/Terminated/Result</code> = runtime yielded/terminated/final result; <code>CodeModeSession</code> trait = a session that can execute/wait/terminate/shutdown; <code>CodeModeSessionDelegate</code> trait = the host must provide invoke_tool/notify/cell_closed callbacks.</dd>
+<dt>code-mode / service.rs (CodeModeService)</dt>
+<dd>Turns external requests into cell lifecycle management. Input: ExecuteRequest/WaitRequest; Output: StartedCell/WaitOutcome. Maintains stored_values (cross-cell shared key-value store, used by JS store/load), the cells table (cell_id → CellHandle), and the shutting_down flag. ServiceCellHost is the CellHost trait implementation that bridges cell-actor callbacks to CodeModeSessionDelegate.</dd>
+<dt>code-mode / cell_actor (CellActor + run_cell)</dt>
+<dd>The "director" of one exec call. Input: CellRequest + host; Output: CellHandle + CellEvent stream. It is a tokio select loop watching four sources: the command channel (observe/terminate), yield timeouts, runtime events (Started/Pending/ContentItem/YieldRequested/ToolCall/Notify/Result), and background tasks (notification/tool JoinSet). It decides when to flush accumulated output to the observer based on ObserveMode: YieldAfter = flush when timed out, PendingFrontier = flush when the runtime pauses at the pending frontier. This is the state-machine core of the whole chain.</dd>
+<dt>code-mode / runtime (mod.rs + globals + callbacks + module_loader + timers + value)</dt>
+<dd>Runs a V8 isolate on a dedicated OS thread to execute JS. Input: JS source + tool table + stored_values; Output: RuntimeEvent stream. globals installs global functions (removes dangerous globals like console/Atomics/WebAssembly); callbacks are the V8 callbacks for each global (tool/text/image/store/load/notify/setTimeout/yield_control/exit); module_loader compiles ES modules, checks Promise completion, and resolves tool Promises; timers implements setTimeout on a separate thread; value handles V8↔JSON serialization and image-output normalization (rejects remote http(s) images, only accepts data: URIs).</dd>
+<dt>code-mode-host / main.rs</dt>
+<dd>Placeholder empty main, reserved for a future remote host process.</dd>
+</dl>
+
+<h2>Key state machines and boundary annotations</h2>
+
+<ul>
+<li><strong>Cell lifecycle state machine</strong> (cell_actor/mod.rs run_cell): a cell progresses through Running (an observer is waiting) → either Yielded (waiting for the next wait after yielding) → ... → Completed/Terminated. Only one observer may exist at a time (a second observe returns Busy); terminate has the highest priority and cancels the token + terminate_execution to forcibly tear down V8. completed_event is buffered; if no observer is present it is stored and delivered directly to the next observer.</li>
+<li><strong>Runtime pause mode</strong> (runtime/mod.rs next_runtime_command): in PauseUntilResumed mode, when JS reaches pending (no result and no tool call outstanding) it emits RuntimeEvent::Pending and blocks waiting for a control command—Continue = proceed to the next RuntimeCommand, Resume = keep spinning for new events, Terminate = force exit. This is used for the "model wants to see where JS is" PendingFrontier observation mode.</li>
+<li><strong>Communication boundary 1: V8 thread ↔ cell actor</strong> (runtime/mod.rs): uses std::mpsc (RuntimeCommand/RuntimeControlCommand in, V8 thread receives) and tokio mpsc (RuntimeEvent out, actor receives). The V8 thread is a synchronous blocking thread; the actor is a tokio task; the two are decoupled by channels.</li>
+<li><strong>Communication boundary 2: cell actor ↔ CodeModeService</strong> (cell_actor/types.rs CellHandle): CellHandle holds an mpsc::UnboundedSender&lt;CellCommand&gt;; observe/terminate/shutdown all send commands to the actor, and the actor returns CellEvents via oneshot.</li>
+<li><strong>Communication boundary 3: code-mode ↔ core host</strong> (service.rs ServiceCellHost + protocol CodeModeSessionDelegate): every tools.foo() call inside JS eventually reaches delegate.invoke_tool; the delegate is implemented in core (CodeModeDispatchBroker) and dispatches the call to the real tool executor, with results returning the same way. This is the only bridge between "JS inside the sandbox" and "real system capabilities."</li>
+<li><strong>Security boundary</strong> (runtime/globals.rs + value.rs): removes console/Atomics/SharedArrayBuffer/WebAssembly globals; rejects remote image URLs (only data: URIs accepted); dynamic import throws "Unsupported import"; store only accepts JSON-serializable values. The sandbox has no Node, no fs, no network.</li>
+</ul>
+
+<script>
+window.__sourceMap = {
+  "A": {"file":"codex-rs/code-mode-protocol/src/lib.rs","startLine":44,"endLine":46},
+  "B": {"file":"codex-rs/code-mode-protocol/src/description.rs","startLine":163,"endLine":245},
+  "B1": {"file":"codex-rs/code-mode-protocol/src/description.rs","startLine":163,"endLine":168},
+  "C": {"file":"codex-rs/code-mode-protocol/src/runtime.rs","startLine":16,"endLine":22},
+  "D": {"file":"codex-rs/code-mode/src/service.rs","startLine":130,"endLine":151},
+  "E": {"file":"codex-rs/code-mode/src/service.rs","startLine":166,"endLine":194},
+  "E1": {"file":"codex-rs/code-mode/src/service.rs","startLine":178,"endLine":183},
+  "F": {"file":"codex-rs/code-mode/src/cell_actor/mod.rs","startLine":46,"endLine":88},
+  "G": {"file":"codex-rs/code-mode/src/runtime/mod.rs","startLine":68,"endLine":115},
+  "G1": {"file":"codex-rs/code-mode/src/runtime/mod.rs","startLine":147,"endLine":161},
+  "H": {"file":"codex-rs/code-mode/src/runtime/globals.rs","startLine":14,"endLine":47},
+  "I": {"file":"codex-rs/code-mode/src/runtime/module_loader.rs","startLine":9,"endLine":52},
+  "J": {"file":"codex-rs/code-mode/src/runtime/mod.rs","startLine":224,"endLine":272},
+  "K": {"file":"codex-rs/code-mode/src/runtime/callbacks.rs","startLine":13,"endLine":72},
+  "L": {"file":"codex-rs/code-mode/src/cell_actor/callbacks.rs","startLine":31,"endLine":46},
+  "M": {"file":"codex-rs/code-mode/src/service.rs","startLine":318,"endLine":342},
+  "N": {"file":"codex-rs/code-mode/src/runtime/mod.rs","startLine":229,"endLine":244},
+  "O": {"file":"codex-rs/code-mode/src/runtime/module_loader.rs","startLine":66,"endLine":101},
+  "P": {"file":"codex-rs/code-mode/src/runtime/callbacks.rs","startLine":74,"endLine":97},
+  "Q": {"file":"codex-rs/code-mode/src/cell_actor/mod.rs","startLine":220,"endLine":227},
+  "R": {"file":"codex-rs/code-mode/src/service.rs","startLine":422,"endLine":444},
+  "S": {"file":"codex-rs/code-mode-protocol/src/runtime.rs","startLine":65,"endLine":80},
+  "T": {"file":"codex-rs/code-mode-protocol/src/runtime.rs","startLine":25,"endLine":28},
+  "U": {"file":"codex-rs/code-mode/src/service.rs","startLine":196,"endLine":218},
+  "V": {"file":"codex-rs/code-mode/src/runtime/mod.rs","startLine":342,"endLine":379},
+  "W": {"file":"codex-rs/code-mode/src/cell_actor/mod.rs","startLine":361,"endLine":378},
+  "X": {"file":"codex-rs/code-mode/src/service.rs","startLine":428,"endLine":435},
+  "Y": {"file":"codex-rs/code-mode/src/service.rs","startLine":364,"endLine":367},
+  "Z": {"file":"codex-rs/code-mode/src/service.rs","startLine":220,"endLine":226},
+  "AA": {"file":"codex-rs/code-mode/src/cell_actor/mod.rs","startLine":462,"endLine":472},
+  "BB": {"file":"codex-rs/code-mode/src/cell_actor/mod.rs","startLine":352,"endLine":359},
+  "CC": {"file":"codex-rs/code-mode/src/service.rs","startLine":436,"endLine":439},
+  "DD": {"file":"codex-rs/code-mode/src/service.rs","startLine":477,"endLine":479},
+  "V2": {"file":"codex-rs/code-mode/src/cell_actor/mod.rs","startLine":253,"endLine":272}
+}
+</script>
+
+<aside id="source-panel"><div id="source-header"></div><div id="monaco-container"></div></aside>
+<script src="assets/codeindex-runtime.js"></script>
+<script src="assets/codeindex.js"></script>
+</body>
+</html>

@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Model Turn and Tool Execution</title>
+<link rel="stylesheet" href="assets/codeindex.css">
+</head>
+<body>
+<p><a href="index.html">← Back to overview</a></p>
+<h1>Model Turns and Tool Execution</h1>
+
+<p>When a user initiates a request from the TUI, exec, app-server, or SDK, it ultimately enters the same core pipeline: the request is first turned into a submission with an ID, the session loop receives it in order, creates the TurnContext for this turn, writes the user input, attached context, skill and plugin prompts into history, and then initiates streaming sampling to the model. If the model only replies with text, the turn ends; if the model requests to call a tool, the system first executes the tool according to current permissions and the tool registry, appends the tool output back to the model input, and continues to the next round of sampling until the model explicitly ends or there is no pending input.</p>
+
+<dl>
+  <dt>Input</dt>
+  <dd>User messages, attached context, thread settings, permission configuration, current workspace, and available tools</dd>
+  <dt>Output</dt>
+  <dd>A client-facing event stream: reasoning/text deltas, tool start and completion, token usage, diff, final assistant message or error</dd>
+</dl>
+
+<pre class="mermaid">
+graph TD
+  external-client["External entry point submits user request"] --> enqueue-submission["Wrapped into submission with ID"]
+  enqueue-submission --> session-loop["Session loop dispatches Op in order"]
+  session-loop --> create-turn["Creates TurnContext for this turn"]
+  create-turn --> steer-or-start["Decides whether to append to active turn or start new task"]
+  steer-or-start --> record-input["Records user input and attached context"]
+  record-input --> inject-skills["Injects skills, plugins, and extended context"]
+  inject-skills --> build-history["Builds model input from history"]
+  build-history --> build-tools["Exposes tools according to this turn's config"]
+  build-tools --> stream-model["Initiates streaming sampling to model"]
+  stream-model --> handle-text["Text/reasoning deltas converted to client events"]
+  stream-model --> handle-tool["Model tool call enters ToolRouter"]
+  handle-tool --> dispatch-tool["Executes tool according to registry and permissions"]
+  dispatch-tool --> tool-output["Tool output written back to model input"]
+  tool-output --> build-history
+  stream-model --> complete-response["response.completed summarizes usage and whether to continue"]
+  complete-response --> need-follow-up["Checks for remaining tools, pending input, or compression continuation"]
+  need-follow-up --> build-history
+  need-follow-up --> finish-turn["Runs stop hook and ends turn when no follow-up work"]
+  finish-turn --> emit-final["Emits final events, tokens, and diff"]
+</pre>
+
+<ul>
+  <li>The Codex facade only exposes queue interfaces for submitting and receiving events; concrete behavior is dispatched by the background session loop after consuming an Op.</li>
+  <li>TurnContext is the source of truth for a turn, containing the model, permissions, sandbox, environment, skills, dynamic tools, output schema, and telemetry.</li>
+  <li>Tools are not executed directly by the model; model output is first parsed into ToolCall, then ToolRouter finds the corresponding executor from the registry.</li>
+  <li>A turn may loop multiple times: tool output, automatic compression, stop hook continuation, or mid-turn user input all cause the system to rebuild model input and continue sampling.</li>
+</ul>
+
+<script>
+window.__sourceMap = {
+  "external-client": {
+    "file": "codex-rs/core/src/codex_thread.rs",
+    "startLine": 150,
+    "endLine": 320
+  },
+  "enqueue-submission": {
+    "file": "codex-rs/core/src/session/mod.rs",
+    "startLine": 687,
+    "endLine": 742
+  },
+  "session-loop": {
+    "file": "codex-rs/core/src/session/handlers.rs",
+    "startLine": 698,
+    "endLine": 830
+  },
+  "create-turn": {
+    "file": "codex-rs/core/src/session/handlers.rs",
+    "startLine": 189,
+    "endLine": 227
+  },
+  "steer-or-start": {
+    "file": "codex-rs/core/src/session/handlers.rs",
+    "startLine": 228,
+    "endLine": 286
+  },
+  "record-input": {
+    "file": "codex-rs/core/src/session/turn.rs",
+    "startLine": 140,
+    "endLine": 214
+  },
+  "inject-skills": {
+    "file": "codex-rs/core/src/session/turn.rs",
+    "startLine": 430,
+    "endLine": 632
+  },
+  "build-history": {
+    "file": "codex-rs/core/src/session/turn.rs",
+    "startLine": 215,
+    "endLine": 244
+  },
+  "build-tools": {
+    "file": "codex-rs/core/src/session/turn.rs",
+    "startLine": 1018,
+    "endLine": 1091
+  },
+  "stream-model": {
+    "file": "codex-rs/core/src/session/turn.rs",
+    "startLine": 1842,
+    "endLine": 1926
+  },
+  "handle-text": {
+    "file": "codex-rs/core/src/session/turn.rs",
+    "startLine": 2060,
+    "endLine": 2223
+  },
+  "handle-tool": {
+    "file": "codex-rs/core/src/session/turn.rs",
+    "startLine": 1927,
+    "endLine": 2058
+  },
+  "dispatch-tool": {
+    "file": "codex-rs/core/src/tools/router.rs",
+    "startLine": 74,
+    "endLine": 189
+  },
+  "tool-output": {
+    "file": "codex-rs/core/src/session/turn.rs",
+    "startLine": 2036,
+    "endLine": 2050
+  },
+  "complete-response": {
+    "file": "codex-rs/core/src/session/turn.rs",
+    "startLine": 2140,
+    "endLine": 2186
+  },
+  "need-follow-up": {
+    "file": "codex-rs/core/src/session/turn.rs",
+    "startLine": 245,
+    "endLine": 326
+  },
+  "finish-turn": {
+    "file": "codex-rs/core/src/session/turn.rs",
+    "startLine": 327,
+    "endLine": 360
+  },
+  "emit-final": {
+    "file": "codex-rs/core/src/session/turn.rs",
+    "startLine": 2305,
+    "endLine": 2348
+  }
+};
+</script>
+
+<aside id="source-panel"><div id="source-header"></div><div id="monaco-container"></div></aside>
+<script src="assets/codeindex-runtime.js"></script>
+<script src="assets/codeindex.js"></script>
+</body>
+</html>

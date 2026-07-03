@@ -1,0 +1,226 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Configuration Loading and Management</title>
+<link rel="stylesheet" href="assets/codeindex.css">
+</head>
+<body>
+<p><a href="index.html">← Back to overview</a></p>
+<h1>Configuration Loading and Management</h1>
+
+<p>Codex configuration is not governed by a single file, but by a <strong>layered stack</strong>: from the bottom-layer MDM system policy, to system-level config.toml, to enterprise cloud-distributed policy packages, to user personal config, to project-local config, and finally to command-line temporary overrides—each layer is stacked on top by priority, with higher-priority layers overriding lower-priority ones. This mechanism must ensure administrators can enforce constraints (for example, "sandbox must be read-only") while leaving enough customization space for users and projects. In addition, there is a parallel "cloud configuration" path: pulling enterprise-managed configuration packages from the ChatGPT backend, with local caching and background refresh.</p>
+
+<h2>User Perspective: Where Configuration Comes From and What Overrides What</h2>
+
+<p>When a user runs <code>codex</code>, configuration is stacked from lowest to highest priority as follows (numbers from <code>ConfigLayerSource::precedence()</code>):</p>
+
+<dl>
+<dt>MDM managed preferences (precedence 0)</dt>
+<dd>Preferences pushed by device-management tools on macOS, lowest priority. Read-only constraints.</dd>
+<dt>System config.toml (precedence 10)</dt>
+<dd>On Unix this is <code>/etc/codex/config.toml</code>; on Windows it is <code>%ProgramData%\OpenAI\Codex\config.toml</code>. Administrator-level local machine configuration.</dd>
+<dt>Enterprise cloud-managed configuration (precedence 15)</dt>
+<dd>Enterprise-managed configuration fragments pulled from the ChatGPT backend, containing both config and requirements parts.</dd>
+<dt>User config.toml (precedence 20/21)</dt>
+<dd><code>$CODEX_HOME/config.toml</code> (default <code>~/.codex/config.toml</code>). The main battlefield for daily user configuration. If <code>--profile &lt;name&gt;</code> selects profile-v2, an additional layer <code>&lt;name&gt;.config.toml</code> is stacked on top (precedence 21).</dd>
+<dt>Project .codex/config.toml (precedence 25)</dt>
+<dd>From cwd upward to the project root, every directory containing <code>.codex/</code> counts as a layer. However, project configuration is <strong>trust-checked</strong>: projects not marked as trusted in user config have their project layers disabled (recorded but not effective). Project config also has a denylist: sensitive fields such as openai_base_url, model_provider, notify, etc. are stripped, preventing projects from secretly changing user credential destinations.</dd>
+<dt>Command-line --config override (precedence 30)</dt>
+<dd>Temporary overrides passed via <code>-c key=value</code> or <code>--config key=value</code>, effective only for this session, represented by the SessionFlags layer.</dd>
+<dt>legacy managed_config.toml (precedence 40/50)</dt>
+<dd>The old <code>managed_config.toml</code> mechanism is now reinterpreted as requirements constraints, but as a config layer it is also "best-effort" stacked on top. Being phased out.</dd>
+</dl>
+
+<p>Besides config layers, there is a parallel <strong>requirements (constraints) chain</strong>: system requirements.toml + cloud requirements + legacy managed_config + macOS MDM. These combine into <code>ConfigRequirements</code>, which is not "overridden" but applied as hard constraints at the end—for example, if an administrator requires the sandbox to be read-only, a user-configured workspace-write is rejected.</p>
+
+<p>Command-line parameters such as <code>--model</code>, <code>--sandbox-mode</code>, <code>--approval-policy</code> take another path: <strong>ConfigOverrides (harness overrides)</strong>. They do not enter the config-layer stack, but directly override the corresponding fields when the final Config object is assembled, and are subject to mutual-exclusion validation (for example, sandbox_mode and permission_profile cannot both be given).</p>
+
+<h2>System Internals: Main Configuration Loading Flow</h2>
+
+<p>The entry point is <code>ConfigBuilder::build()</code>. It collects all inputs, calls <code>load_config_layers_state()</code> to stack the layers, then calls <code>Config::load_config_with_layer_stack()</code> to parse the stacked TOML into a runtime <code>Config</code> object and apply constraints and overrides.</p>
+
+<pre class="mermaid">
+graph TD
+    A["User starts codex with CLI args/env/config.toml"] --> B["ConfigBuilder collects all inputs · core/config/mod.rs:1152-1210"]
+    B --> C["load_config_layers_state · config/loader/mod.rs:116-421"]
+    C --> R1{"ignore_managed_requirements?"}
+    R1 -->|no| RQ["Load requirements layers · system/cloud/legacy/MDM · loader/mod.rs:140-191"]
+    R1 -->|yes| RQSKIP["Skip managed requirements · loader/mod.rs:173-175"]
+    RQ --> RCOMP["compose_requirements combines constraints · loader/mod.rs:191"]
+    RQSKIP --> RCOMP
+    C --> CL["Load config layers (in priority order) · loader/mod.rs:202-409"]
+    CL --> CL_SYS["system config.toml layer · loader/mod.rs:223-238"]
+    CL --> CL_CLOUD["cloud enterprise-managed layer · loader/mod.rs:239"]
+    CL --> CL_USER["user config.toml + profile layer · loader/mod.rs:244-289"]
+    CL_USER --> CL_USER_ERR{"legacy profile conflict?"}
+    CL_USER_ERR -->|yes| CL_USER_FAIL["Return error: cannot use --profile while also having legacy profile · loader/mod.rs:265-274"]
+    CL_USER_ERR -->|no| CL_PROJ
+    CL --> CL_PROJ{"has cwd?"}
+    CL_PROJ -->|yes| CL_MERGE["First merge existing layers to compute project_root · loader/mod.rs:293-299"]
+    CL_MERGE --> CL_TRUST["Project trust decision · loader/mod.rs:314-339"]
+    CL_TRUST --> CL_PROJLAY["Load project layer cwd→root · effective if trusted, disabled if not · loader/mod.rs:340-350"]
+    CL_PROJ -->|no| CL_CLI
+    CL_PROJLAY --> CL_CLI["Append CLI --config override layer · SessionFlags · loader/mod.rs:354-359"]
+    CL_CLI --> CL_THREAD["Insert thread config layer by priority · loader/mod.rs:361-363"]
+    CL_THREAD --> CL_LEGACY["Append legacy managed_config layer · loader/mod.rs:370-409"]
+    CL_LEGACY --> STACK["ConfigLayerStack assembly complete · state.rs:240-270"]
+    RCOMP --> STACK
+    STACK --> EFF["effective_config merges all layers · state.rs:483-492"]
+    EFF --> EFFMERGE["merge_toml_values stacks layer by layer · merge.rs:7-35"]
+    EFFMERGE --> DES["Deserialize into ConfigToml · core/config/mod.rs:1257-1274"]
+    DES --> DESERR{"Parse failed?"}
+    DESERR -->|yes| DESERRFX["first_layer_config_error locates error · core/config/mod.rs:1260-1272"]
+    DESERR -->|no| LOCK{"Has config lockfile?"}
+    DESERRFX --> FAIL1["Return IO error"]
+    LOCK -->|yes| LOCKLOAD["Read lockfile, replace with lock layer · core/config/mod.rs:1279-1310"]
+    LOCK -->|no| BUILD
+    LOCKLOAD --> BUILD
+    DES --> BUILD["load_config_with_layer_stack · core/config/mod.rs:2668-2790"]
+    BUILD --> REQAPPLY["Apply ConfigRequirements constraints · core/config/mod.rs:2688-2707"]
+    REQAPPLY --> OVRAPPLY["Apply ConfigOverrides · --model/--sandbox-mode etc. · core/config/mod.rs:2715-2740"]
+    OVRAPPLY --> OVRCHK{"Mutual-exclusion check · sandbox_mode vs permission_profile"}
+    OVRCHK -->|conflict| FAIL2["Return InvalidInput error · core/config/mod.rs:2750-2767"]
+    OVRCHK -->|pass| CFG["Final Config object · consumed everywhere"]
+</pre>
+
+<h2>Cloud Configuration Path (Independent Sub-Flow)</h2>
+
+<p>Acquisition of the cloud configuration package (<code>CloudConfigBundle</code>) is an independent "startup fetch + cache + background refresh" path, initiated by <code>cloud_config_bundle_loader()</code> at startup. The result is stored as a <code>CloudConfigBundleLoader</code> (a shared Future) inside <code>ConfigLoadOptions</code>, which the main flow awaits once in <code>load_config_layers_state</code> to obtain it.</p>
+
+<pre class="mermaid">
+graph TD
+    CA["Startup: cloud_config_bundle_loader · cloud-config/bundle_loader.rs:21-53"] --> CB["CloudConfigBundleService · cloud-config/service.rs:74-112"]
+    CB --> CST["load_startup_bundle_with_timeout · 15s timeout · service.rs:114-169"]
+    CST --> CAUTH{"Has auth and is enterprise/education? · service.rs:47-54"}
+    CAUTH -->|no| CNONE["Return None (no cloud config)"]
+    CAUTH -->|yes| CCACHE["Check local cache · cloud-config-bundle-cache.json · service.rs:196-225"]
+    CCACHE --> CCACHECHK{"Cache hit and · HMAC signature+identity+TTL valid?"}
+    CCACHECHK -->|yes| CUSE["Use cached bundle · service.rs:217"]
+    CCACHECHK -->|no| CFETCH["Fetch from ChatGPT backend · BackendBundleClient.get_bundle · backend.rs:58-88"]
+    CFETCH --> CFETCHRES{"Result"}
+    CFETCHRES -->|OK| CVALID["validate_bundle · validation.rs:8-34"]
+    CFETCHRES -->|Retryable error| CRETRY["Backoff retry (max 5) · service.rs:343-363"]
+    CRETRY --> CFETCH
+    CFETCHRES -->|401 unauthorized| CREC["Auth recovery: refresh token · service.rs:365-455"]
+    CREC -->|Recovery succeeded| CFETCH
+    CREC -->|Permanent failure| CFAIL["CloudConfigBundleLoadError::Auth"]
+    CVALID -->|invalid| CFAIL2["InvalidBundle error"]
+    CVALID -->|valid| CSAVE["Write cache (HMAC signature) · service.rs:320-330"]
+    CSAVE --> CBUNDLE["Return CloudConfigBundle"]
+    CUSE --> CBUNDLE
+    CBUNDLE --> CLAYERS["CloudConfigBundleLayers::from_bundle · config/cloud_config_bundle.rs:76-136"]
+    CLAYERS --> CSPLIT["Split into config layer + requirements layer"]
+    CSPLIT --> CCFG["enterprise_managed_config · → insert into main config layer (precedence 15)"]
+    CSPLIT --> CREQ["enterprise_managed_requirements · → insert into main requirements chain"]
+    CB --> CREFRESH["Background refresh every 15 minutes · service.rs:457-496 · does not affect already-snapshotted runtime config"]
+</pre>
+
+<h2>Key Concepts Explained</h2>
+
+<dl>
+<dt>ConfigLayerStack (configuration layer stack)</dt>
+<dd>The list of all config layers ordered from lowest to highest priority, plus requirements constraints and startup warnings. It is the intermediate product of configuration loading and can be serialized to show the user "where this configuration came from."</dd>
+<dt>effective_config (effective configuration)</dd>
+<dd>The merged TOML after stacking all non-disabled layers in the stack with <code>merge_toml_values</code>. During merging, key aliases are normalized (e.g., legacy codex field name mappings) and network domains are normalized.</dd>
+<dt>ConfigRequirements (configuration requirements)</ddt>
+<dd>Hard constraints forcibly imposed by administrators; they are not overridden but validated: allowed_sandbox_modes, allowed_approval_policies, allowed_approvals_reviewers, network/filesystem constraints, mcp_server identity constraints, etc. Applied in <code>load_config_with_layer_stack</code>; user-configured values not in the allowed list are rejected.</dd>
+<dt>ConfigOverrides (harness overrides)</dt>
+<dd>Command-line parameters (--model, --sandbox-mode, --approval-policy, --permission-profile, etc.) and harness internal overrides (cwd, codex_self_exe, etc.). They do not enter the TOML layer stack but directly override fields when the Config object is assembled, with mutual-exclusion validation.</dd>
+<dt>Project trust (TrustLevel)</dt>
+<dd>Project-local configuration (.codex/config.toml, hooks, exec policy) is not effective by default; it only becomes effective after the project path is marked <code>trust = "trusted"</code> in the user config.toml <code>[projects]</code> section. This is a security mechanism to prevent cloned malicious repositories from automatically executing dangerous operations via their configuration.</dd>
+<dt>strict_config (strict validation)</dt>
+<dd>When enabled, serde_ignored + serde_path_to_error detect all unrecognized fields in TOML; unknown keys cause errors rather than being silently ignored. CLI overrides are also validated the same way.</dd>
+<dt>CloudConfigBundleLoader</dt>
+<dd>A wrapper around a shared Future, turning the time-consuming "fetch cloud config package at startup" operation into a lazy + multi-awaitable operation. The main flow calls <code>.get().await</code> once in <code>load_config_layers_state</code> to obtain the result.</dd>
+</dl>
+
+<h2>Module in One Sentence</h2>
+
+<dl>
+<dt>codex-rs/config</dt>
+<dd>Turns multi-source TOML (files/CLI/cloud/MDM) into a stacked ConfigLayerStack + ConfigRequirements—the "merger + validator" of configuration.</dd>
+<dt>codex-rs/cloud-config</dt>
+<dd>Turns the enterprise-managed configuration package from the ChatGPT backend into an HMAC-signed cached CloudConfigBundle—the "cloud transport + cache layer" of configuration.</dd>
+<dt>codex-rs/core/src/config</dt>
+<dd>Parses + constrains + overrides the ConfigLayerStack into a runtime Config object, and manages configuration consumption for editing/permissions/network proxy/etc.—the "final assembly + consumption" of configuration.</dd>
+</dl>
+
+<p><strong>Input:</strong> CLI arguments, environment variables, config.toml files (system/user/project), cloud config packages, MDM preferences.<br/>
+<strong>Output:</strong> A globally effective <code>Config</code> object consumed by the agent runtime, permission system, MCP, hooks, and all other subsystems; plus a <code>ConfigLayerStack</code> for displaying provenance and editing user configuration.</p>
+
+<p><strong>Notes:</strong></p>
+<ul>
+<li>Project configuration has a denylist (PROJECT_LOCAL_CONFIG_DENYLIST): sensitive fields such as openai_base_url, model_provider, notify, otel are stripped, preventing the project layer from secretly changing credential destinations or notification behavior.</li>
+<li>Legacy managed_config.toml is simultaneously interpreted as a requirements layer (hard constraint) and a config layer (best-effort override), existing on dual tracks and being phased out.</li>
+<li>Cloud configuration cache has a 1-hour TTL, HMAC signature, and user_id+account_id-based auth; corruption is fail-closed (treated as a miss and refetched). Background refresh only updates the cache file, not the already-loaded runtime config (snapshotted once at startup).</li>
+<li>Config lockfile mechanism: if the user configures <code>[debug.config_lockfile]</code>, a replacement configuration layer is loaded from the lockfile path, used to lock a reproducible configuration snapshot.</li>
+<li>profile-v2 mechanism: <code>--profile foo</code> loads <code>foo.config.toml</code> as a second user layer on top of the base user config; it only needs to contain overrides. If the base config still has old-style <code>profile = "foo"</code> or <code>[profiles.foo]</code>, an error is returned requesting migration.</li>
+</ul>
+
+<script>window.__sourceMap = {
+  "A": {"file": "codex-rs/core/src/config/mod.rs", "startLine": 1152, "endLine": 1210},
+  "B": {"file": "codex-rs/core/src/config/mod.rs", "startLine": 1212, "endLine": 1250},
+  "C": {"file": "codex-rs/config/src/loader/mod.rs", "startLine": 116, "endLine": 421},
+  "R1": {"file": "codex-rs/config/src/loader/mod.rs", "startLine": 140, "endLine": 175},
+  "RQ": {"file": "codex-rs/config/src/loader/mod.rs", "startLine": 140, "endLine": 191},
+  "RQSKIP": {"file": "codex-rs/config/src/loader/mod.rs", "startLine": 173, "endLine": 175},
+  "RCOMP": {"file": "codex-rs/config/src/loader/mod.rs", "startLine": 191, "endLine": 191},
+  "CL": {"file": "codex-rs/config/src/loader/mod.rs", "startLine": 202, "endLine": 409},
+  "CL_SYS": {"file": "codex-rs/config/src/loader/mod.rs", "startLine": 223, "endLine": 238},
+  "CL_CLOUD": {"file": "codex-rs/config/src/loader/mod.rs", "startLine": 239, "endLine": 239},
+  "CL_USER": {"file": "codex-rs/config/src/loader/mod.rs", "startLine": 244, "endLine": 289},
+  "CL_USER_ERR": {"file": "codex-rs/config/src/loader/mod.rs", "startLine": 254, "endLine": 275},
+  "CL_USER_FAIL": {"file": "codex-rs/config/src/loader/mod.rs", "startLine": 265, "endLine": 274},
+  "CL_PROJ": {"file": "codex-rs/config/src/loader/mod.rs", "startLine": 291, "endLine": 292},
+  "CL_MERGE": {"file": "codex-rs/config/src/loader/mod.rs", "startLine": 293, "endLine": 299},
+  "CL_TRUST": {"file": "codex-rs/config/src/loader/mod.rs", "startLine": 314, "endLine": 339},
+  "CL_PROJLAY": {"file": "codex-rs/config/src/loader/mod.rs", "startLine": 340, "endLine": 350},
+  "CL_CLI": {"file": "codex-rs/config/src/loader/mod.rs", "startLine": 354, "endLine": 359},
+  "CL_THREAD": {"file": "codex-rs/config/src/loader/mod.rs", "startLine": 361, "endLine": 363},
+  "CL_LEGACY": {"file": "codex-rs/config/src/loader/mod.rs", "startLine": 370, "endLine": 409},
+  "STACK": {"file": "codex-rs/config/src/state.rs", "startLine": 240, "endLine": 287},
+  "EFF": {"file": "codex-rs/config/src/state.rs", "startLine": 483, "endLine": 492},
+  "EFFMERGE": {"file": "codex-rs/config/src/merge.rs", "startLine": 7, "endLine": 35},
+  "DES": {"file": "codex-rs/core/src/config/mod.rs", "startLine": 1257, "endLine": 1274},
+  "DESERR": {"file": "codex-rs/core/src/config/mod.rs", "startLine": 1259, "endLine": 1260},
+  "DESERRFX": {"file": "codex-rs/core/src/config/mod.rs", "startLine": 1260, "endLine": 1272},
+  "FAIL1": {"file": "codex-rs/core/src/config/mod.rs", "startLine": 1266, "endLine": 1272},
+  "LOCK": {"file": "codex-rs/core/src/config/mod.rs", "startLine": 1279, "endLine": 1280},
+  "LOCKLOAD": {"file": "codex-rs/core/src/config/mod.rs", "startLine": 1288, "endLine": 1310},
+  "BUILD": {"file": "codex-rs/core/src/config/mod.rs", "startLine": 1311, "endLine": 1318},
+  "REQAPPLY": {"file": "codex-rs/core/src/config/mod.rs", "startLine": 2688, "endLine": 2707},
+  "OVRAPPLY": {"file": "codex-rs/core/src/config/mod.rs", "startLine": 2715, "endLine": 2740},
+  "OVRCHK": {"file": "codex-rs/core/src/config/mod.rs", "startLine": 2750, "endLine": 2767},
+  "FAIL2": {"file": "codex-rs/core/src/config/mod.rs", "startLine": 2750, "endLine": 2767},
+  "CFG": {"file": "codex-rs/core/src/config/mod.rs", "startLine": 2674, "endLine": 2674},
+  "CA": {"file": "codex-rs/cloud-config/src/bundle_loader.rs", "startLine": 21, "endLine": 53},
+  "CB": {"file": "codex-rs/cloud-config/src/service.rs", "startLine": 74, "endLine": 112},
+  "CST": {"file": "codex-rs/cloud-config/src/service.rs", "startLine": 114, "endLine": 169},
+  "CAUTH": {"file": "codex-rs/cloud-config/src/service.rs", "startLine": 47, "endLine": 54},
+  "CNONE": {"file": "codex-rs/cloud-config/src/service.rs", "startLine": 174, "endLine": 179},
+  "CCACHE": {"file": "codex-rs/cloud-config/src/service.rs", "startLine": 196, "endLine": 225},
+  "CCACHECHK": {"file": "codex-rs/cloud-config/src/cache.rs", "startLine": 49, "endLine": 90},
+  "CUSE": {"file": "codex-rs/cloud-config/src/service.rs", "startLine": 217, "endLine": 217},
+  "CFETCH": {"file": "codex-rs/cloud-config/src/backend.rs", "startLine": 58, "endLine": 88},
+  "CFETCHRES": {"file": "codex-rs/cloud-config/src/service.rs", "startLine": 237, "endLine": 237},
+  "CVALID": {"file": "codex-rs/cloud-config/src/validation.rs", "startLine": 8, "endLine": 34},
+  "CRETRY": {"file": "codex-rs/cloud-config/src/service.rs", "startLine": 343, "endLine": 363},
+  "CREC": {"file": "codex-rs/cloud-config/src/service.rs", "startLine": 365, "endLine": 455},
+  "CFAIL": {"file": "codex-rs/cloud-config/src/service.rs", "startLine": 416, "endLine": 421},
+  "CFAIL2": {"file": "codex-rs/cloud-config/src/validation.rs", "startLine": 25, "endLine": 31},
+  "CSAVE": {"file": "codex-rs/cloud-config/src/service.rs", "startLine": 320, "endLine": 330},
+  "CBUNDLE": {"file": "codex-rs/cloud-config/src/backend.rs", "startLine": 90, "endLine": 118},
+  "CLAYERS": {"file": "codex-rs/config/src/cloud_config_bundle.rs", "startLine": 76, "endLine": 136},
+  "CSPLIT": {"file": "codex-rs/config/src/cloud_config_bundle.rs", "startLine": 109, "endLine": 135},
+  "CCFG": {"file": "codex-rs/config/src/loader/mod.rs", "startLine": 239, "endLine": 239},
+  "CREQ": {"file": "codex-rs/config/src/loader/mod.rs", "startLine": 152, "endLine": 152},
+  "CREFRESH": {"file": "codex-rs/cloud-config/src/service.rs", "startLine": 457, "endLine": 496}
+};</script>
+
+<aside id="source-panel"><div id="source-header"></div><div id="monaco-container"></div></aside>
+<script src="assets/codeindex-runtime.js"></script>
+<script src="assets/codeindex.js"></script>
+</body>
+</html>

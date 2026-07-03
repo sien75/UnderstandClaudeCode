@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sandbox and Command Execution Isolation</title>
+<link rel="stylesheet" href="assets/codeindex.css">
+</head>
+<body>
+<p><a href="index.html">← Back to overview</a></p>
+<h1>Sandbox and Command Execution Isolation</h1>
+
+<p>Codex needs to run model-generated commands and modify files on the user's machine. This code is responsible for three things: <strong>wrapping commands in a sandbox</strong> (restricting which directories they can read/write and whether they can access the network), <strong>deciding whether a command should be allowed automatically</strong> (policy engine + dangerous-command heuristics), and <strong>using a separate server to actually execute commands and file operations</strong> (exec-server, either local or remote). Overall goal: when the model says "run <code>rm -rf /</code>", the system can block it; when the model says "run <code>npm test</code>", the system can run it safely in a restricted environment.</p>
+
+<p>Trigger timing: the model produces a shell command or file-edit action during a turn → codex-core first uses execpolicy / shell-command to make a policy decision (allow / prompt / forbidden) → after user approval → SandboxManager converts the command + permission profile into platform-native sandbox launch parameters → exec-server receives a SandboxExecRequest, spawns a process or reads/writes files inside the sandbox → the output stream is returned to codex-core.</p>
+
+<h2>Core Data Flow: From Model Command to Sandbox Execution</h2>
+
+<p>The diagram below shows a complete command execution chain, from codex-core receiving the model command to exec-server spawning a process in the sandbox and returning output. Cross-platform branches (macOS seatbelt / Linux bwrap+seccomp / Windows restricted token) are shown as diamond decisions.</p>
+
+<pre class="mermaid">
+graph TD
+    cmd-in["codex-core receives the model-generated command"] --> parse-cmd
+    parse-cmd["shell-command: parse shell script/PowerShell into token list"] --> safety-check
+    safety-check{"command_safety: known-safe command or dangerous command?"}
+    safety-check -->|"known safe"| policy-check
+    safety-check -->|"suspicious/dangerous"| deny-or-prompt
+    safety-check -->|"cannot determine"| policy-check
+    deny-or-prompt["mark as forbidden/prompt, hand off to approval flow"] --> flow-end-deny
+    flow-end-deny[("flow ends: denied or awaiting approval")]
+    policy-check{"execpolicy: Starlark rules match command prefix"}
+    policy-check -->|"Allow"| sandbox-prep
+    policy-check -->|"Prompt"| ask-user
+    policy-check -->|"Forbidden"| flow-end-deny
+    ask-user["request user approval"] --> sandbox-prep
+    sandbox-prep["SandboxManager.transform: command + PermissionProfile converted to SandboxExecRequest"] --> plat-decide
+    plat-decide{"current platform?"}
+    plat-decide -->|"macOS"| seatbelt-gen
+    plat-decide -->|"Linux"| linux-sandbox-gen
+    plat-decide -->|"Windows"| win-sandbox-gen
+    plat-decide -->|"no sandbox needed"| exec-req
+    seatbelt-gen["seatbelt.rs: generate .sbpl policy + sandbox-exec wrapper"] --> exec-req
+    linux-sandbox-gen["landlock.rs: generate codex-linux-sandbox arguments"] --> bwrap-or-legacy
+    bwrap-or-legacy{"linux_run_main: use bubblewrap or legacy landlock?"}
+    bwrap-or-legacy -->|"default bwrap"| bwrap-stage
+    bwrap-stage["bwrap creates isolated mount namespace, then re-enters helper to add seccomp"] --> linux-exec-inner
+    bwrap-or-legacy -->|"legacy landlock"| landlock-direct
+    landlock-direct["apply_permission_profile: no_new_privs + seccomp + landlock FS"] --> linux-exec-inner
+    linux-exec-inner["execvp the actual user command"] --> exec-req
+    win-sandbox-gen["Windows restricted token: de-elevated token + ACL + WFP network filtering"] --> exec-req
+    exec-req["SandboxExecRequest sent to exec-server"] --> exec-server-spawn
+    exec-server-spawn["local_process.rs: spawn process and start output stream forwarding"] --> output-stream
+    output-stream["stdout/stderr/exit streams returned to client via JSON-RPC notifications"] --> flow-end-done
+    flow-end-done[("flow ends: output returned to codex-core")]
+</pre>
+
+<h2>File System Sandbox Execution Flow (inside exec-server)</h2>
+
+<p>exec-server doesn't just run commands; it also performs file reads and writes on behalf of the model. File operations also go through the sandbox, but the mechanism is different: it uses the codex binary itself as a helper, restarts itself in <code>codex-fs-helper</code> mode, applies the sandbox, and then exchanges JSON requests over stdin/stdout. Below is the data flow for the file system sandbox.</p>
+
+<pre class="mermaid">
+graph TD
+    fs-req["client sends fs/readFile / fs/writeFile etc. JSON-RPC"] --> fs-handler
+    fs-handler{"server/file_system_handler: platform sandbox needed?"}
+    fs-handler -->|"yes"| sandboxed-fs
+    fs-handler -->|"no, read locally directly"| local-fs
+    local-fs["local_file_system.rs: direct std::fs operations"] --> fs-resp
+    sandboxed-fs["sandboxed_file_system.rs: wrap request as FsHelperRequest"] --> fs-sandbox-runner
+    fs-sandbox-runner["fs_sandbox.rs: take PermissionProfile + cwd and call SandboxManager.transform"] --> fs-spawn-helper
+    fs-spawn-helper["spawn codex itself as helper, apply seatbelt/bwrap/win-token"] --> fs-stdin
+    fs-stdin["write FsHelperRequest JSON into helper stdin"] --> fs-helper-main
+    fs-helper-main["fs_helper_main.rs: helper process entrypoint, read stdin, perform file operations, write JSON back"] --> fs-resp
+    fs-resp["FsHelperPayload result returned to client"] --> flow-fs-end
+    flow-fs-end[("file operation complete")]
+</pre>
+
+<h2>Command Policy Decision State Machine (execpolicy)</h2>
+
+<p>execpolicy is a Starlark DSL engine. Users write rules like <code>prefix_rule(pattern=["git","commit"], decision="allow")</code>. Policy.check() feeds the command token list to the rules, and matched prefix rules produce a Decision (Allow / Prompt / Forbidden). When multiple rules match, the strictest one is chosen (Forbidden beats Prompt beats Allow). If no rule matches, a heuristic fallback is used (provided by shell-command's safety checks).</p>
+
+<pre class="mermaid">
+graph TD
+    cmd-tokens["command token list, e.g. git commit -m"] --> exact-match
+    exact-match{"look up rules_by_program by first token"}
+    exact-match -->|"match"| prefix-match
+    exact-match -->|"no match"| host-exe-match
+    host-exe-match{"first token is an absolute path? look up host_executables"}
+    host-exe-match -->|"matched basename rule"| prefix-match
+    host-exe-match -->|"no match"| heuristic
+    prefix-match{"PrefixPattern.matches_prefix: match token by token"}
+    prefix-match -->|"match"| collect-decision
+    prefix-match -->|"no match"| heuristic
+    heuristic["shell-command: is_known_safe / command_might_be_dangerous"] --> collect-decision
+    collect-decision["take the maximum Decision from all matched rules"] --> eval-out
+    eval-out[("Evaluation: decision + matchedRules")]
+</pre>
+
+<h2>Module Inventory</h2>
+
+<dl>
+<dt>sandboxing (cross-platform sandbox manager)</dt>
+<dd>Turns the "command the model wants to run + permission profile" into "platform-native sandbox launch parameters". Input: SandboxCommand + PermissionProfile; output: SandboxExecRequest. macOS uses seatbelt (sandbox-exec + .sbpl policy), Linux uses codex-linux-sandbox (bwrap + seccomp), Windows uses restricted token. Also handles details such as merging additional permissions, MITM CA readable roots, and proxy network policies.</dd>
+<dt>linux-sandbox (Linux sandbox helper)</dt>
+<dd>Implementation of the codex-linux-sandbox binary. run_main parses CLI arguments (--permission-profile JSON, --sandbox-policy-cwd, etc.). By default it uses bubblewrap to create a mount namespace + file system view, then re-enters itself to add seccomp + no_new_privs, and finally execvp the user command. legacy landlock is an alternative path. Also includes proxy_routing (builds a proxy bridge in netns) and bwrap argument construction (bwrap.rs, 2708 lines).</dd>
+<dt>windows-sandbox-rs (Windows sandbox)</dt>
+<dd>Restricted-token sandbox for Windows. Implemented with de-elevated token + ACL (allow/deny read/write) + WFP network filtering + ConPTY + desktop isolation. Includes setup (create sandbox user, firewall rules), spawn_prep (command preparation), and unified_exec (unified execution backend: elevated / legacy). About 17k lines; the largest cross-platform difference.</dd>
+<dt>execpolicy (command policy engine)</dt>
+<dd>Starlark DSL parser + prefix rule matcher. Users define policies with prefix_rule / network_rule / host_executable; Policy.check() performs prefix matching on commands and produces Allow/Prompt/Forbidden. The amend module supports appending rules at runtime (with file locking and deduplication). parser.rs uses the starlark library to execute the DSL.</dd>
+<dt>execpolicy-legacy (legacy command policy)</dt>
+<dd>Predecessor to execpolicy, based on custom policy files + execv_checker for command validation. Kept for backward compatibility with old configurations.</dd>
+<dt>shell-command (command parsing and safety checks)</dt>
+<dd>Parses shell scripts (bash -lc) / PowerShell commands into token lists (ParsedCommand). The command_safety module uses heuristics to determine whether a command is "known safe" (is_known_safe_command, whitelist) or "potentially dangerous" (command_might_be_dangerous, blacklist + rm -rf detection). Used as a fallback when execpolicy does not match any rule.</dd>
+<dt>shell-escalation (Unix exec interception)</dt>
+<dd>Intercepts child-process exec() calls via a patched shell (execve_wrapper) and sends EscalateRequest (file/argv/env) to escalate_server. The server decides Run (execute directly), Escalate (re-run with elevated privileges or different sandbox config), or Deny based on policy. Used for secondary approval when a command running inside the sandbox tries to invoke an external program.</dd>
+<dt>exec-server (command/file execution server)</dt>
+<dd>Standalone JSON-RPC server responsible for actual process launching and file operations. protocol.rs defines all methods (process/start, process/read, fs/readFile, etc.). The server module (processor → handler → registry) routes requests; local_process.rs spawns processes with pty/pipe and streams output back; fs_sandbox.rs wraps file operations in a sandbox (restarts codex itself as a helper); client.rs is the client implementation. Supports both local (stdio) and remote (WebSocket + Noise encrypted relay) modes.</dd>
+<dt>bwrap (bundled bubblewrap)</dt>
+<dd>Bundled bubblewrap binary entrypoint; used on Linux when the system has no bwrap installed.</dd>
+<dt>process-hardening (process hardening)</dt>
+<dd>Hardening executed during the pre-main phase (ctor): disable core dumps (setrlimit RLIMIT_CORE=0), disable ptrace attach (Linux prctl PR_SET_DUMPABLE=0 / macOS PT_DENY_ATTACH), and clear dangerous environment variables such as LD_PRELOAD / DYLD_*. Prevents processes from being debugged or hijacked via library injection.</dd>
+</dl>
+
+<h2>Key Boundaries and Communication</h2>
+
+<ul>
+<li><strong>codex-core and exec-server</strong>: JSON-RPC over stdio (local) or WebSocket + Noise (remote). First initialize handshake, then initialized notification, then process/* and fs/* methods. Process output is streamed back via process/output notifications; process exit sends process/exited + process/closed.</li>
+<li><strong>SandboxManager and platform sandbox</strong>: transform() is a pure function that converts the permission profile into argv. macOS prepends /usr/bin/sandbox-exec -p policy to argv; Linux prepends codex-linux-sandbox --permission-profile json; Windows does not modify argv, relying instead on token/ACL settings at spawn time.</li>
+<li><strong>exec-server and sandbox helper</strong>: fs_sandbox uses codex itself as the helper; after spawning it writes FsHelperRequest JSON via stdin, and the helper writes FsHelperResponse JSON to stdout when done. Environment variables are whitelisted (PATH/TMPDIR) to prevent secret leakage into the sandbox.</li>
+<li><strong>shell-escalation client and server</strong>: Unix socket (FD passed via the CODEX_ESCALATE_SOCKET environment variable). The client sends EscalateRequest, and the server replies with EscalateAction (Run / Escalate / Deny). The patched shell's execve_wrapper intercepts exec() to trigger this communication.</li>
+</ul>
+
+<h2>Cross-Platform Differences</h2>
+
+<ul>
+<li><strong>macOS</strong>: relies on sandbox-exec (seatbelt) to execute .sbpl policy files. seatbelt.rs translates PermissionProfile into readable/writable roots (subpath rules) + network (localhost ports / unix sockets) + glob deny. Only trusts /usr/bin/sandbox-exec to prevent PATH injection.</li>
+<li><strong>Linux</strong>: defaults to bubblewrap (creates namespace) + seccomp (limits syscalls). landlock is a legacy fallback (supports full-disk readable + restricted writes, but not read-only restrictions). WSL1 does not support bwrap (no user namespace) and will error. Proxy mode builds a bridge in netns, allowing connections only to the proxy port.</li>
+<li><strong>Windows</strong>: uses de-elevated token + ACL (path-level read/write allow/deny) + WFP (Windows Filtering Platform) for network filtering. Requires setup beforehand to create sandbox users and firewall rules. Supports ConPTY and desktop isolation.</li>
+</ul>
+
+<script>window.__sourceMap = {
+  "cmd-in": {"file": "codex-rs/sandboxing/src/manager.rs", "startLine": 226, "endLine": 229},
+  "parse-cmd": {"file": "codex-rs/shell-command/src/parse_command.rs", "startLine": 30, "endLine": 30},
+  "safety-check": {"file": "codex-rs/shell-command/src/command_safety/is_dangerous_command.rs", "startLine": 7, "endLine": 29},
+  "deny-or-prompt": {"file": "codex-rs/shell-command/src/command_safety/is_safe_command.rs", "startLine": 12, "endLine": 54},
+  "flow-end-deny": {"file": "codex-rs/execpolicy/src/decision.rs", "startLine": 9, "endLine": 16},
+  "policy-check": {"file": "codex-rs/execpolicy/src/policy.rs", "startLine": 188, "endLine": 198},
+  "ask-user": {"file": "codex-rs/execpolicy/src/policy.rs", "startLine": 188, "endLine": 198},
+  "sandbox-prep": {"file": "codex-rs/sandboxing/src/manager.rs", "startLine": 226, "endLine": 339},
+  "plat-decide": {"file": "codex-rs/sandboxing/src/manager.rs", "startLine": 270, "endLine": 322},
+  "seatbelt-gen": {"file": "codex-rs/sandboxing/src/seatbelt.rs", "startLine": 602, "endLine": 741},
+  "linux-sandbox-gen": {"file": "codex-rs/sandboxing/src/landlock.rs", "startLine": 23, "endLine": 60},
+  "bwrap-or-legacy": {"file": "codex-rs/linux-sandbox/src/linux_run_main.rs", "startLine": 147, "endLine": 230},
+  "bwrap-stage": {"file": "codex-rs/linux-sandbox/src/linux_run_main.rs", "startLine": 213, "endLine": 230},
+  "landlock-direct": {"file": "codex-rs/linux-sandbox/src/landlock.rs", "startLine": 42, "endLine": 88},
+  "linux-exec-inner": {"file": "codex-rs/linux-sandbox/src/linux_run_main.rs", "startLine": 178, "endLine": 198},
+  "win-sandbox-gen": {"file": "codex-rs/sandboxing/src/manager.rs", "startLine": 318, "endLine": 321},
+  "exec-req": {"file": "codex-rs/sandboxing/src/manager.rs", "startLine": 100, "endLine": 114},
+  "exec-server-spawn": {"file": "codex-rs/exec-server/src/local_process.rs", "startLine": 150, "endLine": 274},
+  "output-stream": {"file": "codex-rs/exec-server/src/local_process.rs", "startLine": 282, "endLine": 358},
+  "flow-end-done": {"file": "codex-rs/exec-server/src/protocol.rs", "startLine": 446, "endLine": 468},
+  "fs-req": {"file": "codex-rs/exec-server/src/protocol.rs", "startLine": 203, "endLine": 215},
+  "fs-handler": {"file": "codex-rs/exec-server/src/server/file_system_handler.rs", "startLine": 1, "endLine": 50},
+  "local-fs": {"file": "codex-rs/exec-server/src/local_file_system.rs", "startLine": 1, "endLine": 50},
+  "sandboxed-fs": {"file": "codex-rs/exec-server/src/sandboxed_file_system.rs", "startLine": 42, "endLine": 52},
+  "fs-sandbox-runner": {"file": "codex-rs/exec-server/src/fs_sandbox.rs", "startLine": 63, "endLine": 94},
+  "fs-spawn-helper": {"file": "codex-rs/exec-server/src/fs_sandbox.rs", "startLine": 96, "endLine": 133},
+  "fs-stdin": {"file": "codex-rs/exec-server/src/fs_sandbox.rs", "startLine": 273, "endLine": 299},
+  "fs-helper-main": {"file": "codex-rs/exec-server/src/fs_helper_main.rs", "startLine": 1, "endLine": 46},
+  "fs-resp": {"file": "codex-rs/exec-server/src/fs_sandbox.rs", "startLine": 294, "endLine": 299},
+  "flow-fs-end": {"file": "codex-rs/exec-server/src/protocol.rs", "startLine": 210, "endLine": 215},
+  "cmd-tokens": {"file": "codex-rs/execpolicy/src/policy.rs", "startLine": 188, "endLine": 198},
+  "exact-match": {"file": "codex-rs/execpolicy/src/policy.rs", "startLine": 297, "endLine": 305},
+  "host-exe-match": {"file": "codex-rs/execpolicy/src/policy.rs", "startLine": 307, "endLine": 334},
+  "prefix-match": {"file": "codex-rs/execpolicy/src/rule.rs", "startLine": 46, "endLine": 60},
+  "heuristic": {"file": "codex-rs/shell-command/src/command_safety/is_dangerous_command.rs", "startLine": 7, "endLine": 29},
+  "collect-decision": {"file": "codex-rs/execpolicy/src/policy.rs", "startLine": 365, "endLine": 374},
+  "eval-out": {"file": "codex-rs/execpolicy/src/policy.rs", "startLine": 349, "endLine": 356}
+}</script>
+
+<aside id="source-panel"><div id="source-header"></div><div id="monaco-container"></div></aside>
+<script src="assets/codeindex-runtime.js"></script>
+<script src="assets/codeindex.js"></script>
+</body>
+</html>

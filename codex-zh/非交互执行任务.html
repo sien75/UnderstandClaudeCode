@@ -1,0 +1,388 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>非交互执行任务</title>
+<link rel="stylesheet" href="assets/codeindex.css">
+</head>
+<body>
+<p><a href="index.html">← Back to overview</a></p>
+<h1>非交互执行任务</h1>
+
+<p>用户运行 codex exec &lt;prompt&gt; 时，命令行参数先被主 CLI 识别为非交互子命令，然后整体交给 exec crate。exec crate 负责把提示词、图片、结构化输出 schema、工作目录、模型、权限和沙箱配置整理成一次 in-process app-server 会话，再发起 turn/start。用户运行 codex review 时，主 CLI 会构造一个等价的 exec CLI，把 review 参数放进 exec 的 Review 子命令，随后走同一条非交互执行管道，只是提交的是 review/start。</p>
+
+<dl>
+  <dt>输入</dt>
+  <dd>命令行参数、可选 stdin 提示词、图片路径、JSON Schema 文件、配置覆盖项、工作目录和权限/沙箱选项；review 场景额外输入 uncommitted/base/commit/custom prompt 之一。</dd>
+  <dt>输出</dt>
+  <dd>默认模式下，过程日志、工具调用、diff、计划和 token 用量写到 stderr，最终消息在适合自动化消费时写到 stdout；--json 模式下，stdout 是逐行 JSON 事件。两种模式都可以把最后一条 agent 消息写入 --output-last-message 指定的文件。</dd>
+</dl>
+
+<pre class="mermaid">
+graph TD
+  user-command["用户运行 codex exec 或 codex review"] --> main-subcommand{"主 CLI 识别子命令"}
+  main-subcommand -->|exec| exec-dispatch["继承根选项并进入 codex_exec::run_main"]
+  main-subcommand -->|review| review-adapt["把 review 参数包装成 exec Review 命令"]
+  review-adapt --> exec-dispatch
+  exec-dispatch --> exec-cli-shape["exec CLI 承载 prompt、json、schema、resume、review 等参数"]
+  exec-cli-shape --> normalize-config["解析配置覆盖、cwd、模型、权限和沙箱"]
+  normalize-config --> start-runtime["初始化状态库和 in-process app-server client 参数"]
+  start-runtime --> choose-operation{"本次要提交什么任务"}
+  choose-operation -->|普通 exec| build-user-turn["解析 prompt/stdin/images/schema 为用户输入"]
+  choose-operation -->|review| build-review["把 review 目标转换为 ReviewRequest"]
+  choose-operation -->|exec resume| build-resume-turn["解析恢复后的追加 prompt 和图片"]
+  build-user-turn --> trusted-dir-check{"是否允许当前目录执行"}
+  build-review --> trusted-dir-check
+  build-resume-turn --> trusted-dir-check
+  trusted-dir-check -->|不可信且未跳过| exit-untrusted["打印错误并退出"]
+  trusted-dir-check -->|允许| start-client["启动 in-process app-server client"]
+</pre>
+
+<p>这一段的关键状态边界是“交互 CLI”和“非交互 exec”之间的切换。codex review 没有单独实现一套执行引擎，而是被翻译成 exec 的 Review 命令，避免 review 和 exec 在配置、认证、沙箱、输出循环上分叉。权限边界也在这里确定：headless 默认 approval_policy 为 never，--full-auto 兼容为 workspace-write，--dangerously-bypass-approvals-and-sandbox 会切到 danger-full-access。</p>
+
+<pre class="mermaid">
+graph TD
+  start-client["in-process app-server client 已启动"] --> resume-check{"是否是 exec resume"}
+  resume-check -->|否| thread-start["发送 thread/start 创建新 thread"]
+  resume-check -->|是| find-thread["按 --last、UUID 或名称解析目标 thread"]
+  find-thread --> found-thread{"找到可恢复 thread"}
+  found-thread -->|是| thread-resume["发送 thread/resume 恢复 thread"]
+  found-thread -->|否| thread-start
+  thread-start --> session-configured["把 ThreadStartResponse 映射成 SessionConfiguredEvent"]
+  thread-resume --> session-configured
+  session-configured --> output-config["输出配置摘要或 thread.started JSON 事件"]
+  output-config --> submit-kind{"提交普通 turn 还是 review"}
+  submit-kind -->|普通 exec/resume| turn-start["发送 turn/start，携带输入、cwd、approval、effort、schema"]
+  submit-kind -->|review| review-start["发送 review/start，携带 review target"]
+  review-start --> synthetic-turn-start["把 review 返回的 turn 合成为 TurnStarted 通知"]
+  turn-start --> task-id["记录 turn id 作为本次任务边界"]
+  synthetic-turn-start --> task-id
+</pre>
+
+<p>session 的创建和恢复都通过 app-server 协议完成。新任务使用 thread/start；resume 先通过 thread/list、状态库和 rollout 元数据解析 thread，再使用 thread/resume；如果 resume 没有目标，就退回创建新 thread。SessionConfiguredEvent 不再等待后续流式事件，而是直接由 start/resume 响应构造，减少非交互启动延迟。</p>
+
+<pre class="mermaid">
+graph TD
+  task-id["已有 thread id 和 turn id"] --> event-loop["进入事件循环等待 app-server 事件或 Ctrl-C"]
+  event-loop --> interrupt{"收到 Ctrl-C"}
+  interrupt -->|是| send-interrupt["发送 turn/interrupt"]
+  send-interrupt --> event-loop
+  interrupt -->|否| server-event{"收到哪类服务端事件"}
+  server-event -->|ServerRequest| reject-interactive["自动取消 elicitation，拒绝审批/用户输入/动态工具等交互请求"]
+  reject-interactive --> event-loop
+  server-event -->|ServerNotification| classify-notification["按 thread id 和 turn id 过滤通知"]
+  classify-notification --> backfill{"turn/completed 是否缺少 items 且可从历史补齐"}
+  backfill -->|是| thread-read["发送 thread/read 回填最终 items"]
+  backfill -->|否| process-output["交给输出处理器"]
+  thread-read --> process-output
+  process-output --> shutdown-decision{"输出处理器要求结束吗"}
+  shutdown-decision -->|继续| event-loop
+  shutdown-decision -->|结束| unsubscribe["发送 thread/unsubscribe 并跳出循环"]
+  server-event -->|Lagged| lagged-warning["输出事件丢失警告"]
+  lagged-warning --> event-loop
+  unsubscribe --> final-output["关闭 client，输出最终结果，必要时以非零状态退出"]
+</pre>
+
+<p>非交互模式不会向用户发起审批或输入请求。来自 app-server 的 MCP elicitation 会自动取消；命令执行审批、文件修改审批、request_user_input、动态工具、认证刷新、attestation 和权限审批都会被拒绝。这是 Permission/Sandbox 边界的一部分：任务可以按已有配置运行，但不能在运行中要求人工确认。</p>
+
+<pre class="mermaid">
+graph TD
+  process-output["事件进入 EventProcessor"] --> output-mode{"是否 --json"}
+  output-mode -->|否| human-summary["stderr 打印配置摘要和用户输入"]
+  human-summary --> human-items["stderr 渲染工具、patch、MCP、web search、reasoning、diff、plan"]
+  human-items --> human-complete{"turn 状态"}
+  human-complete -->|completed| human-final["保存 final_message，结束时按终端状态写 stdout 或 stderr"]
+  human-complete -->|failed/interrupted| human-fail["清空 final_message，打印错误或 interrupted，结束循环"]
+  human-final --> last-message-file["如设置 --output-last-message，写最后消息文件"]
+  human-fail --> last-message-file
+  output-mode -->|是| json-started["先输出 thread.started JSONL"]
+  json-started --> json-map-items["把 app-server ThreadItem 映射成 exec JSON 事件"]
+  json-map-items --> json-complete{"turn 状态"}
+  json-complete -->|completed| json-turn-completed["输出 turn.completed 和 usage"]
+  json-complete -->|failed| json-turn-failed["输出 turn.failed 和 error"]
+  json-complete -->|interrupted| json-interrupted["结束但不输出最终消息正文"]
+  json-turn-completed --> last-message-file
+  json-turn-failed --> last-message-file
+  json-interrupted --> last-message-file
+</pre>
+
+<p>默认输出模式的 stdout 被严格保留给最终消息，其他过程信息写 stderr，这让脚本可以直接捕获回答正文。JSON 模式则完全不同：stdout 是事件流，事件包括 thread.started、turn.started、item.started、item.updated、item.completed、turn.completed、turn.failed 和 error；最后消息本身不单独作为 stdout 尾行重复输出，只在 item.completed 的 agent_message 中出现，或写入 --output-last-message 文件。</p>
+
+<ul>
+  <li>State Machine：一次任务从配置初始化进入 session start/resume，再进入 submitted/running，收到 completed/failed/interrupted 后请求 unsubscribe 并关闭 client。</li>
+  <li>Communication：exec crate 与 agent 运行时通过 InProcessAppServerClient 交换 JSON-RPC 风格请求和通知，关键方法是 thread/start、thread/resume、turn/start、review/start、thread/read、turn/interrupt、thread/unsubscribe。</li>
+  <li>Permission/Sandbox boundaries：exec headless 默认不询问审批；运行时审批请求被拒绝；sandbox/permission profile 在 thread/start 或 thread/resume 参数中传入 app-server。</li>
+  <li>Lifecycle：app-server client 的生命周期由 exec session 包住，启动后提交任务，任务终态后取消订阅并 shutdown；如果服务端报告不可重试错误或任务失败/中断，进程以非零状态退出。</li>
+</ul>
+
+<script>
+window.__sourceMap = {
+  "user-command": {
+    "file": "codex-rs/cli/src/main.rs",
+    "startLine": 122,
+    "endLine": 129
+  },
+  "main-subcommand": {
+    "file": "codex-rs/cli/src/main.rs",
+    "startLine": 986,
+    "endLine": 1037
+  },
+  "exec-dispatch": {
+    "file": "codex-rs/cli/src/main.rs",
+    "startLine": 1001,
+    "endLine": 1015
+  },
+  "review-adapt": {
+    "file": "codex-rs/cli/src/main.rs",
+    "startLine": 1017,
+    "endLine": 1036
+  },
+  "exec-cli-shape": {
+    "file": "codex-rs/exec/src/cli.rs",
+    "startLine": 9,
+    "endLine": 85
+  },
+  "normalize-config": {
+    "file": "codex-rs/exec/src/lib.rs",
+    "startLine": 238,
+    "endLine": 455
+  },
+  "start-runtime": {
+    "file": "codex-rs/exec/src/lib.rs",
+    "startLine": 516,
+    "endLine": 580
+  },
+  "choose-operation": {
+    "file": "codex-rs/exec/src/lib.rs",
+    "startLine": 705,
+    "endLine": 763
+  },
+  "build-user-turn": {
+    "file": "codex-rs/exec/src/lib.rs",
+    "startLine": 743,
+    "endLine": 762
+  },
+  "build-review": {
+    "file": "codex-rs/exec/src/lib.rs",
+    "startLine": 706,
+    "endLine": 710
+  },
+  "build-resume-turn": {
+    "file": "codex-rs/exec/src/lib.rs",
+    "startLine": 711,
+    "endLine": 742
+  },
+  "trusted-dir-check": {
+    "file": "codex-rs/exec/src/lib.rs",
+    "startLine": 765,
+    "endLine": 773
+  },
+  "exit-untrusted": {
+    "file": "codex-rs/exec/src/lib.rs",
+    "startLine": 767,
+    "endLine": 772
+  },
+  "start-client": {
+    "file": "codex-rs/exec/src/lib.rs",
+    "startLine": 775,
+    "endLine": 780
+  },
+  "resume-check": {
+    "file": "codex-rs/exec/src/lib.rs",
+    "startLine": 782,
+    "endLine": 834
+  },
+  "thread-start": {
+    "file": "codex-rs/exec/src/lib.rs",
+    "startLine": 805,
+    "endLine": 833
+  },
+  "find-thread": {
+    "file": "codex-rs/exec/src/lib.rs",
+    "startLine": 1436,
+    "endLine": 1549
+  },
+  "found-thread": {
+    "file": "codex-rs/exec/src/lib.rs",
+    "startLine": 787,
+    "endLine": 819
+  },
+  "thread-resume": {
+    "file": "codex-rs/exec/src/lib.rs",
+    "startLine": 790,
+    "endLine": 803
+  },
+  "session-configured": {
+    "file": "codex-rs/exec/src/lib.rs",
+    "startLine": 1153,
+    "endLine": 1258
+  },
+  "output-config": {
+    "file": "codex-rs/exec/src/lib.rs",
+    "startLine": 836,
+    "endLine": 854
+  },
+  "submit-kind": {
+    "file": "codex-rs/exec/src/lib.rs",
+    "startLine": 864,
+    "endLine": 928
+  },
+  "turn-start": {
+    "file": "codex-rs/exec/src/lib.rs",
+    "startLine": 864,
+    "endLine": 902
+  },
+  "review-start": {
+    "file": "codex-rs/exec/src/lib.rs",
+    "startLine": 903,
+    "endLine": 917
+  },
+  "synthetic-turn-start": {
+    "file": "codex-rs/exec/src/lib.rs",
+    "startLine": 918,
+    "endLine": 923
+  },
+  "task-id": {
+    "file": "codex-rs/exec/src/lib.rs",
+    "startLine": 924,
+    "endLine": 929
+  },
+  "event-loop": {
+    "file": "codex-rs/exec/src/lib.rs",
+    "startLine": 931,
+    "endLine": 1028
+  },
+  "interrupt": {
+    "file": "codex-rs/exec/src/lib.rs",
+    "startLine": 938,
+    "endLine": 961
+  },
+  "send-interrupt": {
+    "file": "codex-rs/exec/src/lib.rs",
+    "startLine": 944,
+    "endLine": 959
+  },
+  "server-event": {
+    "file": "codex-rs/exec/src/lib.rs",
+    "startLine": 968,
+    "endLine": 1027
+  },
+  "reject-interactive": {
+    "file": "codex-rs/exec/src/lib.rs",
+    "startLine": 1630,
+    "endLine": 1762
+  },
+  "classify-notification": {
+    "file": "codex-rs/exec/src/lib.rs",
+    "startLine": 972,
+    "endLine": 1005
+  },
+  "backfill": {
+    "file": "codex-rs/exec/src/lib.rs",
+    "startLine": 1324,
+    "endLine": 1378
+  },
+  "thread-read": {
+    "file": "codex-rs/exec/src/lib.rs",
+    "startLine": 1342,
+    "endLine": 1364
+  },
+  "process-output": {
+    "file": "codex-rs/exec/src/event_processor.rs",
+    "startLine": 13,
+    "endLine": 29
+  },
+  "shutdown-decision": {
+    "file": "codex-rs/exec/src/lib.rs",
+    "startLine": 1005,
+    "endLine": 1019
+  },
+  "unsubscribe": {
+    "file": "codex-rs/exec/src/lib.rs",
+    "startLine": 1007,
+    "endLine": 1017
+  },
+  "lagged-warning": {
+    "file": "codex-rs/exec/src/lib.rs",
+    "startLine": 1022,
+    "endLine": 1026
+  },
+  "final-output": {
+    "file": "codex-rs/exec/src/lib.rs",
+    "startLine": 1030,
+    "endLine": 1038
+  },
+  "output-mode": {
+    "file": "codex-rs/exec/src/lib.rs",
+    "startLine": 676,
+    "endLine": 683
+  },
+  "human-summary": {
+    "file": "codex-rs/exec/src/event_processor_with_human_output.rs",
+    "startLine": 211,
+    "endLine": 225
+  },
+  "human-items": {
+    "file": "codex-rs/exec/src/event_processor_with_human_output.rs",
+    "startLine": 67,
+    "endLine": 208
+  },
+  "human-complete": {
+    "file": "codex-rs/exec/src/event_processor_with_human_output.rs",
+    "startLine": 301,
+    "endLine": 334
+  },
+  "human-final": {
+    "file": "codex-rs/exec/src/event_processor_with_human_output.rs",
+    "startLine": 301,
+    "endLine": 316
+  },
+  "human-fail": {
+    "file": "codex-rs/exec/src/event_processor_with_human_output.rs",
+    "startLine": 317,
+    "endLine": 332
+  },
+  "last-message-file": {
+    "file": "codex-rs/exec/src/event_processor.rs",
+    "startLine": 31,
+    "endLine": 48
+  },
+  "json-started": {
+    "file": "codex-rs/exec/src/event_processor_with_jsonl_output.rs",
+    "startLine": 394,
+    "endLine": 604
+  },
+  "json-map-items": {
+    "file": "codex-rs/exec/src/event_processor_with_jsonl_output.rs",
+    "startLine": 141,
+    "endLine": 359
+  },
+  "json-complete": {
+    "file": "codex-rs/exec/src/event_processor_with_jsonl_output.rs",
+    "startLine": 504,
+    "endLine": 557
+  },
+  "json-turn-completed": {
+    "file": "codex-rs/exec/src/event_processor_with_jsonl_output.rs",
+    "startLine": 517,
+    "endLine": 528
+  },
+  "json-turn-failed": {
+    "file": "codex-rs/exec/src/event_processor_with_jsonl_output.rs",
+    "startLine": 529,
+    "endLine": 549
+  },
+  "json-interrupted": {
+    "file": "codex-rs/exec/src/event_processor_with_jsonl_output.rs",
+    "startLine": 550,
+    "endLine": 554
+  }
+};
+</script>
+
+<aside id="source-panel"><div id="source-header"></div><div id="monaco-container"></div></aside>
+<script src="assets/codeindex-runtime.js"></script>
+<script src="assets/codeindex.js"></script>
+</body>
+</html>

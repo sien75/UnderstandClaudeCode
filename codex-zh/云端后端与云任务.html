@@ -1,0 +1,380 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>云端后端与云任务</title>
+<link rel="stylesheet" href="assets/codeindex.css">
+</head>
+<body>
+<p><a href="index.html">← Back to overview</a></p>
+<h1>云端后端与云任务</h1>
+
+<p>这套模块讲的是 Codex 客户端怎么和"云端"打交道:把一个用户提示送到 OpenAI/ChatGPT 后端跑出回答、把一段代码任务丢到 Codex Cloud 远程执行再把 diff 拉回来 apply、以及当用户不用 OpenAI 而是接本地 Ollama / LM Studio 或 Amazon Bedrock 时怎么切换认证和模型来源。核心是"数据怎么从本地出去、怎么从云端回来"。</p>
+
+<h2>用户能做什么</h2>
+<ul>
+  <li>发一个对话/补全请求到 OpenAI Responses API 并流式收回答 → codex-api 的 ResponsesClient + SSE 流</li>
+  <li>查后端账号、配额、速率限制、token 用量 → backend-client</li>
+  <li>把代码任务提交到 Codex Cloud 远程跑、查状态、列任务、看 diff、apply 回本地 → cloud-tasks + cloud-tasks-client</li>
+  <li>用 TUI 浏览/选择云端任务并 apply → cloud-tasks 的 app/ui</li>
+  <li>切换模型提供商:OpenAI / Azure / Amazon Bedrock / 本地 Ollama / LM Studio → model-provider + model-provider-info + models-manager + ollama + lmstudio</li>
+  <li>用一个本地代理把 Responses 请求转发到上游(隐藏 API Key)→ responses-api-proxy</li>
+</ul>
+
+<h2>关键概念</h2>
+<dl>
+  <dt>Provider(提供商)</dt>
+  <dd>一个可对接的模型后端,由 ModelProviderInfo 描述:base_url、env_key、auth、wire_api(现在只剩 responses)、retry/超时。codex-api 的 Provider 是它运行时形态。</dd>
+  <dt>AuthProvider(认证提供者)</dt>
+  <dd>trait,负责给出去的 HTTP 请求贴认证头。实现有 BearerAuthProvider(普通 Bearer token + ChatGPT-Account-Id + Fedramp 头)、AgentIdentityAuthProvider(Agent Identity 签名)、Bedrock SigV4、Unauthenticated(本地 OSS)。</dd>
+  <dt>路径风格 PathStyle</dt>
+  <dd>backend-client 按 base_url 决定走 /api/codex/... (CodexApi) 还是 /wham/... (ChatGptApi,即 backend-api)。cloud-tasks 也复用同一套。</dd>
+  <dt>Responses SSE 流</dt>
+  <dd>codex-api 把 POST /responses 的 text/event-stream 解析成 ResponseEvent 序列(Created、OutputTextDelta、ToolCallInputDelta、ReasoningSummaryDelta、Completed、RateLimits、ServerModel…),并通过 mpsc channel 推给上层。</dd>
+  <dt>Cloud Task 生命周期</dt>
+  <dd>Pending(排队/跑着)→ Ready(完成有 diff)→ Applied(已 apply)或 Error。best-of-N 时一个 turn 有多个 sibling attempts。</dd>
+</dl>
+
+<h2>主数据流:发一次 Responses 请求并收流式回答</h2>
+
+<p>上层(core)拿到用户 prompt,组装成 ResponsesApiRequest(model、input、tools、reasoning、store…),交给 ResponsesClient。ResponsesClient 把请求体 JSON 编码(Azure 场景额外 attach item id),贴上 session/thread/subagent 头,交给 EndpointSession。EndpointSession 用 Provider.build_request 拼出最终 URL+默认头+query,再让 AuthProvider.apply_auth 贴认证头,最后通过 HttpTransport(底层 reqwest)发出 POST,以 text/event-stream 接收。spawn_response_stream 起一个 tokio task,逐条解析 SSE event,映射成 ResponseEvent 推进 channel。出错(response.failed/incomplete)时按错误码分类成 ContextWindowExceeded / QuotaExceeded / CyberPolicy / ServerOverloaded / Retryable 等 ApiError,再由 api_bridge 翻译成 core 层的 CodexErr。</p>
+
+<pre class="mermaid">
+graph TD
+    A["上层 core: 组装 ResponsesApiRequest"] --> B["ResponsesClient.stream_request"]
+    B --> C{"Azure endpoint?"}
+    C -->|是| D["attach_item_ids 给 input 项加 id"]
+    C -->|否| E["EncodedJsonBody encode"]
+    D --> E
+    E --> F["拼 session thread subagent 头"]
+    F --> G["EndpointSession.stream_encoded_json_with"]
+    G --> H["Provider.build_request 拼 URL query"]
+    H --> I["AuthProvider.apply_auth 贴认证头"]
+    I --> J["HttpTransport.stream POST"]
+    J --> K{"HTTP 状态"}
+    K -->|4xx 5xx 网络| L["TransportError 到 api_bridge.map_api_error"]
+    K -->|200 event-stream| M["spawn_response_stream"]
+    M --> N["解析响应头 ServerModel RateLimits ModelsEtag turn_state"]
+    N --> O["process_sse 循环读 event"]
+    O --> P{"SSE event 类型"}
+    P -->|output_text.delta| Q["ResponseEvent OutputTextDelta"]
+    P -->|output_item.added done| R["ResponseEvent OutputItemAdded Done"]
+    P -->|reasoning_summary.delta| S["ResponseEvent ReasoningSummaryDelta"]
+    P -->|response.completed| T["ResponseEvent Completed token usage"]
+    P -->|response.failed| U["按 code 分类成 ApiError"]
+    P -->|response.incomplete| V["ApiError Stream"]
+    P -->|空闲超时 流断| W["ApiError Stream"]
+    Q --> X["mpsc channel 到 ResponseStream"]
+    R --> X
+    S --> X
+    T --> X
+    U --> X
+    V --> X
+    W --> X
+    L --> X
+    X --> Y["上层 core 消费 ResponseStream"]
+</pre>
+
+<h2>子图:认证头怎么来(AuthProvider 选择)</h2>
+
+<p>codex-api 只定义 AuthProvider trait,真正选哪个实现由 model-provider 的 resolve_provider_auth / auth_provider_from_auth 决定。规则:BedrockApiKey 在非 Bedrock 提供商上直接报错;provider 配了 api_key 或 experimental_bearer_token 就用 BearerAuthProvider;否则按当前 CodexAuth 类型映射:Chatgpt/ApiKey/PAT → Bearer,AgentIdentity → AgentIdentityAuthProvider(签名),本地 OSS 且无 auth → Unauthenticated。Bedrock 走自己的 SigV4 签名(amazon_bedrock/auth.rs)。</p>
+
+<pre class="mermaid">
+graph TD
+    A["model-provider.create_model_provider"] --> B{"provider_info.is_amazon_bedrock?"}
+    B -->|是| C["AmazonBedrockModelProvider"]
+    B -->|否| D["ConfiguredModelProvider"]
+    C --> E["api_auth 到 Bedrock SigV4 签名"]
+    D --> F["resolve_provider_auth"]
+    F --> G{"当前 auth 是 BedrockApiKey?"}
+    G -->|是 且 非 Bedrock provider| H["报错 UnsupportedOperation"]
+    G -->|否| I{"provider 有 api_key bearer_token?"}
+    I -->|是| J["BearerAuthProvider"]
+    I -->|否| K{"有 CodexAuth?"}
+    K -->|AgentIdentity| L["AgentIdentityAuthProvider 签名头"]
+    K -->|Chatgpt ApiKey PAT| M["BearerAuthProvider token account_id fedramp"]
+    K -->|无| N["UnauthenticatedAuthProvider"]
+    E --> Z["SharedAuthProvider 注入 codex-api"]
+    J --> Z
+    L --> Z
+    M --> Z
+    N --> Z
+</pre>
+
+<h2>子图:backend-client 账号/配额/任务 API</h2>
+
+<p>backend-client 是面向 ChatGPT/Codex 后端(/api/codex 或 /wham)的瘦 HTTP 客户端,所有云任务、配额、账号校验都走它。它持有 base_url、reqwest Client、SharedAuthProvider、可选 ChatGPT-Account-Id 和 Fedramp 标记。每个方法拼 URL(按 PathStyle 二选一前缀)、贴 headers、发 reqwest、按状态码 bail 或解析 JSON。速率限制相关把后端的 RateLimitStatusPayload 映射成 protocol 层的 RateLimitSnapshot(主/副窗口、credits、spend control、plan_type)。</p>
+
+<pre class="mermaid">
+graph TD
+    A["Client new base_url"] --> B["归一化 base_url chatgpt.com 加 backend-api"]
+    B --> C["PathStyle from_base_url"]
+    C --> D["headers UA auth头 Account-Id Fedramp"]
+    D --> E["各业务方法"]
+    E --> F["get_accounts_check"]
+    E --> G["get_token_usage_profile"]
+    E --> H["list_tasks"]
+    E --> I["get_task_details"]
+    E --> J["list_sibling_turns"]
+    E --> K["create_task POST 返回 task id"]
+    E --> L["get_config_bundle"]
+    E --> M["get_rate_limits_many"]
+    M --> N["映射主副窗口 credits individual_limit plan_type"]
+    H --> O["exec_request decode_json"]
+    I --> O
+    K --> O
+    O --> P{"status 成功?"}
+    P -->|否| Q["RequestError UnexpectedStatus"]
+    P -->|是| R["返回解析后的强类型"]
+</pre>
+
+<h2>主数据流:云任务——提交、查、apply</h2>
+
+<p>cloud-tasks 是 codex cloud 子命令的入口。CLI 有五个子命令(exec/status/list/apply/diff)+ 默认的 TUI。init_backend 读 base_url(默认 chatgpt.com/backend-api),用 codex-login 加载 ChatGPT 登录态,构造 cloud-tasks-client 的 HttpClient(内部包了 backend-client)。HttpClient 实现 CloudBackend trait:list_tasks/get_task_summary/get_task_diff/get_task_text/list_sibling_attempts/apply_task(_preflight)/create_task。create_task 把 prompt 包成 input_items(可选附带 CODEX_STARTING_DIFF),POST /tasks 拿回 task id。apply 流程:先 get_task_details 拿 unified diff(或用 diff_override),校验是 unified diff,再调 codex-git-utils 的 apply_git_patch 在本地 cwd 跑 git apply(preflight 模式只校验不落盘),按退出码分 Success/Partial/Error。</p>
+
+<pre class="mermaid">
+graph TD
+    A["codex cloud exec status list apply diff"] --> B["run 命令分发"]
+    B --> C["init_backend"]
+    C --> D["load ChatGPT auth 未登录则退出"]
+    D --> E["HttpClient base_url auth_provider"]
+    E --> F{"子命令"}
+    F -->|exec| G["create_task env prompt git_ref attempts"]
+    F -->|status| H["get_task_summary"]
+    F -->|list| I["list_tasks env limit cursor"]
+    F -->|diff| J["collect_attempt_diffs"]
+    F -->|apply| K["collect_attempt_diffs select_attempt"]
+    F -->|TUI| L["App 事件循环 后台刷新富化"]
+    G --> M["backend.create_task POST tasks"]
+    H --> N["backend.get_task_details tasks id"]
+    I --> N
+    J --> N
+    K --> N
+    N --> O["解析 task_status_display 到 status summary"]
+    K --> P["apply_task diff_override"]
+    P --> Q{"diff 是 unified?"}
+    Q -->|否| R["ApplyOutcome Error 格式不符"]
+    Q -->|是| S["apply_git_patch cwd preflight"]
+    S --> T{"exit_code"}
+    T -->|0| U["ApplyStatus Success"]
+    T -->|部分 applied conflict| V["Partial"]
+    T -->|全失败| W["Error"]
+    L --> X["spawn_preflight spawn_apply"]
+    X --> P
+</pre>
+
+<h2>子图:模型发现——models-manager</h2>
+
+<p>models-manager 负责给上层提供"可选模型列表 + 默认模型"。它有三种刷新策略:Online(只走网络)、Offline(只读缓存)、OnlineIfUncached(缓存新鲜就用,否则拉网络)。OpenAiModelsManager 持有 OpenAiModelsEndpoint(由 model-provider 注入,包了 ModelsClient + auth),通过 GET /models?client_version= 拉远程 catalog,带 ETag 做条件请求,落盘 models_cache.json(TTL 5 分钟)。StaticModelsManager 用预置 catalog。最后按 priority 排序、按 auth(是否 codex backend)过滤、标默认,产出 ModelPreset 列表给选择器。</p>
+
+<pre class="mermaid">
+graph TD
+    A["ModelsManager.list_models refresh"] --> B{"refresh 策略"}
+    B -->|Online| C["强制网络拉"]
+    B -->|Offline| D["只读 models_cache.json"]
+    B -->|OnlineIfUncached| E{"缓存新鲜?"}
+    E -->|是| D
+    E -->|否| C
+    C --> F["OpenAiModelsEndpoint.list_models"]
+    F --> G["ModelsClient.list_models GET models client_version"]
+    G --> H["返回 ModelInfo 列表 加 ETag"]
+    H --> I["合并 bundled remote 写 cache"]
+    D --> J["raw_model_catalog"]
+    I --> J
+    J --> K["build_available_models 排序 auth过滤 标默认"]
+    K --> L["ModelPreset 列表给选择器"]
+</pre>
+
+<h2>子图:本地 OSS(Ollama / LM Studio)</h2>
+
+<p>当用户选 --oss 或配了 ollama/lmstudio provider 时,ensure_oss_ready 起步:从 Config 拿到 provider,构造 OllamaClient/LMStudioClient,probe 服务器是否在线(Ollama 打 /api/tags 或 /v1/models;LM Studio 打 /models),列本地模型,缺则 pull/download,最后(仅 LM Studio)后台 load 模型。Ollama 还会校验版本 ≥ 0.13.4 才支持 Responses API。这些 provider 的 requires_openai_auth=false,auth 解析成 UnauthenticatedAuthProvider。</p>
+
+<pre class="mermaid">
+graph TD
+    A["oss 或 本地 provider Ollama"] --> B["OllamaClient.try_from_oss_provider"]
+    A2["LM Studio"] --> B2["LMStudioClient.try_from_provider"]
+    B --> C["probe_server api_tags 或 v1_models"]
+    B2 --> C2["check_server models"]
+    C --> D["fetch_models 列本地模型"]
+    C2 --> D2["fetch_models"]
+    D --> E{"模型在本地?"}
+    D2 --> E2{"模型在本地?"}
+    E -->|否| F["pull_with_reporter Ollama api_pull 流式"]
+    E2 -->|否| F2["download_model LM Studio"]
+    E -->|是| G["完成"]
+    E2 -->|是| G2["后台 load_model POST responses 空 input"]
+    B --> H["ensure_responses_supported 版本校验 0.13.4"]
+</pre>
+
+<h2>子图:responses-api-proxy(本地反代隐藏 API Key)</h2>
+
+<p>一个极简 HTTP 反代:stdin 读 auth header(只读一次,from_static + set_sensitive 避免泄漏),起 tiny_http 监听 127.0.0.1,只放行 POST /v1/responses,把请求头原样转发(去掉原 Authorization/Host,换成注入的 auth 和上游 Host),转发到 --upstream-url(默认 api.openai.com/v1/responses),把上游响应(含流式)原样回吐。可选 --dump-dir 把请求/响应落盘做调试。用于让 codex 在不接触 API Key 的前提下打 OpenAI。</p>
+
+<pre class="mermaid">
+graph TD
+    A["启动 read_auth_header_from_stdin"] --> B["bind 127.0.0.1 port"]
+    B --> C["tiny_http 接请求"]
+    C --> D{"POST v1 responses?"}
+    D -->|否| E["403 拒绝"]
+    D -->|是| F["读 body 可选 dump"]
+    F --> G["转发头 去 Authorization Host"]
+    G --> H["注入 auth_header 上游 Host"]
+    H --> I["reqwest POST upstream_url"]
+    I --> J["回吐状态 头 流式 body"]
+</pre>
+
+<h2>错误与边界</h2>
+<ul>
+  <li>codex-api 把后端错误码分类成具体 ApiError(context_length_exceeded → ContextWindowExceeded;insufficient_quota → QuotaExceeded;cyber_policy → CyberPolicy;server_is_overloaded/slow_down → ServerOverloaded;rate_limit_exceeded 带 retry-after → Retryable{delay})。api_bridge 再把 HTTP 4xx/5xx/429(usage_limit_reached → UsageLimitReached)翻译成 core 的 CodexErr。这是一个明显的决策表 + 状态映射边界。</li>
+  <li>未登录 / 非 codex backend auth 在 cloud-tasks 直接 process::exit(1),不进 TUI。</li>
+  <li>apply 前必须校验是 unified git diff,非 unified 直接 Error 不动工作树;preflight 不落盘。</li>
+  <li>SSE 空闲超时(stream_idle_timeout,默认 300s)会断流并报 Stream error。</li>
+  <li>BedrockApiKey auth 只能配 Amazon Bedrock provider,别的 provider 会报 UnsupportedOperation。</li>
+  <li>Azure Responses 端点需要给 input 项显式 attach id(store=true 时)。</li>
+</ul>
+
+<h2>Notes</h2>
+<ul>
+  <li>路径风格:chatgpt.com/backend-api → /wham/...;否则 /api/codex/...。cloud-tasks 默认 base_url 就是 chatgpt.com/backend-api。</li>
+  <li>realtime/responses websocket 端点(v1/v2 协议)是流式通话的另一条通道,本分析只 mapped 概览,未深读。</li>
+  <li>cloud-tasks 的 TUI(app.rs/ui.rs/scrollable_diff.rs/new_task.rs)是 ratatui 渲染层,只 mapped。</li>
+  <li>models.json / prompt.md 是生成物/静态资源,ignored。</li>
+  <li>cloud-tasks-mock-client 提供一个 MockClient 用于本地 TUI 调试(CODEX_CLOUD_TASKS_MODE=mock)。</li>
+</ul>
+
+<script>window.__sourceMap = {
+  "A": {"file": "codex-rs/codex-api/src/lib.rs", "startLine": 1, "endLine": 110},
+  "B": {"file": "codex-rs/codex-api/src/endpoint/responses.rs", "startLine": 71, "endLine": 107},
+  "C": {"file": "codex-rs/codex-api/src/provider.rs", "startLine": 88, "endLine": 104},
+  "D": {"file": "codex-rs/codex-api/src/requests/responses.rs", "startLine": 11, "endLine": 37},
+  "E": {"file": "codex-rs/codex-api/src/endpoint/responses.rs", "startLine": 85, "endLine": 94},
+  "F": {"file": "codex-rs/codex-api/src/requests/headers.rs", "startLine": 5, "endLine": 31},
+  "G": {"file": "codex-rs/codex-api/src/endpoint/session.rs", "startLine": 122, "endLine": 156},
+  "H": {"file": "codex-rs/codex-api/src/provider.rs", "startLine": 53, "endLine": 86},
+  "I": {"file": "codex-rs/codex-api/src/auth.rs", "startLine": 55, "endLine": 61},
+  "J": {"file": "codex-rs/codex-api/src/endpoint/session.rs", "startLine": 139, "endLine": 152},
+  "K": {"file": "codex-rs/codex-api/src/endpoint/session.rs", "startLine": 80, "endLine": 114},
+  "L": {"file": "codex-rs/codex-api/src/api_bridge.rs", "startLine": 18, "endLine": 137},
+  "M": {"file": "codex-rs/codex-api/src/sse/responses.rs", "startLine": 31, "endLine": 88},
+  "N": {"file": "codex-rs/codex-api/src/sse/responses.rs", "startLine": 37, "endLine": 64},
+  "O": {"file": "codex-rs/codex-api/src/sse/responses.rs", "startLine": 434, "endLine": 529},
+  "P": {"file": "codex-rs/codex-api/src/sse/responses.rs", "startLine": 298, "endLine": 432},
+  "Q": {"file": "codex-rs/codex-api/src/sse/responses.rs", "startLine": 310, "endLine": 314},
+  "R": {"file": "codex-rs/codex-api/src/sse/responses.rs", "startLine": 302, "endLine": 418},
+  "S": {"file": "codex-rs/codex-api/src/sse/responses.rs", "startLine": 326, "endLine": 333},
+  "T": {"file": "codex-rs/codex-api/src/sse/responses.rs", "startLine": 393, "endLine": 410},
+  "U": {"file": "codex-rs/codex-api/src/sse/responses.rs", "startLine": 347, "endLine": 381},
+  "V": {"file": "codex-rs/codex-api/src/sse/responses.rs", "startLine": 382, "endLine": 392},
+  "W": {"file": "codex-rs/codex-api/src/sse/responses.rs", "startLine": 457, "endLine": 470},
+  "X": {"file": "codex-rs/codex-api/src/common.rs", "startLine": 305, "endLine": 318},
+  "Y": {"file": "codex-rs/codex-api/src/lib.rs", "startLine": 1, "endLine": 110},
+  "mpA": {"file": "codex-rs/model-provider/src/provider.rs", "startLine": 188, "endLine": 197},
+  "mpB": {"file": "codex-rs/model-provider/src/provider.rs", "startLine": 188, "endLine": 197},
+  "mpC": {"file": "codex-rs/model-provider/src/amazon_bedrock/mod.rs", "startLine": 34, "endLine": 77},
+  "mpD": {"file": "codex-rs/model-provider/src/provider.rs", "startLine": 200, "endLine": 214},
+  "mpE": {"file": "codex-rs/model-provider/src/amazon_bedrock/auth.rs", "startLine": 1, "endLine": 297},
+  "mpF": {"file": "codex-rs/model-provider/src/auth.rs", "startLine": 82, "endLine": 100},
+  "mpG": {"file": "codex-rs/model-provider/src/auth.rs", "startLine": 82, "endLine": 90},
+  "mpH": {"file": "codex-rs/model-provider/src/auth.rs", "startLine": 86, "endLine": 90},
+  "mpI": {"file": "codex-rs/model-provider/src/auth.rs", "startLine": 102, "endLine": 114},
+  "mpJ": {"file": "codex-rs/model-provider/src/bearer_auth_provider.rs", "startLine": 31, "endLine": 47},
+  "mpK": {"file": "codex-rs/model-provider/src/auth.rs", "startLine": 82, "endLine": 100},
+  "mpL": {"file": "codex-rs/model-provider/src/auth.rs", "startLine": 25, "endLine": 54},
+  "mpM": {"file": "codex-rs/model-provider/src/auth.rs", "startLine": 117, "endLine": 132},
+  "mpN": {"file": "codex-rs/model-provider/src/auth.rs", "startLine": 61, "endLine": 67},
+  "mpZ": {"file": "codex-rs/codex-api/src/auth.rs", "startLine": 30, "endLine": 68},
+  "Z": {"file": "codex-rs/codex-api/src/auth.rs", "startLine": 30, "endLine": 68},
+  "bcA": {"file": "codex-rs/backend-client/src/client.rs", "startLine": 148, "endLine": 175},
+  "bcB": {"file": "codex-rs/backend-client/src/client.rs", "startLine": 149, "endLine": 161},
+  "bcC": {"file": "codex-rs/backend-client/src/client.rs", "startLine": 111, "endLine": 119},
+  "bcD": {"file": "codex-rs/backend-client/src/client.rs", "startLine": 210, "endLine": 230},
+  "bcE": {"file": "codex-rs/backend-client/src/client.rs", "startLine": 289, "endLine": 466},
+  "bcF": {"file": "codex-rs/backend-client/src/client.rs", "startLine": 302, "endLine": 310},
+  "bcG": {"file": "codex-rs/backend-client/src/client.rs", "startLine": 312, "endLine": 324},
+  "bcH": {"file": "codex-rs/backend-client/src/client.rs", "startLine": 341, "endLine": 375},
+  "bcI": {"file": "codex-rs/backend-client/src/client.rs", "startLine": 377, "endLine": 394},
+  "bcJ": {"file": "codex-rs/backend-client/src/client.rs", "startLine": 396, "endLine": 414},
+  "bcK": {"file": "codex-rs/backend-client/src/client.rs", "startLine": 435, "endLine": 466},
+  "bcL": {"file": "codex-rs/backend-client/src/client.rs", "startLine": 420, "endLine": 431},
+  "bcM": {"file": "codex-rs/backend-client/src/client.rs", "startLine": 298, "endLine": 300},
+  "bcN": {"file": "codex-rs/backend-client/src/client.rs", "startLine": 469, "endLine": 533},
+  "bcO": {"file": "codex-rs/backend-client/src/client.rs", "startLine": 232, "endLine": 287},
+  "bcP": {"file": "codex-rs/backend-client/src/client.rs", "startLine": 247, "endLine": 278},
+  "bcQ": {"file": "codex-rs/backend-client/src/client.rs", "startLine": 253, "endLine": 278},
+  "bcR": {"file": "codex-rs/backend-client/src/client.rs", "startLine": 280, "endLine": 287},
+  "ctA": {"file": "codex-rs/cloud-tasks/src/cli.rs", "startLine": 15, "endLine": 27},
+  "ctB": {"file": "codex-rs/cloud-tasks/src/lib.rs", "startLine": 161, "endLine": 184},
+  "ctC": {"file": "codex-rs/cloud-tasks/src/lib.rs", "startLine": 43, "endLine": 107},
+  "ctD": {"file": "codex-rs/cloud-tasks/src/lib.rs", "startLine": 71, "endLine": 95},
+  "ctE": {"file": "codex-rs/cloud-tasks-client/src/http.rs", "startLine": 24, "endLine": 63},
+  "ctF": {"file": "codex-rs/cloud-tasks/src/cli.rs", "startLine": 15, "endLine": 27},
+  "ctG": {"file": "codex-rs/cloud-tasks-client/src/http.rs", "startLine": 329, "endLine": 390},
+  "ctH": {"file": "codex-rs/cloud-tasks-client/src/http.rs", "startLine": 193, "endLine": 260},
+  "ctI": {"file": "codex-rs/cloud-tasks-client/src/http.rs", "startLine": 158, "endLine": 191},
+  "ctJ": {"file": "codex-rs/cloud-tasks/src/lib.rs", "startLine": 300, "endLine": 341},
+  "ctK": {"file": "codex-rs/cloud-tasks/src/lib.rs", "startLine": 589, "endLine": 608},
+  "ctL": {"file": "codex-rs/cloud-tasks/src/lib.rs", "startLine": 735, "endLine": 817},
+  "ctM": {"file": "codex-rs/backend-client/src/client.rs", "startLine": 435, "endLine": 466},
+  "ctN": {"file": "codex-rs/backend-client/src/client.rs", "startLine": 377, "endLine": 394},
+  "ctO": {"file": "codex-rs/cloud-tasks-client/src/http.rs", "startLine": 199, "endLine": 260},
+  "ctP": {"file": "codex-rs/cloud-tasks-client/src/http.rs", "startLine": 440, "endLine": 520},
+  "ctQ": {"file": "codex-rs/cloud-tasks-client/src/http.rs", "startLine": 459, "endLine": 473},
+  "ctR": {"file": "codex-rs/cloud-tasks-client/src/http.rs", "startLine": 465, "endLine": 473},
+  "ctS": {"file": "codex-rs/cloud-tasks-client/src/http.rs", "startLine": 475, "endLine": 520},
+  "ctT": {"file": "codex-rs/cloud-tasks-client/src/http.rs", "startLine": 484, "endLine": 491},
+  "ctU": {"file": "codex-rs/cloud-tasks-client/src/http.rs", "startLine": 484, "endLine": 485},
+  "ctV": {"file": "codex-rs/cloud-tasks-client/src/http.rs", "startLine": 486, "endLine": 488},
+  "ctW": {"file": "codex-rs/cloud-tasks-client/src/http.rs", "startLine": 488, "endLine": 490},
+  "ctX": {"file": "codex-rs/cloud-tasks/src/lib.rs", "startLine": 618, "endLine": 728},
+  "mmA": {"file": "codex-rs/models-manager/src/manager.rs", "startLine": 79, "endLine": 97},
+  "mmB": {"file": "codex-rs/models-manager/src/manager.rs", "startLine": 49, "endLine": 74},
+  "mmC": {"file": "codex-rs/models-manager/src/manager.rs", "startLine": 1, "endLine": 78},
+  "mmD": {"file": "codex-rs/models-manager/src/cache.rs", "startLine": 1, "endLine": 184},
+  "mmE": {"file": "codex-rs/models-manager/src/manager.rs", "startLine": 99, "endLine": 103},
+  "mmF": {"file": "codex-rs/model-provider/src/models_endpoint.rs", "startLine": 1, "endLine": 258},
+  "mmG": {"file": "codex-rs/codex-api/src/endpoint/models.rs", "startLine": 40, "endLine": 73},
+  "mmH": {"file": "codex-rs/codex-api/src/endpoint/models.rs", "startLine": 58, "endLine": 72},
+  "mmI": {"file": "codex-rs/models-manager/src/manager.rs", "startLine": 117, "endLine": 129},
+  "mmJ": {"file": "codex-rs/models-manager/src/manager.rs", "startLine": 99, "endLine": 103},
+  "mmK": {"file": "codex-rs/models-manager/src/manager.rs", "startLine": 117, "endLine": 129},
+  "mmL": {"file": "codex-rs/models-manager/src/lib.rs", "startLine": 1, "endLine": 27},
+  "olA": {"file": "codex-rs/ollama/src/lib.rs", "startLine": 23, "endLine": 50},
+  "olA2": {"file": "codex-rs/lmstudio/src/lib.rs", "startLine": 13, "endLine": 46},
+  "A2": {"file": "codex-rs/lmstudio/src/lib.rs", "startLine": 13, "endLine": 46},
+  "B2": {"file": "codex-rs/lmstudio/src/client.rs", "startLine": 15, "endLine": 44},
+  "C2": {"file": "codex-rs/lmstudio/src/client.rs", "startLine": 46, "endLine": 62},
+  "D2": {"file": "codex-rs/lmstudio/src/client.rs", "startLine": 95, "endLine": 120},
+  "E2": {"file": "codex-rs/lmstudio/src/client.rs", "startLine": 95, "endLine": 120},
+  "F2": {"file": "codex-rs/lmstudio/src/client.rs", "startLine": 95, "endLine": 120},
+  "G2": {"file": "codex-rs/lmstudio/src/client.rs", "startLine": 65, "endLine": 92},
+  "olB": {"file": "codex-rs/ollama/src/client.rs", "startLine": 35, "endLine": 50},
+  "olB2": {"file": "codex-rs/lmstudio/src/client.rs", "startLine": 15, "endLine": 44},
+  "olC": {"file": "codex-rs/ollama/src/client.rs", "startLine": 81, "endLine": 101},
+  "olC2": {"file": "codex-rs/lmstudio/src/client.rs", "startLine": 46, "endLine": 62},
+  "olD": {"file": "codex-rs/ollama/src/client.rs", "startLine": 104, "endLine": 130},
+  "olD2": {"file": "codex-rs/lmstudio/src/client.rs", "startLine": 95, "endLine": 120},
+  "olE": {"file": "codex-rs/ollama/src/client.rs", "startLine": 104, "endLine": 130},
+  "olE2": {"file": "codex-rs/lmstudio/src/client.rs", "startLine": 95, "endLine": 120},
+  "olF": {"file": "codex-rs/ollama/src/pull.rs", "startLine": 1, "endLine": 148},
+  "olF2": {"file": "codex-rs/lmstudio/src/client.rs", "startLine": 95, "endLine": 120},
+  "olG": {"file": "codex-rs/ollama/src/lib.rs", "startLine": 23, "endLine": 50},
+  "olG2": {"file": "codex-rs/lmstudio/src/client.rs", "startLine": 65, "endLine": 92},
+  "olH": {"file": "codex-rs/ollama/src/lib.rs", "startLine": 63, "endLine": 77},
+  "pxA": {"file": "codex-rs/responses-api-proxy/src/lib.rs", "startLine": 73, "endLine": 136},
+  "pxB": {"file": "codex-rs/responses-api-proxy/src/lib.rs", "startLine": 138, "endLine": 143},
+  "pxC": {"file": "codex-rs/responses-api-proxy/src/lib.rs", "startLine": 113, "endLine": 133},
+  "pxD": {"file": "codex-rs/responses-api-proxy/src/lib.rs", "startLine": 170, "endLine": 179},
+  "pxE": {"file": "codex-rs/responses-api-proxy/src/lib.rs", "startLine": 170, "endLine": 179},
+  "pxF": {"file": "codex-rs/responses-api-proxy/src/lib.rs", "startLine": 181, "endLine": 194},
+  "pxG": {"file": "codex-rs/responses-api-proxy/src/lib.rs", "startLine": 198, "endLine": 213},
+  "pxH": {"file": "codex-rs/responses-api-proxy/src/lib.rs", "startLine": 217, "endLine": 222},
+  "pxI": {"file": "codex-rs/responses-api-proxy/src/lib.rs", "startLine": 223, "endLine": 228},
+  "pxJ": {"file": "codex-rs/responses-api-proxy/src/lib.rs", "startLine": 265, "endLine": 274}
+}</script>
+
+<aside id="source-panel"><div id="source-header"></div><div id="monaco-container"></div></aside>
+<script src="assets/codeindex-runtime.js"></script>
+<script src="assets/codeindex.js"></script>
+</body>
+</html>

@@ -1,0 +1,264 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>网络代理(network-proxy / uds / stdio-to-uds)</title>
+<link rel="stylesheet" href="assets/codeindex.css">
+</head>
+<body>
+<p><a href="index.html">← Back to overview</a></p>
+<h1>网络代理(network-proxy / uds / stdio-to-uds)</h1>
+
+<p>这是 codex 给 AI 跑命令时用的"网络沙箱"。当 codex 让子进程(编译、跑测试、装依赖、git 操作)联网时,不是让它直连外网,而是把子进程的环境变量全部改写成指向本地一个回环代理,再由这个代理按策略决定"这个请求能不能出去、能去哪、用什么方法"。整条链路是:子进程 → 回环 HTTP/SOCKS5 代理 → 策略判断 → 直连或上游代理或 MITM 解密 → 目标服务器。配套的 <code>uds</code> crate 提供跨平台 Unix domain socket 收发,<code>stdio-to-uds</code> 是个小桥子,把进程的标准输入输出接到 Unix socket 上,典型用途是让 git-ssh 经 SOCKS5 走代理。</p>
+
+<p>核心组件分工一句话:<b>NetworkProxy</b>(proxy.rs)是总入口和装配器,负责绑端口、起 HTTP/SOCKS5 两个监听、给子进程写环境变量;<b>NetworkProxyState</b>(runtime.rs)是活的策略状态,持有配置、allow/deny glob 集合、MITM 状态、拦截记录器,所有"这个 host 能不能连"的判断都在它身上;<b>http_proxy.rs / socks5.rs</b> 是两个协议的入口处理函数,做协议级策略和路由;<b>mitm.rs</b> 在需要看 HTTPS 内层请求时,用自签 CA 证书终结 TLS、解密后再按方法/钩子策略决定放行;<b>network_policy.rs</b> 是统一策略评估+审计事件发射层;<b>policy.rs</b> 是底层 host 归一化和 glob 匹配;<b>config.rs / state.rs / certs.rs / mitm_hook.rs / upstream.rs / connect_policy.rs / responses.rs / reasons.rs</b> 分别管配置模型、约束校验、CA 证书、请求钩子、上游客户端、本地绑定策略、响应构造、原因字符串。</p>
+
+<h2>主数据流 A:HTTP 代理路径</h2>
+
+<p>Input:子进程的 HTTP 请求(absolute-form)或 CONNECT(HTTPS 隧道),经 HTTP_PROXY/HTTPS_PROXY 环境变量导向回环代理。<br>
+Output:放行后转发给目标(直连或上游代理或 Unix socket),或返回 403/503 拦截响应。<br>
+Notes:x-unix-socket 头是 macOS 专属逃生舱,严格 allowlist;CONNECT 在 Limited 模式或有 mitm_hook 时必须开 MITM 才能放行。</p>
+
+<pre class="mermaid">
+graph TD
+    child["子进程发请求(HTTP_PROXY 等环境变量指向回环)"]
+    env["apply_to_env 写 HTTP_PROXY/SOCKS5h/NO_PROXY/GIT_SSH_COMMAND + MITM CA 包"]
+    disp{"到哪个监听"}
+    child --> env --> disp
+    disp -->|"HTTP / CONNECT"| hp["run_http_proxy_with_listener 起 HTTP1 服务 + UpgradeLayer"]
+    hp --> ux{"x-unix-socket 头"}
+    ux -->|"是"| unixp["proxy_via_unix_socket 转 Unix socket(macOS+allowlist)"]
+    ux -->|"否"| en1{"enabled"}
+    en1 -->|"否"| dis["proxy_disabled 503+记录+审计"]
+    en1 -->|"是"| kind{"CONNECT 还是普通"}
+    kind -->|"普通 HTTP"| plain["http_plain_proxy 取 host 校验 Host 头"]
+    kind -->|"CONNECT 443"| conn["http_connect_accept 取 authority"]
+    plain --> meth{"method_allowed(Limited 只放 GET/HEAD/OPTIONS)"}
+    meth -->|"否"| methb["json_blocked 403 method_not_allowed"]
+    meth -->|"是"| pol["evaluate_host_policy"]
+    conn --> en2{"enabled"}
+    en2 -->|"否"| dis
+    en2 -->|"是"| pol2["evaluate_host_policy"]
+    pol --> needm1{"需要 MITM(Limited 或 host 有 hook)"}
+    pol2 --> needm1
+    needm1 -->|"需要且无 mitm_state"| mitmreqb["blocked mitm_required"]
+    needm1 -->|"需要且有 mitm_state"| mtunnel["http_connect_proxy → mitm::mitm_tunnel 终结 TLS"]
+    needm1 -->|"不需要"| fwd["forward_connect_tunnel TargetCheckedTcpConnector+TLS StreamForward"]
+    plain --> up{"allow_upstream_proxy"}
+    up -->|"是"| upc["UpstreamClient.from_env_proxy 读环境代理"]
+    up -->|"否"| upd["UpstreamClient.direct"]
+    upc --> ups["serve 建 TLS+HTTP 转发请求"]
+    upd --> ups
+    unixp --> outu["本地 Unix socket 守护进程"]
+    fwd --> out["目标服务器"]
+    ups --> out
+    dis --> resp["子进程收到拦截响应"]
+    methb --> resp
+    mitmreqb --> resp
+</pre>
+
+<h2>主数据流 B:MITM 解密内层</h2>
+
+<p>Input:CONNECT 或 SOCKS5(443)在需要 MITM 时,把 TLS 流量用自签 CA 终结。<br>
+Output:对内层 HTTP 请求做策略+钩子评估后转发,或返回拦截响应。<br>
+Notes:CA 在 codex_home/proxy/ 持久化,per-host 签 ECDSA P-256 证书;hooked host 不匹配任何钩子会被拦(mitm_hook_denied)防绕过。</p>
+
+<pre class="mermaid">
+graph TD
+    enter["mitm_tunnel / mitm_stream 取出 MitmState+ProxyTarget"]
+    cert["tls_acceptor_data_for_host ManagedMitmCa 签 per-host 证书"]
+    tls["TlsAcceptorLayer 终结 TLS HttpServer.auto 处理内层 HTTP"]
+    handle["handle_mitm_request → forward_request → evaluate_mitm_policy"]
+    enter --> cert --> tls --> handle
+    handle --> dec{"内层策略评估"}
+    dec -->|"host 与 target 不一致"| b1["400 host mismatch"]
+    dec -->|"本地/私网 rebinding"| b2["blocked not_allowed_local"]
+    dec -->|"hook 命中但不匹配"| b3["blocked mitm_hook_denied"]
+    dec -->|"method 不允许"| b4["blocked method_not_allowed"]
+    dec -->|"全过"| mf["UpstreamClient.serve 转发 可选 inspect_body 记录"]
+    b1 --> r["拦截响应"]
+    b2 --> r
+    b3 --> r
+    b4 --> r
+    mf --> out["目标服务器"]
+</pre>
+
+<h2>主数据流 C:SOCKS5 路径</h2>
+
+<p>Input:子进程的 SOCKS5 TCP/UDP 请求,经 ALL_PROXY(socks5h://)导向。<br>
+Output:放行后直连或经 MITM,或返回 PermissionDenied 错误。<br>
+Notes:Limited 下 UDP 全拦、非 443 TCP 全拦;443 TCP 在 Limited 或有 hook 时走 MITM,否则直连。</p>
+
+<pre class="mermaid">
+graph TD
+    s5["run_socks5_with_listener 起 SOCKS5 acceptor + UDP relay"]
+    st{"TCP 还是 UDP"}
+    s5 --> st
+    st -->|"TCP"| tcp["handle_socks5_tcp"]
+    st -->|"UDP"| udp["inspect_socks5_udp"]
+    udp --> uen{"enabled"}
+    uen -->|"否"| dis["blocked proxy_disabled"]
+    uen -->|"是"| umode{"Limited"}
+    umode -->|"Limited"| ub["blocked method_not_allowed(UDP 全拦)"]
+    umode -->|"Full"| upol["evaluate_host_policy"]
+    tcp --> ten{"enabled"}
+    ten -->|"否"| dis
+    ten -->|"是"| tmode{"Limited 且非 443"}
+    tmode -->|"是"| tb["blocked method_not_allowed(非 HTTPS TCP 全拦)"]
+    tmode -->|"否"| tpol["evaluate_host_policy"]
+    tpol -->|"Allow"| tmitm{"443 且(Limited 或有 hook)需 MITM"}
+    tmitm -->|"需要且无 mitm_state"| mreq["blocked mitm_required"]
+    tmitm -->|"hook 但非 443"| mreq
+    tmitm -->|"需要且有 mitm_state"| smitm["Socks5TcpConnection::Mitm → mitm::mitm_stream"]
+    tmitm -->|"不需要"| sd["tcp_connector.serve 直连 StreamForward"]
+    smitm --> mflow["进入 MITM 解密内层(见数据流 B)"]
+    upol --> dis2{"Deny"}
+    dis2 -->|"Deny"| blk["blocked + policy_denied_error"]
+    dis2 -->|"Allow"| urel["RelayResponse 放行 UDP"]
+    sd --> out["目标服务器"]
+    ub --> resp["拦截/错误"]
+    tb --> resp
+    mreq --> resp
+    blk --> resp
+    dis --> resp
+</pre>
+
+<h2>策略状态机与热重载</h2>
+
+<p>NetworkProxyState 内部用 <code>RwLock&lt;ConfigState&gt;</code> 持有当前生效配置。每次对外查询(current_cfg/enabled/host_blocked/...)都会先调 <code>reload_if_needed</code>,让 ConfigReloader 判断配置源(如 config.toml)是否变了,变了就重建 ConfigState(重编 glob 集合、重编 mitm hooks、必要时重建 MitmState)。codex 自己改策略时走 <code>add_allowed_domain/add_denied_domain/set_network_mode/replace_config_state</code>,这些方法会先复制当前配置、改副本、用 <code>validate_policy_against_constraints</code> 校验不超出 managed constraints(防止子任务把自己提权),再写回并保留 blocked 缓冲。</p>
+
+<p>状态机要点:<b>NetworkMode</b> 有 Limited/Full 两态,Limited→Full 允许(提权受 constraints 管),Full→Limited 受限。MITM 状态只在 <code>network.mitm=true</code> 且 build_config_state 时构造一次(MitmState 持有 CA + UpstreamClient),后续 reload 若 mitm 关掉则变 None。<b>HostBlockDecision</b> 是无状态计算结果(Allowed / Blocked{Denied, NotAllowed, NotAllowedLocal})。</p>
+
+<h2>通信边界</h2>
+
+<ul>
+<li><b>子进程 ↔ 代理</b>:回环 TCP,HTTP/1.1(absolute-form / CONNECT)或 SOCKS5(含 UDP associate)。子进程通过 HTTP_PROXY/HTTPS_PROXY/ALL_PROXY/NO_PROXY 等环境变量被强制指向代理;macOS 上额外写 GIT_SSH_COMMAND 让 git-ssh 经 SOCKS5。</li>
+<li><b>代理 ↔ 目标</b>:直连 TCP+TLS,或经上游 HTTP 代理(读 HTTP_PROXY/HTTPS_PROXY 环境),或经 Unix socket(x-unix-socket 头,仅 macOS + allowlist)。</li>
+<li><b>代理 ↔ codex 主进程</b>:NetworkProxyState 是共享 Arc,主进程直接调其方法改策略、取 blocked_snapshot/drain_blocked、设置 BlockedRequestObserver 回调;ConfigReloader trait 抽象"配置从哪来"。</li>
+<li><b>审计边界</b>:所有策略决策经 tracing::event!(target: codex_otel.network_proxy) 发 codex.network_proxy.policy_decision 事件,带 conversation_id/app_version/decision/source/reason/protocol 等;BlockedRequest 同时进内存环形缓冲(上限 200 条)并经 observer 回调上报。</li>
+</ul>
+
+<h2>辅助流程:uds / stdio-to-uds 桥接</h2>
+
+<p>Input:进程的 stdin/stdout 或一个 Unix socket 路径。<br>
+Output:把 stdio 双向桥接到 Unix socket,或提供跨平台 UnixListener/UnixStream。<br>
+Notes:<code>uds</code> 在 Unix 上包 tokio 原生 UnixListener/UnixStream,目录强制 0700;在 Windows 上包 uds_windows + async_io。stdio-to-uds 接一个 socket 路径参数,连上后用 tokio::io::copy 双向搬运,stdin→socket 写完会 shutdown 写端(容忍 NotConnected 竞态)。典型场景:macOS 上 GIT_SSH_COMMAND 注入 <code>nc -X 5 -x &lt;socks_addr&gt; %h %p</code>,让 git-ssh 经 SOCKS5 出网。</p>
+
+<pre class="mermaid">
+graph TD
+    u1["prepare_private_socket_directory 建 0700 目录(Unix) 或 create_dir_all(Win)"]
+    u2["UnixListener::bind / accept"]
+    u3["UnixStream::connect"]
+    u4["is_stale_socket_path 判断残留 socket 文件"]
+    u1 --> u2 --> u3
+    u4 --> u2
+    s1["stdio-to-uds main 取 socket 路径参数"]
+    s2["run(socket_path) UnixStream::connect"]
+    s3["tokio::io::split 双向 copy"]
+    s4a["stdin → socket_writer copy + shutdown"]
+    s4b["socket_reader → stdout copy + flush"]
+    s1 --> s2 --> s3 --> s4a
+    s3 --> s4b
+    s4a --> peer["Unix socket 对端(如代理/守护)"]
+    s4b --> peer
+</pre>
+
+<h2>关键决策表(host_blocked 决策顺序)</h2>
+
+<table>
+<tr><th>步骤</th><th>条件</th><th>结果</th></tr>
+<tr><td>1</td><td>deny glob 集命中</td><td>Blocked(Denied)</td></tr>
+<tr><td>2a</td><td>非 allow_local_binding 且 host 是 loopback/私网 IP 字面量</td><td>Blocked(NotAllowedLocal),除非显式 allowlist 精确命中</td></tr>
+<tr><td>2b</td><td>非 allow_local_binding 且 DNS 解析到私网/解析失败</td><td>Blocked(NotAllowedLocal)</td></tr>
+<tr><td>3</td><td>allowlist 为空 或 未命中</td><td>Blocked(NotAllowed)</td></tr>
+<tr><td>4</td><td>以上都不拦</td><td>Allowed</td></tr>
+<tr><td>5</td><td>baseline 给 NotAllowed 且配置了 NetworkPolicyDecider</td><td>交给 decider 最终裁决(可 override 成 Allow)</td></tr>
+</table>
+
+<p>注:decider 只在 baseline 判 NotAllowed 时介入,且只有 Allow 才算 override(审计里 source=decider、policy_override=true)。其余 baseline 的 Denied/NotAllowedLocal 直接生效,decider 无法翻盘。</p>
+
+<dl>
+<dt>入口</dt><dd>NetworkProxy::builder().build() → NetworkProxy::run() 同时起 HTTP 和 SOCKS5(可选)两个 tokio task,返回 NetworkProxyHandle 可 wait/shutdown。</dd>
+<dt>环境注入</dt><dd>NetworkProxy::apply_to_env 把 HTTP_PROXY/HTTPS_PROXY/WS_PROXY/ALL_PROXY/FTP_PROXY/NO_PROXY/NODE_USE_ENV_PROXY/ELECTRON_GET_USE_PROXY/GIT_SSH_COMMAND(macOS) 全写一遍,让子进程各种 HTTP 客户端都走代理;MITM 开启时还会把 CA 信任包路径写到 SSL_CERT_FILE/REQUESTS_CA_BUNDLE 等 10 个 key。</dd>
+<dt>Unix socket 逃生舱</dt><dd>x-unix-socket 头只在 macOS + allow_unix_sockets 命中 + method 允许时放行,把请求转给本地 daemon(如 docker.sock),严格防远端滥用:开启 unix socket 时强制回环绑定。</dd>
+<dt>CA 管理</dt><dd>certs.rs 在 codex_home/proxy/ 下持久化 ca.pem+ca.key(0600/0644,拒绝符号链接/组可读),签发 per-host ECDSA P-256 证书,并把原生根证书 + 自签 CA 合并成 ca-bundle-&lt;sha&gt;.pem 给子进程信任。</dd>
+<dt>MITM 钩子</dt><dd>mitm_hook.rs 按 host 编译钩子,匹配 method/path_prefix/glob、query、header;命中后可剥除指定请求头、注入从 env/file 取出的 secret 头。HookedHostNoMatch(配了钩子但请求没匹配上任何钩子)会被拦(mitm_hook_denied),防止绕过。</dd>
+</dl>
+
+<script>window.__sourceMap = {
+  "child": {"file": "codex-rs/network-proxy/src/proxy.rs", "startLine": 643, "endLine": 655},
+  "env": {"file": "codex-rs/network-proxy/src/proxy.rs", "startLine": 486, "endLine": 593},
+  "disp": {"file": "codex-rs/network-proxy/src/proxy.rs", "startLine": 697, "endLine": 763},
+  "hp": {"file": "codex-rs/network-proxy/src/http_proxy.rs", "startLine": 115, "endLine": 154},
+  "ux": {"file": "codex-rs/network-proxy/src/http_proxy.rs", "startLine": 503, "endLine": 634},
+  "unixp": {"file": "codex-rs/network-proxy/src/http_proxy.rs", "startLine": 805, "endLine": 831},
+  "en1": {"file": "codex-rs/network-proxy/src/runtime.rs", "startLine": 310, "endLine": 314},
+  "dis": {"file": "codex-rs/network-proxy/src/http_proxy.rs", "startLine": 943, "endLine": 994},
+  "kind": {"file": "codex-rs/network-proxy/src/http_proxy.rs", "startLine": 130, "endLine": 146},
+  "plain": {"file": "codex-rs/network-proxy/src/http_proxy.rs", "startLine": 479, "endLine": 680},
+  "conn": {"file": "codex-rs/network-proxy/src/http_proxy.rs", "startLine": 156, "endLine": 329},
+  "meth": {"file": "codex-rs/network-proxy/src/runtime.rs", "startLine": 537, "endLine": 541},
+  "methb": {"file": "codex-rs/network-proxy/src/http_proxy.rs", "startLine": 908, "endLine": 937},
+  "pol": {"file": "codex-rs/network-proxy/src/network_policy.rs", "startLine": 289, "endLine": 359},
+  "en2": {"file": "codex-rs/network-proxy/src/runtime.rs", "startLine": 310, "endLine": 314},
+  "pol2": {"file": "codex-rs/network-proxy/src/network_policy.rs", "startLine": 289, "endLine": 359},
+  "needm1": {"file": "codex-rs/network-proxy/src/http_proxy.rs", "startLine": 255, "endLine": 320},
+  "mitmreqb": {"file": "codex-rs/network-proxy/src/http_proxy.rs", "startLine": 271, "endLine": 312},
+  "mtunnel": {"file": "codex-rs/network-proxy/src/http_proxy.rs", "startLine": 331, "endLine": 405},
+  "fwd": {"file": "codex-rs/network-proxy/src/http_proxy.rs", "startLine": 407, "endLine": 477},
+  "up": {"file": "codex-rs/network-proxy/src/runtime.rs", "startLine": 543, "endLine": 547},
+  "upc": {"file": "codex-rs/network-proxy/src/upstream.rs", "startLine": 110, "endLine": 129},
+  "upd": {"file": "codex-rs/network-proxy/src/upstream.rs", "startLine": 103, "endLine": 122},
+  "ups": {"file": "codex-rs/network-proxy/src/upstream.rs", "startLine": 149, "endLine": 220},
+  "outu": {"file": "codex-rs/network-proxy/src/upstream.rs", "startLine": 242, "endLine": 253},
+  "out": {"file": "codex-rs/network-proxy/src/upstream.rs", "startLine": 149, "endLine": 220},
+  "resp": {"file": "codex-rs/network-proxy/src/responses.rs", "startLine": 76, "endLine": 99},
+  "enter": {"file": "codex-rs/network-proxy/src/mitm.rs", "startLine": 138, "endLine": 180},
+  "cert": {"file": "codex-rs/network-proxy/src/mitm.rs", "startLine": 166, "endLine": 166},
+  "tls": {"file": "codex-rs/network-proxy/src/mitm.rs", "startLine": 188, "endLine": 211},
+  "handle": {"file": "codex-rs/network-proxy/src/mitm.rs", "startLine": 213, "endLine": 275},
+  "dec": {"file": "codex-rs/network-proxy/src/mitm.rs", "startLine": 288, "endLine": 408},
+  "b1": {"file": "codex-rs/network-proxy/src/mitm.rs", "startLine": 306, "endLine": 318},
+  "b2": {"file": "codex-rs/network-proxy/src/mitm.rs", "startLine": 322, "endLine": 349},
+  "b3": {"file": "codex-rs/network-proxy/src/mitm.rs", "startLine": 357, "endLine": 379},
+  "b4": {"file": "codex-rs/network-proxy/src/mitm.rs", "startLine": 383, "endLine": 405},
+  "mf": {"file": "codex-rs/network-proxy/src/mitm.rs", "startLine": 249, "endLine": 275},
+  "r": {"file": "codex-rs/network-proxy/src/mitm.rs", "startLine": 218, "endLine": 224},
+  "s5": {"file": "codex-rs/network-proxy/src/socks5.rs", "startLine": 91, "endLine": 151},
+  "st": {"file": "codex-rs/network-proxy/src/socks5.rs", "startLine": 116, "endLine": 149},
+  "tcp": {"file": "codex-rs/network-proxy/src/socks5.rs", "startLine": 153, "endLine": 408},
+  "udp": {"file": "codex-rs/network-proxy/src/socks5.rs", "startLine": 517, "endLine": 673},
+  "uen": {"file": "codex-rs/network-proxy/src/runtime.rs", "startLine": 310, "endLine": 314},
+  "umode": {"file": "codex-rs/network-proxy/src/runtime.rs", "startLine": 555, "endLine": 559},
+  "ub": {"file": "codex-rs/network-proxy/src/socks5.rs", "startLine": 583, "endLine": 614},
+  "upol": {"file": "codex-rs/network-proxy/src/network_policy.rs", "startLine": 289, "endLine": 359},
+  "ten": {"file": "codex-rs/network-proxy/src/runtime.rs", "startLine": 310, "endLine": 314},
+  "tmode": {"file": "codex-rs/network-proxy/src/socks5.rs", "startLine": 219, "endLine": 265},
+  "tb": {"file": "codex-rs/network-proxy/src/socks5.rs", "startLine": 230, "endLine": 264},
+  "tpol": {"file": "codex-rs/network-proxy/src/network_policy.rs", "startLine": 289, "endLine": 359},
+  "tmitm": {"file": "codex-rs/network-proxy/src/socks5.rs", "startLine": 318, "endLine": 386},
+  "mreq": {"file": "codex-rs/network-proxy/src/socks5.rs", "startLine": 336, "endLine": 372},
+  "smitm": {"file": "codex-rs/network-proxy/src/socks5.rs", "startLine": 374, "endLine": 386},
+  "sd": {"file": "codex-rs/network-proxy/src/socks5.rs", "startLine": 388, "endLine": 407},
+  "mflow": {"file": "codex-rs/network-proxy/src/mitm.rs", "startLine": 144, "endLine": 211},
+  "dis2": {"file": "codex-rs/network-proxy/src/network_policy.rs", "startLine": 294, "endLine": 319},
+  "blk": {"file": "codex-rs/network-proxy/src/socks5.rs", "startLine": 698, "endLine": 703},
+  "urel": {"file": "codex-rs/network-proxy/src/socks5.rs", "startLine": 664, "endLine": 667},
+  "u1": {"file": "codex-rs/uds/src/lib.rs", "startLine": 15, "endLine": 17},
+  "u2": {"file": "codex-rs/uds/src/lib.rs", "startLine": 33, "endLine": 45},
+  "u3": {"file": "codex-rs/uds/src/lib.rs", "startLine": 52, "endLine": 58},
+  "u4": {"file": "codex-rs/uds/src/lib.rs", "startLine": 24, "endLine": 26},
+  "s1": {"file": "codex-rs/stdio-to-uds/src/main.rs", "startLine": 6, "endLine": 20},
+  "s2": {"file": "codex-rs/stdio-to-uds/src/lib.rs", "startLine": 12, "endLine": 16},
+  "s3": {"file": "codex-rs/stdio-to-uds/src/lib.rs", "startLine": 17, "endLine": 23},
+  "s4a": {"file": "codex-rs/stdio-to-uds/src/lib.rs", "startLine": 24, "endLine": 40},
+  "s4b": {"file": "codex-rs/stdio-to-uds/src/lib.rs", "startLine": 18, "endLine": 23},
+  "peer": {"file": "codex-rs/uds/src/lib.rs", "startLine": 52, "endLine": 58}
+}</script>
+
+<aside id="source-panel"><div id="source-header"></div><div id="monaco-container"></div></aside>
+<script src="assets/codeindex-runtime.js"></script>
+<script src="assets/codeindex.js"></script>
+</body>
+</html>

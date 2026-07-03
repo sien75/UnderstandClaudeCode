@@ -1,0 +1,318 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MCP and External Tool Integration</title>
+<link rel="stylesheet" href="assets/codeindex.css">
+</head>
+<body>
+<p><a href="index.html">← Back to overview</a></p>
+<h1>MCP and External Tool Integration</h1>
+
+<p>This section covers how Codex talks to "the outside world." Model Context Protocol (MCP) is a JSON-RPC protocol, and Codex plays two roles in it. On one hand it is an <strong>MCP client</strong>: it connects to the various external MCP servers declared in config.toml (such as GitHub, filesystem, or custom tools), pulls back the tools and resources those servers provide, and feeds them to the model. On the other hand it is an <strong>MCP server</strong>: it packages its own "coding agent" capabilities as the <code>codex</code> and <code>codex-reply</code> tools and exposes them to external MCP clients such as Claude or an IDE. In addition, there is a <strong>plugin/extension</strong> mechanism that lets third-party packages declare their own MCP servers, contribute tools, and hook into the conversation lifecycle.</p>
+
+<h2>What users and external systems can do</h2>
+<ul>
+  <li>Declare MCP servers in config.toml (stdio child process or streamable HTTP); Codex auto-starts, handshakes, and lists tools on launch → <strong>MCP client integration</strong></li>
+  <li>Perform OAuth login against an external MCP server (<code>codex mcp login &lt;server&gt;</code>) and store tokens in keyring or a file → <strong>MCP client integration</strong></li>
+  <li>The model calls <code>mcp__&lt;server&gt;__&lt;tool&gt;</code> tools in conversation; Codex routes them to the corresponding server → <strong>MCP client integration</strong></li>
+  <li>External MCP clients (Claude/IDE) connect to the codex-mcp process over stdio, call the <code>codex</code> tool to start a coding task, and receive <code>codex/event</code> event streams and the final result → <strong>MCP server exposure</strong></li>
+  <li>External clients use the <code>codex-reply</code> tool with a threadId to continue an existing session → <strong>MCP server exposure</strong></li>
+  <li>External clients receive <code>elicitation/create</code> requests when execution/patching needs approval, and reply agree/reject → <strong>MCP server exposure</strong></li>
+  <li>Plugin packages declare MCP servers in their own mcp_servers files; Codex loads and merges them into the runtime catalog → <strong>Plugin/extension integration</strong></li>
+  <li>Extensions contribute tools and mount onto the conversation/tool lifecycle via the Extension API → <strong>Plugin/extension integration</strong></li>
+</ul>
+
+<h2>Overall architecture: three roles</h2>
+<p>The whole scope spans six crates with clear layered responsibilities: <code>codex-mcp</code> is the "brain" that turns configuration into a runtime server catalog, aggregates concurrent client connections, and uniformly exposes tool/resource APIs; <code>rmcp-client</code> is the "transport layer" that wraps the connection lifecycle of a single MCP server (stdio process, HTTP, OAuth); <code>mcp-server</code> is Codex's implementation when it acts as a server, handling external JSON-RPC and driving codex-core to run a task; <code>connectors</code> merges tools from multiple sources, filters them, and performs policy adjudication; <code>plugin</code> defines plugin manifests and loading; <code>ext</code> contains built-in extensions (skills, memories, web-search, goal, image-generation, mcp executor plugin, guardian) and the Extension API itself.</p>
+
+<h2>Flow 1: Codex as MCP client — from configuration to callable tools</h2>
+
+<p>This main line answers: "I wrote an MCP server in config.toml, and now the model can call its tools—what happened in between?" The entry point is codex-core session initialization (outside this scope), which calls <code>codex-mcp</code>'s exposed <code>effective_mcp_servers</code> to turn the server catalog in config into a "pending startup" runtime view, then uses <code>McpConnectionManager::new</code> to spin up all clients concurrently.</p>
+
+<pre class="mermaid">
+graph TD
+    f1_A["User declares MCP server in config.toml"] --> f1_B["McpConfig carries server catalog + OAuth/approval policy"]
+    f1_B --> f1_C["effective_mcp_servers: filter disabled, gate codex_apps by auth"]
+    f1_C --> f1_D["McpConnectionManager::new concurrently builds an AsyncManagedClient per server"]
+    f1_D --> f1_E{"Per server: make_rmcp_client"}
+    f1_E -->|"stdio local"| f1_F["LocalStdioServerLauncher: tokio child process + process group"]
+    f1_E -->|"stdio remote"| f1_G["ExecutorStdioServerLauncher: launched via ExecBackend"]
+    f1_E -->|"streamable HTTP"| f1_H["resolve_bearer_token or OAuth transport"]
+    f1_F --> f1_I["create_pending_transport: obtain rmcp Transport"]
+    f1_G --> f1_I
+    f1_H --> f1_I
+    f1_I --> f1_J["RmcpClient::initialize: handshake + capability negotiation (elicitation/sandbox-state)"]
+    f1_J --> f1_K{"Handshake result"}
+    f1_K -->|failure| f1_L["StartupOutcomeError: cancel/timeout/needs-login - emit McpStartupUpdate Failed"]
+    f1_K -->|success| f1_M["list_tools_for_client_uncached: fetch tool list"]
+    f1_M --> f1_N["filter_tools: filter by allow/deny list"]
+    f1_N --> f1_O["sanitize connector metadata: strip untrusted connector_* fields from non-codex_apps"]
+    f1_O --> f1_P["normalize callable_name/namespace: model-visible name mcp__server__tool"]
+    f1_P --> f1_Q["Write codex_apps tool cache (codex_apps servers only)"]
+    f1_Q --> f1_R["ManagedClient ready, stored in clients map"]
+    f1_R --> f1_S["Emit McpStartupUpdate Ready; emit McpStartupComplete when all done"]
+    f1_L --> f1_S
+    f1_S --> f1_T["list_all_tools: aggregate tools from all servers - expose to model"]
+    f1_T --> f1_U["Model calls mcp__server__tool"]
+    f1_U --> f1_V["McpConnectionManager::call_tool: route to the corresponding client"]
+    f1_V --> f1_W["RmcpClient::call_tool: send tools/call request"]
+    f1_W --> f1_X{"HTTP 404 session expired?"}
+    f1_X -->|"yes"| f1_Y["reinitialize_after_session_expiry: rebuild transport with TransportRecipe"]
+    f1_Y --> f1_W
+    f1_X -->|"no"| f1_Z["Return CallToolResult to codex-core"]
+</pre>
+
+<p>The key "state machine" lives inside <code>RmcpClient</code>: <code>ClientState</code> has three states—<code>Connecting</code> (handshaking, holding pending transport) → <code>Ready</code> (holding RunningService and optional OAuthPersistor) → <code>Closed</code>. Every operation goes through the <code>run_service_operation</code> pipeline: refresh OAuth token first, with transient retry (250 ms / 1000 ms backoff), and on HTTP 404 session expiry rebuild the transport under the <code>session_recovery_lock</code> semaphore using the saved <code>TransportRecipe</code>, then replay the operation once. The Elicitation pause state (<code>ElicitationPauseState</code>) pauses the operation timeout clock while the server is eliciting input from the user, so the user isn't interrupted by a timeout while thinking.</p>
+
+<p><strong>OAuth login subflow</strong>: HTTP servers first determine authentication status before the handshake (<code>determine_streamable_http_auth_status</code>): bearer token env var present → BearerToken; usable stored OAuth token → OAuth; stored token needs authorization → NotLoggedIn; otherwise perform RFC 8414 <code>/.well-known/oauth-authorization-server</code> discovery; if discovery succeeds → NotLoggedIn, otherwise → Unsupported. When the user runs <code>codex mcp login</code> it goes through <code>perform_oauth_login</code>: start a local callback HTTP service, build the authorization URL, open the browser/print the link, wait for the callback code, exchange it for tokens, and store them in the keyring (with a file fallback <code>~/.codex/.credentials.json</code>).</p>
+
+<h2>Flow 2: Codex as MCP server — external clients drive coding tasks</h2>
+
+<p>This main line answers: "Claude or an IDE calls codex tools through MCP to write code—what happens?" The entry point is <code>mcp-server</code>'s <code>run_main</code> (main.rs is just an arg0 dispatch shell). It spawns three tokio tasks: stdin reader, message processor, and stdout writer, chained by a bounded mpsc channel. <code>MessageProcessor</code> is the core dispatcher; it holds codex-core's <code>ThreadManager</code> and translates external JSON-RPC requests into operations on the codex-core session.</p>
+
+<pre class="mermaid">
+graph TD
+    f2_A["External MCP client sends JSON-RPC (stdio)"] --> f2_B["stdin reader: parse JsonRpcMessage line by line"]
+    f2_B --> f2_C["incoming_tx channel - MessageProcessor"]
+    f2_C --> f2_D{"Message type"}
+    f2_D -->|Request| f2_E["process_request"]
+    f2_D -->|Response| f2_F["process_response: wake earlier elicitation oneshot"]
+    f2_D -->|Notification| f2_G["process_notification"]
+    f2_D -->|Error| f2_H["process_error: log only"]
+    f2_E --> f2_I{"ClientRequest variant"}
+    f2_I -->|Initialize| f2_J["handle_initialize: set serverInfo, capability=tools, store client UA"]
+    f2_I -->|ListTools| f2_K["handle_list_tools: return codex + codex-reply Tool definitions"]
+    f2_I -->|CallTool codex| f2_L["handle_tool_call_codex: parse CodexToolCallParam - into_config"]
+    f2_I -->|CallTool codex-reply| f2_M["handle_tool_call_codex_session_reply: parse threadId to get existing thread"]
+    f2_I -->|Other resources/prompts| f2_N["stub: log only (MVP not implemented)"]
+    f2_I -->|tasks or custom| f2_O["METHOD_NOT_FOUND"]
+    f2_L --> f2_P["spawn run_codex_tool_session"]
+    f2_M --> f2_Q["spawn run_codex_tool_session_reply"]
+    f2_P --> f2_R["thread_manager.start_thread - new thread_id"]
+    f2_Q --> f2_S["thread_manager.get_thread"]
+    f2_S --> f2_T{"Thread exists?"}
+    f2_T -->|"no"| f2_U["Return error CallToolResult with threadId"]
+    f2_T -->|"yes"| f2_V["Register request_id to thread_id mapping"]
+    f2_R --> f2_V
+    f2_V --> f2_W["submit Op::UserInput"]
+    f2_W --> f2_X["run_codex_tool_session_inner event loop"]
+    f2_X --> f2_Y{"thread.next_event"}
+    f2_Y -->|Each Event| f2_Z["Emit codex/event notification (_meta carries requestId/threadId)"]
+    f2_Y -->|ExecApprovalRequest| f2_AA["handle_exec_approval: emit elicitation/create - client decides - Op::ExecApproval"]
+    f2_Y -->|ApplyPatchApprovalRequest| f2_AB["handle_patch_approval: emit elicitation/create - Op::PatchApproval (default Deny if no response)"]
+    f2_Y -->|Error| f2_AC["Emit error CallToolResult - break"]
+    f2_Y -->|TurnComplete| f2_AD["Emit success CallToolResult (last_agent_message) - delete mapping - break"]
+    f2_Y -->|Err| f2_AE["Emit error CallToolResult - break"]
+    f2_AA --> f2_X
+    f2_AB --> f2_X
+    f2_AD --> f2_AF["Thread stays in ThreadManager; client can continue with codex-reply"]
+    f2_G --> f2_AG{"Notification variant"}
+    f2_AG -->|Cancelled| f2_AH["Lookup mapping - get thread - submit Op::Interrupt - delete mapping"]
+    f2_AG -->|Other| f2_AI["Log only"]
+</pre>
+
+<p>This is a typical <strong>session-lifecycle state machine</strong>: uninitialized → receives initialize → initialized (only allowed once, second returns invalid_request). Each <code>codex</code> tool call creates a new Codex thread and enters a "running event loop"; TurnComplete/Error/Err are terminal states, but the thread itself is not destroyed—it remains for <code>codex-reply</code> to continue. Multiple threads can run concurrently, so every <code>codex/event</code> carries a <code>threadId</code> for multiplexing. <code>running_requests_id_to_codex_uuid</code> is the single source of truth for cancellation and terminal cleanup.</p>
+
+<p><strong>Bidirectional approval communication</strong> is the highlight of this flow: when codex-core wants to execute a command or apply a patch, it does not ask the user itself. Instead it sends an <code>elicitation/create</code> JSON-RPC request to the external client via <code>OutgoingMessageSender::send_request</code>, registers a oneshot callback, and the event loop <code>continue</code> keeps pulling events (non-blocking). After the external client replies, <code>process_response</code> wakes the callback, and the callback task submits <code>Op::ExecApproval</code>/<code>Op::PatchApproval</code> back to codex-core. Patch approval proactively Denies when the channel is disconnected, making it more conservative than command approval.</p>
+
+<h2>Flow 3: Plugin and extension integration — how third-party capabilities plug into Codex</h2>
+
+<p>This main line answers: "A plugin package declares its own MCP servers, skills, app connectors, and hooks—how do these flow into Codex's runtime?" It splits into two parallel paths: the <strong>plugin manifest path</strong> (plugin crate, responsible for statically loading MCP server/skill/app declarations) and the <strong>Extension API path</strong> (ext/extension-api, responsible for runtime hooking of extensions into the conversation/tool lifecycle).</p>
+
+<pre class="mermaid">
+graph TD
+    f3_A["Plugin package: PluginManifest name,paths,interface"] --> f3_B["PluginProvider::resolve: pick root - ResolvedPlugin (permission bound)"]
+    f3_B --> f3_C["LoadedPlugin: materialize mcp_servers/skill_roots/apps/hook_sources"]
+    f3_C --> f3_D["PluginLoadOutcome: aggregate all active plugins"]
+    f3_D --> f3_E["effective_mcp_servers: first definition wins for same name"]
+    f3_D --> f3_F["effective_apps: union of app connector IDs"]
+    f3_D --> f3_G["effective_skill_roots: union of skill roots"]
+    f3_F --> f3_H["connectors/merge: directory apps + reachable apps + plugin declarations union by ID"]
+    f3_H --> f3_I["connectors/filter: drop blacklist connector_id, narrow discoverable suggestions"]
+    f3_I --> f3_J["connectors/app_tool_policy: AppToolPolicyEvaluator adjudicates per-tool enable + approval"]
+    f3_J --> f3_K["Admin policy (immutable) > tool config > app default > prompt"]
+    f3_E --> f3_L["Merge into McpConfig.mcp_server_catalog"]
+    f3_L --> f3_M["Back to Flow 1: effective_mcp_servers - McpConnectionManager"]
+    f3_K --> f3_M
+    f3_G --> f3_N["host calls ext::*::install to register Contributor"]
+    f3_N --> f3_O["ExtensionRegistryBuilder registers each kind of Contributor"]
+    f3_O --> f3_P["build - ExtensionRegistry (immutable)"]
+    f3_P --> f3_Q{"Runtime looks up Contributors by event"}
+    f3_Q -->|"McpServerContributor"| f3_R["Contribute Set/Remove/SelectedPlugin MCP server overlays"]
+    f3_Q -->|"ThreadLifecycleContributor"| f3_S["on_thread_start: seed thread state with ExtensionData"]
+    f3_Q -->|"TurnInputContributor"| f3_T["Inject ContextualUserFragment (e.g. skill instructions)"]
+    f3_Q -->|"ContextContributor"| f3_U["Inject PromptFragment (with slot)"]
+    f3_Q -->|"ToolContributor"| f3_V["Contribute ToolExecutor (skills/memories/web-search/goal/image-gen)"]
+    f3_Q -->|"ToolLifecycleContributor"| f3_W["on_tool_start/finish: observe only"]
+    f3_Q -->|"TurnLifecycleContributor"| f3_X["on_turn_start/stop/abort/error"]
+    f3_Q -->|"TurnItemContributor"| f3_Y["Rewrite TurnItem before emit"]
+    f3_Q -->|"ApprovalReviewContributor"| f3_Z["Return Option&lt;ReviewDecision&gt;"]
+    f3_R --> f3_AA["Host assembles: prompt fragments + native tools + MCP server tools"]
+    f3_T --> f3_AA
+    f3_U --> f3_AA
+    f3_V --> f3_AA
+    f3_AA --> f3_AB["Feed to model - model calls tools"]
+    f3_AB --> f3_W
+    f3_AB --> f3_Y
+</pre>
+
+<p>There are three boundaries worth marking here: <strong>Communication boundary</strong> at <code>ExtensionRegistry</code>—host and extensions communicate only through trait objects (<code>Arc&lt;dyn ...Contributor&gt;</code>), extension private state is isolated by <code>ExtensionData</code> (a TypeId-keyed Any map) across session/thread/turn scopes, and extensions cannot access host internal structures. <strong>State-machine boundary</strong> at lifecycle contributors—threads have start/resume/idle/stop, turns have start/stop/abort/error, and tool calls have start/finish (Completed/Blocked/Failed/Aborted), forming nested state layers. <strong>Adjudication table</strong> at <code>AppToolPolicyEvaluator</code>—the "enable + approval mode" for each app tool is adjudicated by a fixed priority chain: admin requirement (immutable) > tool-level config > app default > destructive/open-world prompt, producing one of four levels: Auto/OnFailure/Always/OnRequest.</p>
+
+<h2>One sentence per module</h2>
+<dl>
+<dt>codex-mcp (brain)</dt>
+<dd>Turns the server catalog in McpConfig into a set of concurrent AsyncManagedClients, aggregates tools/resources, and uniformly exposes them to codex-core. Input: configuration + auth; Output: callable tool list + resource reads + tool-call routing.</dd>
+<dt>codex-mcp/rmcp_client (single-client lifecycle)</dt>
+<dd>Turns one EffectiveMcpServer into a handshake-complete, tool-listed, routable ManagedClient. Input: server config + runtime context; Output: ManagedClient or StartupOutcomeError.</dd>
+<dt>codex-mcp/connection_manager (aggregator)</dt>
+<dd>Aggregates multiple ManagedClients into one external interface, routes (server,tool) calls, and manages startup-state events. Input: server map; Output: list_all_tools/call_tool/list_resources/read_resource.</dd>
+<dt>codex-mcp/mcp (config layer)</dt>
+<dd>Turns ResolvedMcpCatalog and auth policy into the EffectiveMcpServer runtime view, handling OAuth state computation and tool-name prefixing. Input: McpConfig; Output: effective_mcp_servers + status snapshot.</dd>
+<dt>codex-mcp/elicitation + auth_elicitation</dt>
+<dd>Turns server-originated CreateElicitation requests into Codex protocol events, auto-accepting/rejecting or handing to the user per approval policy. Input: server elicitation; Output: ElicitationResponse or Event.</dd>
+<dt>codex-mcp/plugin_config</dt>
+<dd>Parses plugin mcp_servers files (two formats) into a standardized McpServerConfig and binds env-var sources. Input: plugin root + file content; Output: PluginMcpConfigParseOutcome.</dd>
+<dt>rmcp-client (transport layer)</dt>
+<dd>Turns a TransportRecipe into a reconnectable RmcpClient, wrapping stdio/HTTP/OAuth transports. Input: transport recipe; Output: initialize/list_tools/call_tool/shutdown.</dd>
+<dt>rmcp-client/stdio_server_launcher</dt>
+<dd>Turns a StdioServerCommand into an rmcp Transport, using tokio child process locally and ExecBackend remotely. Input: command line; Output: Transport byte stream + process handle.</dd>
+<dt>rmcp-client/http_client_adapter</dt>
+<dd>Turns rmcp JSON-RPC operations into HTTP requests (SSE/single-message), handling 401/403/404. Input: JSON-RPC message; Output: HTTP request + response stream.</dd>
+<dt>rmcp-client/oauth + perform_oauth_login</dt>
+<dd>Turns a server URL into a browser OAuth authorization-code flow and stores tokens in keyring (with file fallback). Input: URL + scope; Output: StoredOAuthTokens.</dd>
+<dt>mcp-server (Codex as server)</dt>
+<dd>Turns external JSON-RPC requests into operations on codex-core threads and turns Event streams into codex/event notifications. Input: stdio JSON-RPC; Output: tool results + event stream + elicitations.</dd>
+<dt>connectors (app connector discovery)</dt>
+<dd>Merges ChatGPT app catalog + reachable tools + plugin declarations by ID and adjudicates each tool's enablement and approval. Input: directory API + tool metadata; Output: merged AppInfo + AppToolPolicy.</dd>
+<dt>plugin (plugin model)</dt>
+<dd>Turns plugin manifests into LoadedPlugins and aggregates effective resource unions. Input: manifest + disk root; Output: MCP servers/skills/apps/hooks unions.</dd>
+<dt>ext/extension-api (extension contract)</dt>
+<dd>Defines eleven Contributor trait types and three-layer ExtensionData state; the host queries through ExtensionRegistry. Input: extension install registration; Output: tools/prompts/MCP overlays/lifecycle callbacks.</dd>
+<dt>ext/mcp (MCP executor plugin)</dt>
+<dd>When a thread selects an executor plugin, parses its stdio MCP server and contributes it as a SelectedPlugin overlay. Input: selected plugin root; Output: McpServerContribution::SelectedPlugin.</dd>
+<dt>ext/skills</dt>
+<dd>Reads skill main prompts mentioned by the user and injects them into turn input, contributing skill list/read tools. Input: user input + skill roots; Output: prompt fragments + skill tools.</dd>
+<dt>ext/memories</dt>
+<dd>Contributes memory developer instructions and list/read/search/add_note tools (stored locally in codex_home). Input: config; Output: prompt fragments + memory tools.</dd>
+<dt>ext/web-search</dt>
+<dd>Contributes the web.run tool (OpenAI model-provider backend). Input: config + auth; Output: WebSearchTool.</dd>
+<dt>ext/goal</dt>
+<dd>Manages persistent goal state across threads/turns, performs budget accounting and progress counting, and contributes goal tools. Input: state DB; Output: goal tools + steering + accounting.</dd>
+<dt>ext/image-generation</dt>
+<dd>Contributes the image_gen.imagegen tool (Codex images backend). Input: config + auth; Output: ImageGenerationTool.</dd>
+<dt>ext/guardian</dt>
+<dd>Captures the thread id and host-injected AgentSpawner for forking review subagents. Input: thread id; Output: thread-local forked-from context.</dd>
+</dl>
+
+<h2>Key findings</h2>
+<ul>
+  <li><strong>Dual identity</strong>: Codex is both client (codex-mcp + rmcp-client) and server (mcp-server) in the MCP protocol. The two sides share rmcp's JSON-RPC model but have completely different responsibilities—the client side aggregates external tools for the model, while the server side exposes Codex coding capabilities to external clients.</li>
+  <li><strong>Three-level cache</strong>: codex_apps tools have a startup snapshot cache (immediately available at startup) + runtime cache (listed_tools hit) + hard refresh (hard_refresh_codex_apps_tools_cache bypasses cache), solving the slow-remote-app-tool-list problem.</li>
+  <li><strong>Untrusted metadata stripping</strong>: connector_* metadata from non-codex_apps servers is stripped by sanitize_tool_connector_metadata, preventing external servers from impersonating connector identities; only trusted codex_apps servers retain it.</li>
+  <li><strong>Session recovery</strong>: RmcpClient rebuilds the transport under session_recovery_lock using the saved TransportRecipe when it sees HTTP 404, then replays the operation transparently to callers.</li>
+  <li><strong>Elicitation pause clock</strong>: ElicitationPauseState pauses the operation timeout clock while the server is eliciting user input, so the user isn't interrupted by a timeout while thinking.</li>
+  <li><strong>Bidirectional approval channel</strong>: mcp-server does not ask the user directly; it sends elicitation/create to the external client, the event loop remains non-blocking, and the client reply wakes the oneshot callback via process_response; patch approval proactively Denies when the channel is disconnected.</li>
+  <li><strong>Plugin MCP name collisions</strong>: effective_mcp_servers uses first-definition-wins with RegistrationPrecedence priority layers (Plugin > SelectedPlugin > Config > Compatibility > Extension).</li>
+  <li><strong>Three-layer extension state isolation</strong>: ExtensionData isolates extension private state across session/thread/turn scopes using a TypeId-keyed Any map; extensions cannot access host internal structures.</li>
+  <li><strong>mcp-server is an MVP</strong>: resources/prompts/logging/completion are stubs that only log; only tools-related methods and elicitation are implemented; tasks/* directly returns METHOD_NOT_FOUND.</li>
+</ul>
+
+<script>window.__sourceMap = {
+  "f1_A": {"file":"codex-rs/codex-mcp/src/mcp/mod.rs","startLine":110,"endLine":148},
+  "f1_B": {"file":"codex-rs/codex-mcp/src/mcp/mod.rs","startLine":110,"endLine":148},
+  "f1_C": {"file":"codex-rs/codex-mcp/src/mcp/mod.rs","startLine":242,"endLine":266},
+  "f1_D": {"file":"codex-rs/codex-mcp/src/connection_manager.rs","startLine":118,"endLine":281},
+  "f1_E": {"file":"codex-rs/codex-mcp/src/rmcp_client.rs","startLine":579,"endLine":663},
+  "f1_F": {"file":"codex-rs/rmcp-client/src/stdio_server_launcher.rs","startLine":172,"endLine":194},
+  "f1_G": {"file":"codex-rs/rmcp-client/src/stdio_server_launcher.rs","startLine":440,"endLine":458},
+  "f1_H": {"file":"codex-rs/codex-mcp/src/rmcp_client.rs","startLine":435,"endLine":460},
+  "f1_I": {"file":"codex-rs/rmcp-client/src/rmcp_client.rs","startLine":745,"endLine":852},
+  "f1_J": {"file":"codex-rs/rmcp-client/src/rmcp_client.rs","startLine":406,"endLine":469},
+  "f1_K": {"file":"codex-rs/codex-mcp/src/rmcp_client.rs","startLine":173,"endLine":220},
+  "f1_L": {"file":"codex-rs/codex-mcp/src/connection_manager.rs","startLine":843,"endLine":897},
+  "f1_M": {"file":"codex-rs/codex-mcp/src/rmcp_client.rs","startLine":345,"endLine":408},
+  "f1_N": {"file":"codex-rs/codex-mcp/src/tools.rs","startLine":84,"endLine":114},
+  "f1_O": {"file":"codex-rs/codex-mcp/src/rmcp_client.rs","startLine":410,"endLine":434},
+  "f1_P": {"file":"codex-rs/codex-mcp/src/rmcp_client.rs","startLine":356,"endLine":403},
+  "f1_Q": {"file":"codex-rs/codex-mcp/src/rmcp_client.rs","startLine":524,"endLine":536},
+  "f1_R": {"file":"codex-rs/codex-mcp/src/rmcp_client.rs","startLine":539,"endLine":548},
+  "f1_S": {"file":"codex-rs/codex-mcp/src/connection_manager.rs","startLine":258,"endLine":280},
+  "f1_T": {"file":"codex-rs/codex-mcp/src/connection_manager.rs","startLine":447,"endLine":485},
+  "f1_U": {"file":"codex-rs/codex-mcp/src/connection_manager.rs","startLine":677,"endLine":712},
+  "f1_V": {"file":"codex-rs/codex-mcp/src/connection_manager.rs","startLine":677,"endLine":712},
+  "f1_W": {"file":"codex-rs/rmcp-client/src/rmcp_client.rs","startLine":580,"endLine":636},
+  "f1_X": {"file":"codex-rs/rmcp-client/src/rmcp_client.rs","startLine":1049,"endLine":1067},
+  "f1_Y": {"file":"codex-rs/rmcp-client/src/rmcp_client.rs","startLine":1069,"endLine":1128},
+  "f1_Z": {"file":"codex-rs/rmcp-client/src/rmcp_client.rs","startLine":580,"endLine":636},
+  "f2_A": {"file":"codex-rs/mcp-server/src/lib.rs","startLine":126,"endLine":146},
+  "f2_B": {"file":"codex-rs/mcp-server/src/lib.rs","startLine":126,"endLine":146},
+  "f2_C": {"file":"codex-rs/mcp-server/src/lib.rs","startLine":148,"endLine":172},
+  "f2_D": {"file":"codex-rs/mcp-server/src/message_processor.rs","startLine":91,"endLine":100},
+  "f2_E": {"file":"codex-rs/mcp-server/src/message_processor.rs","startLine":91,"endLine":165},
+  "f2_F": {"file":"codex-rs/mcp-server/src/message_processor.rs","startLine":167,"endLine":171},
+  "f2_G": {"file":"codex-rs/mcp-server/src/message_processor.rs","startLine":173,"endLine":194},
+  "f2_H": {"file":"codex-rs/mcp-server/src/message_processor.rs","startLine":196,"endLine":198},
+  "f2_I": {"file":"codex-rs/mcp-server/src/message_processor.rs","startLine":101,"endLine":110},
+  "f2_J": {"file":"codex-rs/mcp-server/src/message_processor.rs","startLine":200,"endLine":240},
+  "f2_K": {"file":"codex-rs/mcp-server/src/message_processor.rs","startLine":312,"endLine":328},
+  "f2_L": {"file":"codex-rs/mcp-server/src/message_processor.rs","startLine":330,"endLine":349},
+  "f2_M": {"file":"codex-rs/mcp-server/src/message_processor.rs","startLine":407,"endLine":488},
+  "f2_N": {"file":"codex-rs/mcp-server/src/message_processor.rs","startLine":284,"endLine":310},
+  "f2_O": {"file":"codex-rs/mcp-server/src/message_processor.rs","startLine":490,"endLine":496},
+  "f2_P": {"file":"codex-rs/mcp-server/src/codex_tool_runner.rs","startLine":57,"endLine":141},
+  "f2_Q": {"file":"codex-rs/mcp-server/src/codex_tool_runner.rs","startLine":143,"endLine":192},
+  "f2_R": {"file":"codex-rs/mcp-server/src/codex_tool_runner.rs","startLine":67,"endLine":78},
+  "f2_S": {"file":"codex-rs/mcp-server/src/codex_tool_runner.rs","startLine":155,"endLine":170},
+  "f2_T": {"file":"codex-rs/mcp-server/src/codex_tool_runner.rs","startLine":172,"endLine":190},
+  "f2_U": {"file":"codex-rs/mcp-server/src/codex_tool_runner.rs","startLine":172,"endLine":190},
+  "f2_V": {"file":"codex-rs/mcp-server/src/codex_tool_runner.rs","startLine":99,"endLine":118},
+  "f2_W": {"file":"codex-rs/mcp-server/src/codex_tool_runner.rs","startLine":119,"endLine":125},
+  "f2_X": {"file":"codex-rs/mcp-server/src/codex_tool_runner.rs","startLine":194,"endLine":411},
+  "f2_Y": {"file":"codex-rs/mcp-server/src/codex_tool_runner.rs","startLine":205,"endLine":216},
+  "f2_Z": {"file":"codex-rs/mcp-server/src/codex_tool_runner.rs","startLine":208,"endLine":216},
+  "f2_AA": {"file":"codex-rs/mcp-server/src/exec_approval.rs","startLine":51,"endLine":110},
+  "f2_AB": {"file":"codex-rs/mcp-server/src/patch_approval.rs","startLine":44,"endLine":101},
+  "f2_AC": {"file":"codex-rs/mcp-server/src/codex_tool_runner.rs","startLine":255,"endLine":264},
+  "f2_AD": {"file":"codex-rs/mcp-server/src/codex_tool_runner.rs","startLine":301,"endLine":318},
+  "f2_AE": {"file":"codex-rs/mcp-server/src/codex_tool_runner.rs","startLine":400,"endLine":408},
+  "f2_AF": {"file":"codex-rs/mcp-server/src/codex_tool_runner.rs","startLine":316,"endLine":318},
+  "f2_AG": {"file":"codex-rs/mcp-server/src/message_processor.rs","startLine":173,"endLine":194},
+  "f2_AH": {"file":"codex-rs/mcp-server/src/message_processor.rs","startLine":515,"endLine":560},
+  "f2_AI": {"file":"codex-rs/mcp-server/src/message_processor.rs","startLine":173,"endLine":194},
+  "f3_A": {"file":"codex-rs/plugin/src/manifest.rs","startLine":8,"endLine":57},
+  "f3_B": {"file":"codex-rs/plugin/src/provider.rs","startLine":115,"endLine":128},
+  "f3_C": {"file":"codex-rs/plugin/src/load_outcome.rs","startLine":17,"endLine":31},
+  "f3_D": {"file":"codex-rs/plugin/src/load_outcome.rs","startLine":90,"endLine":188},
+  "f3_E": {"file":"codex-rs/plugin/src/load_outcome.rs","startLine":144,"endLine":171},
+  "f3_F": {"file":"codex-rs/plugin/src/load_outcome.rs","startLine":144,"endLine":171},
+  "f3_G": {"file":"codex-rs/plugin/src/load_outcome.rs","startLine":144,"endLine":171},
+  "f3_H": {"file":"codex-rs/connectors/src/merge.rs","startLine":8,"endLine":119},
+  "f3_I": {"file":"codex-rs/connectors/src/filter.rs","startLine":5,"endLine":66},
+  "f3_J": {"file":"codex-rs/connectors/src/app_tool_policy.rs","startLine":37,"endLine":67},
+  "f3_K": {"file":"codex-rs/connectors/src/app_tool_policy.rs","startLine":140,"endLine":203},
+  "f3_L": {"file":"codex-rs/codex-mcp/src/mcp/mod.rs","startLine":242,"endLine":247},
+  "f3_M": {"file":"codex-rs/codex-mcp/src/connection_manager.rs","startLine":118,"endLine":281},
+  "f3_N": {"file":"codex-rs/ext/extension-api/src/registry.rs","startLine":21,"endLine":149},
+  "f3_O": {"file":"codex-rs/ext/extension-api/src/registry.rs","startLine":55,"endLine":149},
+  "f3_P": {"file":"codex-rs/ext/extension-api/src/registry.rs","startLine":152,"endLine":242},
+  "f3_Q": {"file":"codex-rs/ext/extension-api/src/contributors.rs","startLine":54,"endLine":259},
+  "f3_R": {"file":"codex-rs/ext/extension-api/src/contributors/mcp.rs","startLine":55,"endLine":71},
+  "f3_S": {"file":"codex-rs/ext/extension-api/src/contributors.rs","startLine":78,"endLine":114},
+  "f3_T": {"file":"codex-rs/ext/extension-api/src/contributors.rs","startLine":162,"endLine":171},
+  "f3_U": {"file":"codex-rs/ext/extension-api/src/contributors.rs","startLine":65,"endLine":71},
+  "f3_V": {"file":"codex-rs/ext/extension-api/src/contributors.rs","startLine":211,"endLine":218},
+  "f3_W": {"file":"codex-rs/ext/extension-api/src/contributors.rs","startLine":225,"endLine":235},
+  "f3_X": {"file":"codex-rs/ext/extension-api/src/contributors.rs","startLine":121,"endLine":154},
+  "f3_Y": {"file":"codex-rs/ext/extension-api/src/contributors.rs","startLine":252,"endLine":259},
+  "f3_Z": {"file":"codex-rs/ext/extension-api/src/contributors.rs","startLine":238,"endLine":245},
+  "f3_AA": {"file":"codex-rs/ext/extension-api/src/registry.rs","startLine":152,"endLine":242},
+  "f3_AB": {"file":"codex-rs/ext/extension-api/src/contributors.rs","startLine":211,"endLine":218}
+}</script>
+
+<aside id="source-panel"><div id="source-header"></div><div id="monaco-container"></div></aside>
+<script src="assets/codeindex-runtime.js"></script>
+<script src="assets/codeindex.js"></script>
+</body>
+</html>
