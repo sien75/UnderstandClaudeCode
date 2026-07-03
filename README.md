@@ -2,7 +2,7 @@
 
 Source-code analyses of [Claude Code](https://github.com/codeaashu/claude-code) and [Codex](https://github.com/openai/codex), generated with [CodeIndex](https://github.com/sien75/CodeIndex).
 
-**Live site:** [sien75.github.io/understandclaudecode](https://sien75.github.io/understandclaudecode)
+**Live site:** [sien75.github.io/UnderstandClaudeCode](https://sien75.github.io/UnderstandClaudeCode)
 
 ## How it was generated
 
@@ -21,7 +21,7 @@ The analysis content is provided for educational and research purposes. The orig
 
 对 [Claude Code](https://github.com/anthropics/claude-code) 与 [Codex](https://github.com/openai/codex) 源码的分析，使用 [CodeIndex](https://github.com/sien75/CodeIndex) 生成。
 
-**在线查看：** [sien75.github.io/understandclaudecode](https://sien75.github.io/understandclaudecode)
+**在线查看：** [sien75.github.io/UnderstandClaudeCode](https://sien75.github.io/UnderstandClaudeCode)
 
 ## 生成方式
 
