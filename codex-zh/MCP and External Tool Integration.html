@@ -1,0 +1,318 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MCP 与外部工具接入</title>
+<link rel="stylesheet" href="assets/codeindex.css">
+</head>
+<body>
+<p><a href="index.html">← Back to overview</a></p>
+<h1>MCP 与外部工具接入</h1>
+
+<p>这一块讲 Codex 如何跟"外面的世界"打交道。Model Context Protocol(MCP)是一套 JSON-RPC 协议,Codex 在这里同时扮演两个角色:一方面它是个 <strong>MCP 客户端</strong>,去连接用户在 config.toml 里声明的各种外部 MCP 服务器(比如 GitHub、文件系统、自定义工具),把那些服务器提供的工具、资源拉回来,喂给模型用;另一方面它又是个 <strong>MCP 服务器</strong>,把自己的"编码代理"能力打包成 <code>codex</code> / <code>codex-reply</code> 两个工具,暴露给 Claude、IDE 这类外部 MCP 客户端来调用。除此之外,还有一套 <strong>插件/扩展</strong> 机制,让第三方包声明自己的 MCP 服务器、贡献工具、挂进对话生命周期。</p>
+
+<h2>用户和外部系统能做什么</h2>
+<ul>
+  <li>在 config.toml 里声明 MCP 服务器(stdio 子进程或 streamable HTTP),Codex 启动时自动拉起、握手、列工具 → <strong>MCP 客户端接入</strong></li>
+  <li>对外部 MCP 服务器做 OAuth 登录(<code>codex mcp login &lt;server&gt;</code>),令牌存进 keyring 或文件 → <strong>MCP 客户端接入</strong></li>
+  <li>模型在对话里调用 <code>mcp__&lt;server&gt;__&lt;tool&gt;</code> 工具,Codex 路由到对应服务器执行 → <strong>MCP 客户端接入</strong></li>
+  <li>外部 MCP 客户端(Claude/IDE)通过 stdio 连到 codex-mcp 进程,调用 <code>codex</code> 工具发起一轮编码任务,收到 <code>codex/event</code> 事件流和最终结果 → <strong>MCP 服务器暴露</strong></li>
+  <li>外部客户端用 <code>codex-reply</code> 工具带着 threadId 续接已有会话 → <strong>MCP 服务器暴露</strong></li>
+  <li>外部客户端在执行/打补丁需要批准时收到 <code>elicitation/create</code> 请求,回复同意/拒绝 → <strong>MCP 服务器暴露</strong></li>
+  <li>插件包在自己的 mcp_servers 文件里声明 MCP 服务器,Codex 加载并合并进运行时目录 → <strong>插件/扩展接入</strong></li>
+  <li>扩展通过 Extension API 贡献工具、挂载到对话/工具生命周期 → <strong>插件/扩展接入</strong></li>
+</ul>
+
+<h2>整体架构:三个角色</h2>
+<p>整个 scope 跨六个 crate,职责清晰分层:<code>codex-mcp</code> 是"大脑",负责把配置变成运行时服务器目录、聚合并发的客户端连接、统一对外暴露工具/资源 API;<code>rmcp-client</code> 是"传输层",封装单个 MCP 服务器的连接生命周期(stdio 进程、HTTP、OAuth);<code>mcp-server</code> 是 Codex 反过来当服务器的实现,处理外部 JSON-RPC、驱动 codex-core 跑一轮任务;<code>connectors</code> 负责把多来源工具合并、过滤、做策略裁决;<code>plugin</code> 定义插件清单和加载;<code>ext</code> 是内置扩展(skills、memories、web-search、goal、image-generation、mcp 执行器插件、guardian)和扩展 API 本身。</p>
+
+<h2>流程一:Codex 作为 MCP 客户端 —— 从配置到工具可调用</h2>
+
+<p>这条主线回答:"我在 config.toml 写了一个 MCP 服务器,然后模型就能调它的工具,中间发生了什么?"入口在 codex-core 的会话初始化(不在本 scope),它会调用 <code>codex-mcp</code> 暴露的 <code>effective_mcp_servers</code>,把配置里的服务器目录变成"待启动"的运行时视图,再用 <code>McpConnectionManager::new</code> 并发拉起所有客户端。</p>
+
+<pre class="mermaid">
+graph TD
+    f1_A["用户在 config.toml 声明 MCP 服务器"] --> f1_B["McpConfig 携带服务器目录+OAuth/审批策略"]
+    f1_B --> f1_C["effective_mcp_servers: 过滤未启用、按鉴权门控 codex_apps"]
+    f1_C --> f1_D["McpConnectionManager::new 并发为每个服务器建 AsyncManagedClient"]
+    f1_D --> f1_E{"每个服务器: make_rmcp_client"}
+    f1_E -->|"stdio 本地"| f1_F["LocalStdioServerLauncher: tokio 子进程+进程组"]
+    f1_E -->|"stdio 远程"| f1_G["ExecutorStdioServerLauncher: 经 ExecBackend 启动"]
+    f1_E -->|"streamable HTTP"| f1_H["resolve_bearer_token 或 OAuth 传输"]
+    f1_F --> f1_I["create_pending_transport: 得到 rmcp Transport"]
+    f1_G --> f1_I
+    f1_H --> f1_I
+    f1_I --> f1_J["RmcpClient::initialize: 握手+协商能力(elicitation/sandbox-state)"]
+    f1_J --> f1_K{"握手结果"}
+    f1_K -->|失败| f1_L["StartupOutcomeError: 取消/超时/需登录 - 发 McpStartupUpdate Failed"]
+    f1_K -->|成功| f1_M["list_tools_for_client_uncached: 拉工具列表"]
+    f1_M --> f1_N["filter_tools: 按启用/禁用名单过滤"]
+    f1_N --> f1_O["sanitize connector metadata: 非 codex_apps 剥离不可信 connector_* 字段"]
+    f1_O --> f1_P["normalize callable_name/namespace: 模型可见名 mcp__server__tool"]
+    f1_P --> f1_Q["写 codex_apps 工具缓存(仅 codex_apps 服务器)"]
+    f1_Q --> f1_R["ManagedClient 就绪,存进 clients map"]
+    f1_R --> f1_S["发 McpStartupUpdate Ready; 全部完成后发 McpStartupComplete"]
+    f1_L --> f1_S
+    f1_S --> f1_T["list_all_tools: 聚合所有服务器工具 - 暴露给模型"]
+    f1_T --> f1_U["模型调用 mcp__server__tool"]
+    f1_U --> f1_V["McpConnectionManager::call_tool: 路由到对应客户端"]
+    f1_V --> f1_W["RmcpClient::call_tool: 发 tools/call 请求"]
+    f1_W --> f1_X{"HTTP 404 会话过期?"}
+    f1_X -->|"是"| f1_Y["reinitialize_after_session_expiry: 用 TransportRecipe 重建传输"]
+    f1_Y --> f1_W
+    f1_X -->|"否"| f1_Z["返回 CallToolResult 给 codex-core"]
+</pre>
+
+<p>关键的"状态机"在 <code>RmcpClient</code> 内部:<code>ClientState</code> 有三个态——<code>Connecting</code>(握手中,持有 pending transport)→ <code>Ready</code>(持有 RunningService 和可选的 OAuthPersistor)→ <code>Closed</code>。每次操作走 <code>run_service_operation</code> 管道:先刷新 OAuth 令牌,带瞬态重试(250ms/1000ms 退避),遇 HTTP 404 会话过期就在 <code>session_recovery_lock</code> 信号量下用保存的 <code>TransportRecipe</code> 重建传输并重放一次操作。Elicitation 暂停态(<code>ElicitationPauseState</code>)会让操作超时时钟在服务器向用户征询输入时暂停,避免用户思考时被超时打断。</p>
+
+<p><strong>OAuth 登录子流程</strong>:HTTP 服务器在握手前会先做鉴权状态判定(<code>determine_streamable_http_auth_status</code>):有 bearer token 环境变量 → BearerToken;有可用存储 OAuth 令牌 → OAuth;存储令牌需授权 → NotLoggedIn;否则做 RFC 8414 <code>/.well-known/oauth-authorization-server</code> 发现,能发现 → NotLoggedIn,不能 → Unsupported。用户跑 <code>codex mcp login</code> 时走 <code>perform_oauth_login</code>:起一个本地回调 HTTP 服务,构建授权 URL,开浏览器/打印链接,等回调 code,换令牌,存进 keyring(带文件兜底 <code>~/.codex/.credentials.json</code>)。</p>
+
+<h2>流程二:Codex 作为 MCP 服务器 —— 外部客户端驱动编码任务</h2>
+
+<p>这条主线回答:"Claude 或 IDE 通过 MCP 调用 codex 工具,让它写代码,中间发生了什么?"入口是 <code>mcp-server</code> 的 <code>run_main</code>(main.rs 只是 arg0 分发壳)。它起三个 tokio 任务:stdin 读、消息处理、stdout 写,用有界 mpsc 通道串起来。<code>MessageProcessor</code> 是核心调度器,持有 codex-core 的 <code>ThreadManager</code>,把外部 JSON-RPC 请求翻译成对 codex-core 会话的操作。</p>
+
+<pre class="mermaid">
+graph TD
+    f2_A["外部 MCP 客户端发 JSON-RPC(stdio)"] --> f2_B["stdin reader: 按行解析 JsonRpcMessage"]
+    f2_B --> f2_C["incoming_tx 通道 - MessageProcessor"]
+    f2_C --> f2_D{"消息类型"}
+    f2_D -->|Request| f2_E["process_request"]
+    f2_D -->|Response| f2_F["process_response: 唤醒之前发出的 elicitation oneshot"]
+    f2_D -->|Notification| f2_G["process_notification"]
+    f2_D -->|Error| f2_H["process_error: 仅日志"]
+    f2_E --> f2_I{"ClientRequest 变体"}
+    f2_I -->|Initialize| f2_J["handle_initialize: 设 serverInfo, 能力=tools, 存客户端 UA"]
+    f2_I -->|ListTools| f2_K["handle_list_tools: 返回 codex + codex-reply 两个 Tool 定义"]
+    f2_I -->|CallTool codex| f2_L["handle_tool_call_codex: 解析 CodexToolCallParam - into_config"]
+    f2_I -->|CallTool codex-reply| f2_M["handle_tool_call_codex_session_reply: 解析 threadId 取已有 thread"]
+    f2_I -->|其它 resources/prompts| f2_N["stub: 仅日志(MVP 未实现)"]
+    f2_I -->|tasks 或自定义| f2_O["METHOD_NOT_FOUND"]
+    f2_L --> f2_P["spawn run_codex_tool_session"]
+    f2_M --> f2_Q["spawn run_codex_tool_session_reply"]
+    f2_P --> f2_R["thread_manager.start_thread - 新 thread_id"]
+    f2_Q --> f2_S["thread_manager.get_thread"]
+    f2_S --> f2_T{"thread 存在?"}
+    f2_T -->|"否"| f2_U["返回 error CallToolResult 带 threadId"]
+    f2_T -->|"是"| f2_V["注册 request_id 到 thread_id 映射"]
+    f2_R --> f2_V
+    f2_V --> f2_W["submit Op::UserInput"]
+    f2_W --> f2_X["run_codex_tool_session_inner 事件循环"]
+    f2_X --> f2_Y{"thread.next_event"}
+    f2_Y -->|每条 Event| f2_Z["发 codex/event 通知(_meta 带 requestId/threadId)"]
+    f2_Y -->|ExecApprovalRequest| f2_AA["handle_exec_approval: 发 elicitation/create - 客户端决定 - Op::ExecApproval"]
+    f2_Y -->|ApplyPatchApprovalRequest| f2_AB["handle_patch_approval: 发 elicitation/create - Op::PatchApproval(无响应默认 Deny)"]
+    f2_Y -->|Error| f2_AC["发 error CallToolResult - break"]
+    f2_Y -->|TurnComplete| f2_AD["发 success CallToolResult(last_agent_message) - 删映射 - break"]
+    f2_Y -->|Err| f2_AE["发 error CallToolResult - break"]
+    f2_AA --> f2_X
+    f2_AB --> f2_X
+    f2_AD --> f2_AF["线程保留在 ThreadManager, 客户端可用 codex-reply 续接"]
+    f2_G --> f2_AG{"Notification 变体"}
+    f2_AG -->|Cancelled| f2_AH["查映射-取 thread-submit Op::Interrupt-删映射"]
+    f2_AG -->|其它| f2_AI["仅日志"]
+</pre>
+
+<p>这是一个典型的 <strong>会话生命周期状态机</strong>:未初始化 → 收到 initialize → 已初始化(只允许一次,第二次返 invalid_request)。每次 <code>codex</code> 工具调用创建一个新 Codex 线程,进入"运行中事件循环";TurnComplete/Error/Err 是终态,但线程本身不销毁,留着等 <code>codex-reply</code> 续接。多线程可并发,所以每条 <code>codex/event</code> 都带 <code>threadId</code> 多路复用。<code>running_requests_id_to_codex_uuid</code> 这张映射表是取消和终态清理的唯一真相源。</p>
+
+<p><strong>审批的双向通信</strong>是这条流程的精华:codex-core 想执行命令或打补丁时,不是自己问用户,而是通过 <code>OutgoingMessageSender::send_request</code> 发一个 <code>elicitation/create</code> JSON-RPC 请求给外部客户端,注册一个 oneshot 回调,事件循环 <code>continue</code> 继续抽事件(不阻塞);外部客户端回复后走 <code>process_response</code> 唤醒回调,回调任务再把 <code>Op::ExecApproval</code>/<code>Op::PatchApproval</code> 提交回 codex-core。补丁审批在通道断开时主动 Deny,比命令审批更保守。</p>
+
+<h2>流程三:插件与扩展接入 —— 第三方能力如何挂进 Codex</h2>
+
+<p>这条主线回答:"一个插件包声明了自己的 MCP 服务器、技能、应用连接器、钩子,这些怎么流进 Codex 的运行时?"分为两条并行路径:<strong>插件清单路径</strong>(plugin crate,负责静态加载 MCP 服务器/技能/应用声明)和<strong>扩展 API 路径</strong>(ext/extension-api,负责运行时把扩展挂进对话/工具生命周期)。</p>
+
+<pre class="mermaid">
+graph TD
+    f3_A["插件包: PluginManifest name,paths,interface"] --> f3_B["PluginProvider::resolve: 选定根 - ResolvedPlugin(权限绑定)"]
+    f3_B --> f3_C["LoadedPlugin: 物化成 mcp_servers/skill_roots/apps/hook_sources"]
+    f3_C --> f3_D["PluginLoadOutcome: 聚合所有活跃插件"]
+    f3_D --> f3_E["effective_mcp_servers: 同名首个定义胜出"]
+    f3_D --> f3_F["effective_apps: 应用连接器 ID 并集"]
+    f3_D --> f3_G["effective_skill_roots: 技能根并集"]
+    f3_F --> f3_H["connectors/merge: 目录应用+可达应用+插件声明 按 ID union"]
+    f3_H --> f3_I["connectors/filter: 剔除黑名单 connector_id,缩窄可发现建议"]
+    f3_I --> f3_J["connectors/app_tool_policy: AppToolPolicyEvaluator 裁决每工具启用+审批"]
+    f3_J --> f3_K["管理策略(不可变) 大于 工具配置 大于 应用默认 大于 提示"]
+    f3_E --> f3_L["并入 McpConfig.mcp_server_catalog"]
+    f3_L --> f3_M["回到流程一: effective_mcp_servers - McpConnectionManager"]
+    f3_K --> f3_M
+    f3_G --> f3_N["host 调用 ext::*::install 注册 Contributor"]
+    f3_N --> f3_O["ExtensionRegistryBuilder 注册各类 Contributor"]
+    f3_O --> f3_P["build - ExtensionRegistry(不可变)"]
+    f3_P --> f3_Q{"运行时按事件查 Contributor"}
+    f3_Q -->|"McpServerContributor"| f3_R["贡献 Set/Remove/SelectedPlugin MCP 服务器叠加"]
+    f3_Q -->|"ThreadLifecycleContributor"| f3_S["on_thread_start: 用 ExtensionData 播种线程状态"]
+    f3_Q -->|"TurnInputContributor"| f3_T["注入 ContextualUserFragment(如技能指令)"]
+    f3_Q -->|"ContextContributor"| f3_U["注入 PromptFragment(带 slot)"]
+    f3_Q -->|"ToolContributor"| f3_V["贡献 ToolExecutor(skills/memories/web-search/goal/image-gen)"]
+    f3_Q -->|"ToolLifecycleContributor"| f3_W["on_tool_start/finish: 仅观察"]
+    f3_Q -->|"TurnLifecycleContributor"| f3_X["on_turn_start/stop/abort/error"]
+    f3_Q -->|"TurnItemContributor"| f3_Y["emit 前改写 TurnItem"]
+    f3_Q -->|"ApprovalReviewContributor"| f3_Z["返回 Option ReviewDecision"]
+    f3_R --> f3_AA["host 组装: prompt 片段+原生工具+MCP 服务器工具"]
+    f3_T --> f3_AA
+    f3_U --> f3_AA
+    f3_V --> f3_AA
+    f3_AA --> f3_AB["送进模型 - 模型调用工具"]
+    f3_AB --> f3_W
+    f3_AB --> f3_Y
+</pre>
+
+<p>这里有三个值得标注的边界:<strong>通信边界</strong>在 <code>ExtensionRegistry</code>——host 和扩展之间只通过 trait 对象(<code>Arc&lt;dyn ...Contributor&gt;</code>)通信,扩展私有状态用 <code>ExtensionData</code>(TypeId 键的 Any map)按 session/thread/turn 三层作用域隔离,扩展拿不到 host 内部结构。<strong>状态机边界</strong>在生命周期 contributor——线程有 start/resume/idle/stop,轮次有 start/stop/abort/error,工具调用有 start/finish(Completed/Blocked/Failed/Aborted),构成嵌套的状态层次。<strong>裁决表</strong>在 <code>AppToolPolicyEvaluator</code>——每个应用工具的"启用+审批模式"按固定优先级链裁决:管理要求(不可改)> 工具级配置 > 应用默认 > 破坏性/开放世界提示,输出 Auto/OnFailure/Always/OnRequest 四档。</p>
+
+<h2>各模块一句话</h2>
+<dl>
+<dt>codex-mcp(大脑)</dt>
+<dd>把 McpConfig 里的服务器目录变成并发的 AsyncManagedClient 集合,聚合工具/资源,统一暴露给 codex-core。Input: 配置+鉴权;Output: 可调用工具列表+资源读取+工具调用路由。</dd>
+<dt>codex-mcp/rmcp_client(单客户端生命周期)</dt>
+<dd>把一个 EffectiveMcpServer 变成一个握手完成、工具已列、可路由调用的 ManagedClient。Input: 服务器配置+运行时上下文;Output: ManagedClient 或 StartupOutcomeError。</dd>
+<dt>codex-mcp/connection_manager(聚合器)</dt>
+<dd>把多个 ManagedClient 聚合成一个对外接口,路由 (server,tool) 调用,管理启动状态事件。Input: 服务器 map;Output: list_all_tools/call_tool/list_resources/read_resource。</dd>
+<dt>codex-mcp/mcp(配置层)</dt>
+<dd>把 ResolvedMcpCatalog 和鉴权策略变成 EffectiveMcpServer 运行时视图,处理 OAuth 状态计算和工具名前缀化。Input: McpConfig;Output: effective_mcp_servers + 状态快照。</dd>
+<dt>codex-mcp/elicitation + auth_elicitation</dt>
+<dd>把服务器发起的 CreateElicitation 请求变成 Codex 协议事件,按审批策略自动接受/拒绝或交用户。Input: 服务器 elicitation;Output: ElicitationResponse 或 Event。</dd>
+<dt>codex-mcp/plugin_config</dt>
+<dd>把插件 mcp_servers 文件(两种格式)解析标准化成 McpServerConfig,绑定环境变量来源。Input: 插件根+文件内容;Output: PluginMcpConfigParseOutcome。</dd>
+<dt>rmcp-client(传输层)</dt>
+<dd>把 TransportRecipe 变成一个可重连的 RmcpClient,封装 stdio/HTTP/OAuth 三种传输。Input: 传输配方;Output: initialize/list_tools/call_tool/shutdown。</dd>
+<dt>rmcp-client/stdio_server_launcher</dt>
+<dd>把 StdioServerCommand 变成 rmcp Transport,本地用 tokio 子进程,远程用 ExecBackend。Input: 命令行;Output: Transport 字节流+进程句柄。</dd>
+<dt>rmcp-client/http_client_adapter</dt>
+<dd>把 rmcp JSON-RPC 操作变成 HTTP 请求(SSE/单消息),处理 401/403/404。Input: JSON-RPC 消息;Output: HTTP 请求+响应流。</dd>
+<dt>rmcp-client/oauth + perform_oauth_login</dt>
+<dd>把服务器 URL 变成浏览器 OAuth 授权码流程,令牌存 keyring(带文件兜底)。Input: URL+scope;Output: StoredOAuthTokens。</dd>
+<dt>mcp-server(Codex 当服务器)</dt>
+<dd>把外部 JSON-RPC 请求变成对 codex-core 线程的操作,把 Event 流变成 codex/event 通知。Input: stdio JSON-RPC;Output: 工具结果+事件流+elicitation。</dd>
+<dt>connectors(应用连接器发现)</dt>
+<dd>把 ChatGPT 应用目录+可达工具+插件声明按 ID 合并,裁决每个工具的启用和审批。Input: 目录 API+工具元数据;Output: 合并后的 AppInfo+AppToolPolicy。</dd>
+<dt>plugin(插件模型)</dt>
+<dd>把插件清单变成 LoadedPlugin,聚合成 effective 资源并集。Input: 清单+磁盘根;Output: MCP 服务器/技能/应用/钩子并集。</dd>
+<dt>ext/extension-api(扩展契约)</dt>
+<dd>定义十一类 Contributor trait 和三层 ExtensionData 状态,host 通过 ExtensionRegistry 查询。Input: 扩展 install 注册;Output: 工具/提示/MCP 叠加/生命周期回调。</dd>
+<dt>ext/mcp(MCP 执行器插件)</dt>
+<dd>当线程选定执行器插件时,解析其 stdio MCP 服务器并贡献为 SelectedPlugin 叠加。Input: 选定插件根;Output: McpServerContribution::SelectedPlugin。</dd>
+<dt>ext/skills</dt>
+<dd>把用户提到的技能主提示读出来注入轮次输入,贡献技能 list/read 工具。Input: 用户输入+技能根;Output: 提示片段+技能工具。</dd>
+<dt>ext/memories</dt>
+<dd>贡献记忆库 developer 指令和 list/read/search/add_note 工具(本地 codex_home 存储)。Input: 配置;Output: 提示片段+记忆工具。</dd>
+<dt>ext/web-search</dt>
+<dd>贡献 web.run 工具(OpenAI 模型提供商后端)。Input: 配置+鉴权;Output: WebSearchTool。</dd>
+<dt>ext/goal</dt>
+<dd>跨线程/轮次管理持久化目标状态,做预算核算和进度计数,贡献 goal 工具。Input: 状态 DB;Output: 目标工具+steering+核算。</dd>
+<dt>ext/image-generation</dt>
+<dd>贡献 image_gen.imagegen 工具(Codex images 后端)。Input: 配置+鉴权;Output: ImageGenerationTool。</dd>
+<dt>ext/guardian</dt>
+<dd>捕获线程 id 和 host 注入的 AgentSpawner,用于 fork 审查子代理。Input: 线程 id;Output: 线程本地 forked-from 上下文。</dd>
+</dl>
+
+<h2>关键发现</h2>
+<ul>
+  <li><strong>双向身份</strong>:Codex 在 MCP 协议里既是 client(codex-mcp+rmcp-client)又是 server(mcp-server),两边共用 rmcp 的 JSON-RPC 模型但职责完全不同——client 侧聚合外部工具喂给模型,server 侧把 codex 编码能力暴露给外部客户端。</li>
+  <li><strong>三级缓存</strong>:codex_apps 工具有启动快照缓存(启动时立即可用)+ 运行时缓存(listed_tools 命中)+ 硬刷新(hard_refresh_codex_apps_tools_cache 绕过缓存),解决远程应用工具列表慢的问题。</li>
+  <li><strong>不可信元数据剥离</strong>:非 codex_apps 服务器的 connector_* 元数据会被 sanitize_tool_connector_metadata 剥离,防止外部服务器伪造连接器身份;只有受信的 codex_apps 服务器保留。</li>
+  <li><strong>会话恢复</strong>:RmcpClient 遇 HTTP 404 用保存的 TransportRecipe 在 session_recovery_lock 下重建传输并重放操作,对调用方透明。</li>
+  <li><strong>elicitation 暂停时钟</strong>:服务器向用户征询输入时,ElicitationPauseState 让操作超时时钟暂停,避免用户思考时被超时打断。</li>
+  <li><strong>审批的双向通道</strong>:mcp-server 不直接问用户,而是发 elicitation/create 给外部客户端,事件循环不阻塞,客户端回复经 process_response 唤醒 oneshot 回调;补丁审批在通道断开时主动 Deny。</li>
+  <li><strong>插件 MCP 名字冲突</strong>:effective_mcp_servers 用首个定义胜出策略,有 RegistrationPrecedence 优先级层(Plugin > SelectedPlugin > Config > Compatibility > Extension)。</li>
+  <li><strong>扩展状态三层隔离</strong>:ExtensionData 按 session/thread/turn 三个作用域用 TypeId 键 Any map 隔离扩展私有状态,扩展拿不到 host 内部结构。</li>
+  <li><strong>mcp-server 是 MVP</strong>:resources/prompts/logging/completion 都是 stub 只记日志,只实现了 tools 相关方法和 elicitation;tasks/* 直接 METHOD_NOT_FOUND。</li>
+</ul>
+
+<script>window.__sourceMap = {
+  "f1_A": {"file":"codex-rs/codex-mcp/src/mcp/mod.rs","startLine":110,"endLine":148},
+  "f1_B": {"file":"codex-rs/codex-mcp/src/mcp/mod.rs","startLine":110,"endLine":148},
+  "f1_C": {"file":"codex-rs/codex-mcp/src/mcp/mod.rs","startLine":242,"endLine":266},
+  "f1_D": {"file":"codex-rs/codex-mcp/src/connection_manager.rs","startLine":118,"endLine":281},
+  "f1_E": {"file":"codex-rs/codex-mcp/src/rmcp_client.rs","startLine":579,"endLine":663},
+  "f1_F": {"file":"codex-rs/rmcp-client/src/stdio_server_launcher.rs","startLine":172,"endLine":194},
+  "f1_G": {"file":"codex-rs/rmcp-client/src/stdio_server_launcher.rs","startLine":440,"endLine":458},
+  "f1_H": {"file":"codex-rs/codex-mcp/src/rmcp_client.rs","startLine":435,"endLine":460},
+  "f1_I": {"file":"codex-rs/rmcp-client/src/rmcp_client.rs","startLine":745,"endLine":852},
+  "f1_J": {"file":"codex-rs/rmcp-client/src/rmcp_client.rs","startLine":406,"endLine":469},
+  "f1_K": {"file":"codex-rs/codex-mcp/src/rmcp_client.rs","startLine":173,"endLine":220},
+  "f1_L": {"file":"codex-rs/codex-mcp/src/connection_manager.rs","startLine":843,"endLine":897},
+  "f1_M": {"file":"codex-rs/codex-mcp/src/rmcp_client.rs","startLine":345,"endLine":408},
+  "f1_N": {"file":"codex-rs/codex-mcp/src/tools.rs","startLine":84,"endLine":114},
+  "f1_O": {"file":"codex-rs/codex-mcp/src/rmcp_client.rs","startLine":410,"endLine":434},
+  "f1_P": {"file":"codex-rs/codex-mcp/src/rmcp_client.rs","startLine":356,"endLine":403},
+  "f1_Q": {"file":"codex-rs/codex-mcp/src/rmcp_client.rs","startLine":524,"endLine":536},
+  "f1_R": {"file":"codex-rs/codex-mcp/src/rmcp_client.rs","startLine":539,"endLine":548},
+  "f1_S": {"file":"codex-rs/codex-mcp/src/connection_manager.rs","startLine":258,"endLine":280},
+  "f1_T": {"file":"codex-rs/codex-mcp/src/connection_manager.rs","startLine":447,"endLine":485},
+  "f1_U": {"file":"codex-rs/codex-mcp/src/connection_manager.rs","startLine":677,"endLine":712},
+  "f1_V": {"file":"codex-rs/codex-mcp/src/connection_manager.rs","startLine":677,"endLine":712},
+  "f1_W": {"file":"codex-rs/rmcp-client/src/rmcp_client.rs","startLine":580,"endLine":636},
+  "f1_X": {"file":"codex-rs/rmcp-client/src/rmcp_client.rs","startLine":1049,"endLine":1067},
+  "f1_Y": {"file":"codex-rs/rmcp-client/src/rmcp_client.rs","startLine":1069,"endLine":1128},
+  "f1_Z": {"file":"codex-rs/rmcp-client/src/rmcp_client.rs","startLine":580,"endLine":636},
+  "f2_A": {"file":"codex-rs/mcp-server/src/lib.rs","startLine":126,"endLine":146},
+  "f2_B": {"file":"codex-rs/mcp-server/src/lib.rs","startLine":126,"endLine":146},
+  "f2_C": {"file":"codex-rs/mcp-server/src/lib.rs","startLine":148,"endLine":172},
+  "f2_D": {"file":"codex-rs/mcp-server/src/message_processor.rs","startLine":91,"endLine":100},
+  "f2_E": {"file":"codex-rs/mcp-server/src/message_processor.rs","startLine":91,"endLine":165},
+  "f2_F": {"file":"codex-rs/mcp-server/src/message_processor.rs","startLine":167,"endLine":171},
+  "f2_G": {"file":"codex-rs/mcp-server/src/message_processor.rs","startLine":173,"endLine":194},
+  "f2_H": {"file":"codex-rs/mcp-server/src/message_processor.rs","startLine":196,"endLine":198},
+  "f2_I": {"file":"codex-rs/mcp-server/src/message_processor.rs","startLine":101,"endLine":110},
+  "f2_J": {"file":"codex-rs/mcp-server/src/message_processor.rs","startLine":200,"endLine":240},
+  "f2_K": {"file":"codex-rs/mcp-server/src/message_processor.rs","startLine":312,"endLine":328},
+  "f2_L": {"file":"codex-rs/mcp-server/src/message_processor.rs","startLine":330,"endLine":349},
+  "f2_M": {"file":"codex-rs/mcp-server/src/message_processor.rs","startLine":407,"endLine":488},
+  "f2_N": {"file":"codex-rs/mcp-server/src/message_processor.rs","startLine":284,"endLine":310},
+  "f2_O": {"file":"codex-rs/mcp-server/src/message_processor.rs","startLine":490,"endLine":496},
+  "f2_P": {"file":"codex-rs/mcp-server/src/codex_tool_runner.rs","startLine":57,"endLine":141},
+  "f2_Q": {"file":"codex-rs/mcp-server/src/codex_tool_runner.rs","startLine":143,"endLine":192},
+  "f2_R": {"file":"codex-rs/mcp-server/src/codex_tool_runner.rs","startLine":67,"endLine":78},
+  "f2_S": {"file":"codex-rs/mcp-server/src/codex_tool_runner.rs","startLine":155,"endLine":170},
+  "f2_T": {"file":"codex-rs/mcp-server/src/codex_tool_runner.rs","startLine":172,"endLine":190},
+  "f2_U": {"file":"codex-rs/mcp-server/src/codex_tool_runner.rs","startLine":172,"endLine":190},
+  "f2_V": {"file":"codex-rs/mcp-server/src/codex_tool_runner.rs","startLine":99,"endLine":118},
+  "f2_W": {"file":"codex-rs/mcp-server/src/codex_tool_runner.rs","startLine":119,"endLine":125},
+  "f2_X": {"file":"codex-rs/mcp-server/src/codex_tool_runner.rs","startLine":194,"endLine":411},
+  "f2_Y": {"file":"codex-rs/mcp-server/src/codex_tool_runner.rs","startLine":205,"endLine":216},
+  "f2_Z": {"file":"codex-rs/mcp-server/src/codex_tool_runner.rs","startLine":208,"endLine":216},
+  "f2_AA": {"file":"codex-rs/mcp-server/src/exec_approval.rs","startLine":51,"endLine":110},
+  "f2_AB": {"file":"codex-rs/mcp-server/src/patch_approval.rs","startLine":44,"endLine":101},
+  "f2_AC": {"file":"codex-rs/mcp-server/src/codex_tool_runner.rs","startLine":255,"endLine":264},
+  "f2_AD": {"file":"codex-rs/mcp-server/src/codex_tool_runner.rs","startLine":301,"endLine":318},
+  "f2_AE": {"file":"codex-rs/mcp-server/src/codex_tool_runner.rs","startLine":400,"endLine":408},
+  "f2_AF": {"file":"codex-rs/mcp-server/src/codex_tool_runner.rs","startLine":316,"endLine":318},
+  "f2_AG": {"file":"codex-rs/mcp-server/src/message_processor.rs","startLine":173,"endLine":194},
+  "f2_AH": {"file":"codex-rs/mcp-server/src/message_processor.rs","startLine":515,"endLine":560},
+  "f2_AI": {"file":"codex-rs/mcp-server/src/message_processor.rs","startLine":173,"endLine":194},
+  "f3_A": {"file":"codex-rs/plugin/src/manifest.rs","startLine":8,"endLine":57},
+  "f3_B": {"file":"codex-rs/plugin/src/provider.rs","startLine":115,"endLine":128},
+  "f3_C": {"file":"codex-rs/plugin/src/load_outcome.rs","startLine":17,"endLine":31},
+  "f3_D": {"file":"codex-rs/plugin/src/load_outcome.rs","startLine":90,"endLine":188},
+  "f3_E": {"file":"codex-rs/plugin/src/load_outcome.rs","startLine":144,"endLine":171},
+  "f3_F": {"file":"codex-rs/plugin/src/load_outcome.rs","startLine":144,"endLine":171},
+  "f3_G": {"file":"codex-rs/plugin/src/load_outcome.rs","startLine":144,"endLine":171},
+  "f3_H": {"file":"codex-rs/connectors/src/merge.rs","startLine":8,"endLine":119},
+  "f3_I": {"file":"codex-rs/connectors/src/filter.rs","startLine":5,"endLine":66},
+  "f3_J": {"file":"codex-rs/connectors/src/app_tool_policy.rs","startLine":37,"endLine":67},
+  "f3_K": {"file":"codex-rs/connectors/src/app_tool_policy.rs","startLine":140,"endLine":203},
+  "f3_L": {"file":"codex-rs/codex-mcp/src/mcp/mod.rs","startLine":242,"endLine":247},
+  "f3_M": {"file":"codex-rs/codex-mcp/src/connection_manager.rs","startLine":118,"endLine":281},
+  "f3_N": {"file":"codex-rs/ext/extension-api/src/registry.rs","startLine":21,"endLine":149},
+  "f3_O": {"file":"codex-rs/ext/extension-api/src/registry.rs","startLine":55,"endLine":149},
+  "f3_P": {"file":"codex-rs/ext/extension-api/src/registry.rs","startLine":152,"endLine":242},
+  "f3_Q": {"file":"codex-rs/ext/extension-api/src/contributors.rs","startLine":54,"endLine":259},
+  "f3_R": {"file":"codex-rs/ext/extension-api/src/contributors/mcp.rs","startLine":55,"endLine":71},
+  "f3_S": {"file":"codex-rs/ext/extension-api/src/contributors.rs","startLine":78,"endLine":114},
+  "f3_T": {"file":"codex-rs/ext/extension-api/src/contributors.rs","startLine":162,"endLine":171},
+  "f3_U": {"file":"codex-rs/ext/extension-api/src/contributors.rs","startLine":65,"endLine":71},
+  "f3_V": {"file":"codex-rs/ext/extension-api/src/contributors.rs","startLine":211,"endLine":218},
+  "f3_W": {"file":"codex-rs/ext/extension-api/src/contributors.rs","startLine":225,"endLine":235},
+  "f3_X": {"file":"codex-rs/ext/extension-api/src/contributors.rs","startLine":121,"endLine":154},
+  "f3_Y": {"file":"codex-rs/ext/extension-api/src/contributors.rs","startLine":252,"endLine":259},
+  "f3_Z": {"file":"codex-rs/ext/extension-api/src/contributors.rs","startLine":238,"endLine":245},
+  "f3_AA": {"file":"codex-rs/ext/extension-api/src/registry.rs","startLine":152,"endLine":242},
+  "f3_AB": {"file":"codex-rs/ext/extension-api/src/contributors.rs","startLine":211,"endLine":218}
+}</script>
+
+<aside id="source-panel"><div id="source-header"></div><div id="monaco-container"></div></aside>
+<script src="assets/codeindex-runtime.js"></script>
+<script src="assets/codeindex.js"></script>
+</body>
+</html>

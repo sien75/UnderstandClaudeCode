@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>斜杠命令系统</title>
+<link rel="stylesheet" href="../assets/codeindex.css">
+</head>
+<body>
+<nav class="topnav"><a href="../index.html">← 返回总览</a></nav>
+<h1>斜杠命令系统</h1>
+
+<p>用户在 REPL 输入框里敲下 <code>/commit</code>、<code>/review</code>、<code>/compact</code> 这类以斜杠开头的文本，就触发了一条命令。这条命令可能直接在本机跑一段代码（比如压缩对话历史），可能弹出一个交互面板（比如配置项界面），也可能只是把一段写好的提示词塞给模型让它去干活（比如让模型帮忙写 git commit）。本模块负责把用户敲的那行字解析成"命令名 + 参数"，在所有可用命令里查到对应的那一个，再根据它的类型走不同的执行路径，最后把结果以消息的形式送回对话流。</p>
+
+<dl>
+  <dt>输入</dt>
+  <dd>用户在 REPL 里敲的一行文本，形如 <code>/compact 请保留测试相关内容</code>——斜杠后的第一个词是命令名，其余是参数</dd>
+  <dt>输出</dt>
+  <dd>一组塞回对话流的消息：可能是给模型看的提示词内容（触发新一轮模型调用），也可能是直接展示给用户的本地执行结果，还可能是一个待渲染的 React/Ink 界面</dd>
+</dl>
+
+<pre class="mermaid">
+graph TD
+  user-input["用户在 REPL 输入 /xxx args"] --> parse["解析斜杠命令&lt;br/&gt;拆出命令名与参数"]
+  parse --> is-slash{"以 / 开头?"}
+  is-slash -->|否| as-prompt["当作普通提示词&lt;br/&gt;直接送给模型"]
+  is-slash -->|是| has-cmd{"命令名在已加载&lt;br/&gt;命令表里存在?"}
+  has-cmd -->|否| looks-cmd{"看起来像命令名&lt;br/&gt;而非文件路径?"}
+  looks-cmd -->|像命令名| unknown["提示 Unknown skill&lt;br/&gt;并保留参数供用户重发"]
+  looks-cmd -->|是文件路径等| as-prompt
+  has-cmd -->|是| user-invocable{"允许用户直接调用?&lt;br/&gt;(userInvocable)"}
+  user-invocable -->|否 仅模型可调| only-model["提示:请让 Claude&lt;br/&gt;替你调用此技能"]
+  user-invocable -->|是| dispatch{"按 command.type 分发"}
+  dispatch -->|local-jsx| jsx-path["加载实现模块→渲染 Ink 界面&lt;br/&gt;等用户在面板里操作完回调 onDone"]
+  dispatch -->|local| local-path["加载实现模块→同步执行 call()&lt;br/&gt;返回 text/compact/skip"]
+  dispatch -->|prompt| prompt-path["取提示词内容&lt;br/&gt;塞进对话流触发模型"]
+  jsx-path --> result
+  local-path --> result["结果封装成消息送回对话流"]
+  prompt-path --> result
+</pre>
+
+<ul>
+  <li>命令表不是写死的一个列表，而是内置命令 + 技能目录命令 + 插件命令 + 工作流命令 + 动态发现的技能拼出来的，每次 <code>getCommands()</code> 调用都会重新过滤可用性和启用状态</li>
+  <li>命令名查找会同时匹配 <code>name</code>、<code>userFacingName()</code> 和 <code>aliases</code>，所以 <code>/settings</code> 能找到 <code>config</code> 命令（它配了别名）</li>
+  <li>当命令名查不到时，系统会再判断它是不是一个文件路径（比如 <code>/tmp/xxx</code>）——如果是路径就当普通输入送给模型，避免误报</li>
+</ul>
+
+<h2>三种命令类型各自怎么执行</h2>
+
+<p>每个命令对象的 <code>type</code> 字段决定了它走哪条执行路径。三种类型的差异本质上是"结果怎么呈现给用户/模型"：提示词型把内容塞给模型触发新一轮对话；本地型直接跑代码、结果以 <code>&lt;local-command-stdout&gt;</code> 形式展示但不送给模型；本地-JSX 型弹出一个 Ink 渲染的交互面板，用户在面板里操作完后通过 <code>onDone</code> 回调收尾。</p>
+
+<pre class="mermaid">
+graph TD
+  subgraph prompt-type["PromptCommand 提示词型"]
+    p-check-fork{"context === fork?"}
+    p-check-fork -->|是| p-fork["在子代理里跑&lt;br/&gt;runAgent 独立上下文"]
+    p-check-fork -->|否 inline| p-getprompt["调用 command.getPromptForCommand()&lt;br/&gt;拿到内容块"]
+    p-getprompt --> p-hooks{"命令带 hooks&lt;br/&gt;且来源受信?"}
+    p-hooks -->|是| p-reg-hooks["注册技能 hooks"]
+    p-hooks -->|否| p-attach
+    p-reg-hooks --> p-attach["附加 allowedTools/模型&lt;br/&gt;封装成 isMeta 消息"]
+    p-attach --> p-query["shouldQuery=true&lt;br/&gt;触发模型新一轮"]
+  end
+  subgraph local-type["LocalCommand 本地型"]
+    l-load["await command.load()"] --> l-call["mod.call(args, context)"]
+    l-call --> l-res{"返回类型"}
+    l-res -->|skip| l-skip["不产生任何消息"]
+    l-res -->|text| l-text["包成 local-command-stdout"]
+    l-res -->|compact| l-compact["走 compact 后处理&lt;br/&gt;重建对话消息"]
+    l-call --> l-err["call 抛错→包成 local-command-stderr"]
+  end
+  subgraph jsx-type["LocalJSXCommand 本地-JSX 型"]
+    j-load["command.load()→mod.call(onDone,ctx,args)"] --> j-jsx{"返回 JSX?"}
+    j-jsx -->|有| j-render["setToolJSX 渲染为全屏面板&lt;br/&gt;隐藏输入框"]
+    j-jsx -->|空且未调 onDone| j-wait["等待用户在面板内操作"]
+    j-render --> j-done["用户操作完→回调 onDone"]
+    j-done --> j-disp{"display 选项"}
+    j-disp -->|skip| j-skip["不加任何消息"]
+    j-disp -->|system| j-sys["命令输入+stdout 作为系统消息"]
+    j-disp -->|默认 user| j-user["作为用户消息展示"]
+    j-load --> j-err["load/call 抛错→清空面板&lt;br/&gt;避免队列死锁"]
+  end
+</pre>
+
+<ul>
+  <li>提示词型还能再分叉：<code>context: 'fork'</code> 的技能会在子代理里独立跑（有自己的上下文和 token 预算），结果以 <code>&lt;local-command-stdout&gt;</code> 回到主对话；<code>inline</code>（默认）则直接把内容塞进当前对话</li>
+  <li>本地型的 <code>compact</code> 是少数会改写整段对话历史的命令——它把旧消息压成摘要后替换掉，所以走专门的 <code>buildPostCompactMessages</code> 重建消息流，而不是简单追加</li>
+  <li>本地-JSX 型的 <code>onDone</code> 回调是关键：如果命令实现里既没调 <code>onDone</code> 又没返回 JSX，外层的 Promise 会永远挂起、卡死输入队列，所以分发逻辑里对 <code>load/call</code> 抛错做了兜底清理</li>
+  <li>三类命令都支持懒加载：<code>load()</code> 返回 <code>import('./xxx.js')</code>，把重依赖推迟到真正调用时才加载，避免启动时把所有命令的依赖全拉进来</li>
+</ul>
+
+<h2>命令从哪来：注册与加载</h2>
+
+<p>用户能敲到的命令来自好几个来源，系统在 <code>getCommands(cwd)</code> 里把它们汇总成一张表。内置命令是硬编码的数组；技能目录命令来自 <code>.claude/skills/</code> 等目录下扫描到的 SKILL.md；插件命令来自已启用插件；工作流命令来自工作流脚本。汇总后会依次过两道闸门：<code>meetsAvailabilityRequirement</code>（按账号类型过滤，比如某些命令只对 claude.ai 订阅者可见）和 <code>isCommandEnabled</code>（按功能开关/环境变量过滤）。</p>
+
+<pre class="mermaid">
+graph TD
+  loadall["loadAllCommands(cwd)&lt;br/&gt;并行加载所有来源"] --> src-skills["技能目录命令&lt;br/&gt;getSkillDirCommands"]
+  loadall --> src-plugin["插件命令&lt;br/&gt;getPluginCommands"]
+  loadall --> src-workflow["工作流命令&lt;br/&gt;getWorkflowCommands"]
+  loadall --> src-bundled["捆绑技能&lt;br/&gt;getBundledSkills"]
+  loadall --> src-builtin-plugin["内置插件技能"]
+  loadall --> src-plugin-skills["插件技能&lt;br/&gt;getPluginSkills"]
+  loadall --> src-commands["内置命令数组 COMMANDS()"]
+  src-skills --> merge["合并成一张表"]
+  src-plugin --> merge
+  src-workflow --> merge
+  src-bundled --> merge
+  src-builtin-plugin --> merge
+  src-plugin-skills --> merge
+  src-commands --> merge
+  merge --> dyn["叠加运行时动态发现的技能&lt;br/&gt;getDynamicSkills()"]
+  dyn --> avail{"meetsAvailabilityRequirement&lt;br/&gt;账号类型是否匹配?"}
+  avail -->|否| drop["丢弃"]
+  avail -->|是| enabled{"isCommandEnabled&lt;br/&gt;功能开关是否开启?"}
+  enabled -->|否| drop
+  enabled -->|是| final["返回最终可用命令表"]
+</pre>
+
+<ul>
+  <li>加载过程是 memoize 缓存的（按 cwd），因为扫目录和动态 import 很贵；但可用性和启用检查每次都重跑，这样用户 <code>/login</code> 切换账号后命令列表能立刻更新</li>
+  <li>内置命令数组里还有一批"条件加载"的命令，靠 <code>feature('XXX')</code> 功能开关决定要不要 <code>require</code> 进来——比如 <code>bridge</code>、<code>voice</code>、<code>ultraplan</code> 等，外部构建里这些代码会被死代码消除</li>
+  <li>另有一组 <code>INTERNAL_ONLY_COMMANDS</code>（commit、bughunter、version 等），只在 <code>USER_TYPE === 'ant'</code> 且非 demo 环境下才并入命令表，对外部用户不可见</li>
+  <li>同一个名字可能来自多个来源，动态技能会去重：只在基础表里没有这个名字时才插入，并插在内置命令之前</li>
+</ul>
+
+<h2>权限与可用性：谁能用、何时能用</h2>
+
+<p>命令对象上有两个独立维度的开关。<code>availability</code> 描述"谁有资格看到这个命令"——是静态的账号类型要求（claude.ai 订阅者 / Console API 密钥用户），不满足就根本不会出现在命令表里。<code>isEnabled()</code> 描述"此刻这个命令开着没"——会读功能开关、环境变量等动态状态。此外还有 <code>userInvocable</code>（用户能否直接敲，还是只能让模型代为调用）、<code>isHidden</code>（是否在 typeahead/帮助里隐藏）、<code>disableModelInvocation</code>（是否禁止模型经由 Skill 工具调用）等控制位。</p>
+
+<p>远程模式（<code>--remote</code>）和桥接模式（手机/网页客户端）还有额外的安全白名单：<code>REMOTE_SAFE_COMMANDS</code> 只放行只影响本地 TUI 状态、不依赖本地文件系统的命令；<code>BRIDGE_SAFE_COMMANDS</code> 控制哪些 <code>local</code> 型命令能从手机端触发，<code>local-jsx</code> 型因为会弹 Ink 全屏面板而被整体禁掉。</p>
+
+<ul>
+  <li>权限闸门在 <code>getCommands()</code> 返回前就过滤完了，REPL 拿到的命令表里不存在用户用不了的命令，所以分发阶段不需要再判权限</li>
+  <li>命令的 <code>source</code> 字段（builtin/mcp/plugin/bundled/skills/...）会显示在 typeahead 描述里，让用户一眼看出某个命令是内置的还是某个插件带来的</li>
+  <li>提示词型命令还能携带 <code>allowedTools</code>，调用时临时授予模型额外的工具权限（比如 <code>/commit</code> 会临时放开 <code>git add/status/commit</code> 的执行权限）</li>
+</ul>
+
+<script>
+window.__sourceMap = {
+  "user-input": { "file": "src/utils/processUserInput/processSlashCommand.tsx", "startLine": 309, "endLine": 311 },
+  "parse": { "file": "src/utils/slashCommandParsing.ts", "startLine": 25, "endLine": 60 },
+  "is-slash": { "file": "src/utils/slashCommandParsing.ts", "startLine": 29, "endLine": 31 },
+  "as-prompt": { "file": "src/utils/processUserInput/processSlashCommand.tsx", "startLine": 362, "endLine": 381 },
+  "has-cmd": { "file": "src/utils/processUserInput/processSlashCommand.tsx", "startLine": 333, "endLine": 334 },
+  "looks-cmd": { "file": "src/utils/processUserInput/processSlashCommand.tsx", "startLine": 336, "endLine": 343 },
+  "unknown": { "file": "src/utils/processUserInput/processSlashCommand.tsx", "startLine": 344, "endLine": 361 },
+  "user-invocable": { "file": "src/utils/processUserInput/processSlashCommand.tsx", "startLine": 535, "endLine": 548 },
+  "only-model": { "file": "src/utils/processUserInput/processSlashCommand.tsx", "startLine": 536, "endLine": 547 },
+  "dispatch": { "file": "src/utils/processUserInput/processSlashCommand.tsx", "startLine": 550, "endLine": 551 },
+  "jsx-path": { "file": "src/utils/processUserInput/processSlashCommand.tsx", "startLine": 551, "endLine": 656 },
+  "local-path": { "file": "src/utils/processUserInput/processSlashCommand.tsx", "startLine": 657, "endLine": 722 },
+  "prompt-path": { "file": "src/utils/processUserInput/processSlashCommand.tsx", "startLine": 723, "endLine": 760 },
+  "result": { "file": "src/utils/processUserInput/processSlashCommand.tsx", "startLine": 514, "endLine": 523 },
+  "p-check-fork": { "file": "src/utils/processUserInput/processSlashCommand.tsx", "startLine": 727, "endLine": 729 },
+  "p-fork": { "file": "src/utils/processUserInput/processSlashCommand.tsx", "startLine": 62, "endLine": 295 },
+  "p-getprompt": { "file": "src/utils/processUserInput/processSlashCommand.tsx", "startLine": 868, "endLine": 868 },
+  "p-hooks": { "file": "src/utils/processUserInput/processSlashCommand.tsx", "startLine": 873, "endLine": 874 },
+  "p-reg-hooks": { "file": "src/utils/processUserInput/processSlashCommand.tsx", "startLine": 875, "endLine": 877 },
+  "p-attach": { "file": "src/utils/processUserInput/processSlashCommand.tsx", "startLine": 886, "endLine": 905 },
+  "p-query": { "file": "src/utils/processUserInput/processSlashCommand.tsx", "startLine": 907, "endLine": 916 },
+  "l-load": { "file": "src/utils/processUserInput/processSlashCommand.tsx", "startLine": 668, "endLine": 668 },
+  "l-call": { "file": "src/utils/processUserInput/processSlashCommand.tsx", "startLine": 669, "endLine": 669 },
+  "l-res": { "file": "src/utils/processUserInput/processSlashCommand.tsx", "startLine": 670, "endLine": 670 },
+  "l-skip": { "file": "src/utils/processUserInput/processSlashCommand.tsx", "startLine": 670, "endLine": 676 },
+  "l-text": { "file": "src/utils/processUserInput/processSlashCommand.tsx", "startLine": 708, "endLine": 713 },
+  "l-compact": { "file": "src/utils/processUserInput/processSlashCommand.tsx", "startLine": 679, "endLine": 705 },
+  "l-err": { "file": "src/utils/processUserInput/processSlashCommand.tsx", "startLine": 714, "endLine": 721 },
+  "j-load": { "file": "src/utils/processUserInput/processSlashCommand.tsx", "startLine": 609, "endLine": 612 },
+  "j-jsx": { "file": "src/utils/processUserInput/processSlashCommand.tsx", "startLine": 612, "endLine": 613 },
+  "j-render": { "file": "src/utils/processUserInput/processSlashCommand.tsx", "startLine": 630, "endLine": 636 },
+  "j-wait": { "file": "src/utils/processUserInput/processSlashCommand.tsx", "startLine": 613, "endLine": 629 },
+  "j-done": { "file": "src/utils/processUserInput/processSlashCommand.tsx", "startLine": 555, "endLine": 608 },
+  "j-disp": { "file": "src/utils/processUserInput/processSlashCommand.tsx", "startLine": 563, "endLine": 564 },
+  "j-skip": { "file": "src/utils/processUserInput/processSlashCommand.tsx", "startLine": 564, "endLine": 573 },
+  "j-sys": { "file": "src/utils/processUserInput/processSlashCommand.tsx", "startLine": 593, "endLine": 593 },
+  "j-user": { "file": "src/utils/processUserInput/processSlashCommand.tsx", "startLine": 593, "endLine": 607 },
+  "j-err": { "file": "src/utils/processUserInput/processSlashCommand.tsx", "startLine": 637, "endLine": 654 },
+  "loadall": { "file": "src/commands.ts", "startLine": 451, "endLine": 471 },
+  "src-skills": { "file": "src/commands.ts", "startLine": 362, "endLine": 370 },
+  "src-plugin": { "file": "src/commands.ts", "startLine": 458, "endLine": 458 },
+  "src-workflow": { "file": "src/commands.ts", "startLine": 459, "endLine": 459 },
+  "src-bundled": { "file": "src/commands.ts", "startLine": 377, "endLine": 377 },
+  "src-builtin-plugin": { "file": "src/commands.ts", "startLine": 379, "endLine": 379 },
+  "src-plugin-skills": { "file": "src/commands.ts", "startLine": 370, "endLine": 374 },
+  "src-commands": { "file": "src/commands.ts", "startLine": 259, "endLine": 348 },
+  "merge": { "file": "src/commands.ts", "startLine": 462, "endLine": 470 },
+  "dyn": { "file": "src/commands.ts", "startLine": 482, "endLine": 482 },
+  "avail": { "file": "src/commands.ts", "startLine": 419, "endLine": 445 },
+  "enabled": { "file": "src/types/command.ts", "startLine": 214, "endLine": 216 },
+  "drop": { "file": "src/commands.ts", "startLine": 485, "endLine": 487 },
+  "final": { "file": "src/commands.ts", "startLine": 514, "endLine": 519 }
+};
+</script>
+
+<aside id="source-panel"><div id="source-header"></div><div id="monaco-container"></div></aside>
+<script src="../assets/codeindex-runtime.js"></script>
+<script src="../assets/codeindex.js"></script>
+</body>
+</html>

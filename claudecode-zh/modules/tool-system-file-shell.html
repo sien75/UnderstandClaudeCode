@@ -1,0 +1,376 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>工具系统框架与文件/Shell 工具</title>
+<link rel="stylesheet" href="../assets/codeindex.css">
+</head>
+<body>
+<nav class="topnav"><a href="../index.html">← 返回总览</a></nav>
+<h1>工具系统框架与文件/Shell 工具</h1>
+
+<p>当 Claude（大模型）决定"去读一个文件、改一段代码、跑一条 shell 命令"时，它会产出一个 <code>tool_use</code> 请求块。本模块讲的就是这个请求从落地到回传给 LLM 的完整生命周期：怎么找到对应的工具、怎么校验入参、怎么过权限关、怎么真正执行、执行完怎么把结果拼回消息流让模型继续推理。范围限定在内置的文件工具（Read/Edit/Write）、Shell 工具（Bash）和两个搜索工具（Glob/Grep，后者封装 ripgrep）。</p>
+
+<dl>
+  <dt>输入</dt>
+  <dd>模型在助手消息里发出的一个 tool_use 块：工具名 + 参数（如 <code>{file_path, old_string, new_string}</code> 或 <code>{command}</code>），外加当前会话上下文（权限规则集、文件读取缓存、中止信号等）。</dd>
+  <dt>输出</dt>
+  <dd>一条用户消息，里面带一个 <code>tool_result</code> 块（成功则是工具返回的内容/摘要，失败则是带 <code>is_error</code> 的错误说明），供模型在下一轮对话里看到并据此决策。</dd>
+</dl>
+
+<ul>
+  <li>工具不是散装函数，而是一组统一契约（<code>Tool</code> 接口）的实例：每个工具自带 <code>validateInput</code>、<code>checkPermissions</code>、<code>call</code>、<code>mapToolResultToToolResultBlockParam</code> 等方法，框架按固定顺序调用它们。</li>
+  <li>并发安全是关键分水岭：标了 <code>isConcurrencySafe=true</code> 的只读工具（Read/Glob/Grep、Bash 只读命令）会被批量并行跑，写操作和不确定的命令则串行执行，避免互相覆盖。</li>
+  <li>权限不是单一闸门，而是"工具自检 + 规则匹配 + PreToolUse 钩子 + canUseTool 决策"多层叠加，任何一层 deny 就直接返回错误结果给模型。</li>
+  <li>文件编辑工具有"陈旧检查"：必须先 Read 过、且磁盘 mtime 没变过才允许写，防止模型基于旧内容覆盖用户最新的改动。</li>
+</ul>
+
+<h2>一、工具注册与工具池装配</h2>
+
+<p>所有内置工具在 <code>tools.ts</code> 里集中登记。一个工具是否"可见"由几道筛子决定：环境/特性开关（feature flag）决定要不要装载、<code>isEnabled()</code> 决定是否启用、权限上下文里的 deny 规则决定是否对模型隐藏。最终交给模型的工具列表，是内置工具与 MCP 工具合并、按名字去重、deny 规则过滤后的结果。</p>
+
+<pre class="mermaid">
+graph TD
+  base-list["getAllBaseTools 列出全部内置工具"] --> feat-gate{"feature/env 开关开启?"}
+  feat-gate -->|否| skip["跳过该工具(如 SleepTool/WorkflowTool)"]
+  feat-gate -->|是| enabled-check["调用 tool.isEnabled()"]
+  enabled-check --> deny-check{"被 deny 规则整名命中?"}
+  deny-check -->|是| hide["从工具池移除:模型根本看不到"]
+  deny-check -->|否| keep["保留进 allowedTools"]
+  keep --> merge-mcp["与 MCP 工具合并"]
+  merge-mcp --> dedup["按 name 去重,内置优先"]
+  dedup --> final-pool["最终工具池交给模型"]
+  simple-mode{"CLAUDE_CODE_SIMPLE?"} -->|是| simple-only["只留 Bash/Read/Edit(+协调模式工具)"]
+  simple-only --> final-pool
+</pre>
+
+<p>要点：<code>getAllBaseTools</code> 是"理论上全部工具"的唯一来源，注释强调它必须和 Statsig 上的系统缓存配置保持同步，否则跨用户的 prompt 缓存会失效。<code>filterToolsByDenyRules</code> 用的是和运行时权限判定同一套匹配器，所以 <code>mcp__server</code> 这种前缀规则会在模型看到工具之前就把整组工具屏蔽掉，而不只是调用时挡掉。</p>
+
+<h2>二、工具契约：<code>Tool</code> 接口与 <code>buildTool</code></h2>
+
+<p><code>src/Tool.ts</code> 定义了所有工具的统一形状。一个工具就是一个对象，带着名字、输入 schema（Zod）、prompt 模板，以及一组方法。其中几个关键方法构成框架调用的固定管线：</p>
+
+<ul>
+  <li><code>validateInput</code>：纯逻辑校验（路径格式、参数范围、deny 路径预判），不碰需要权限的 I/O。失败直接返回错误，不进入权限流程。</li>
+  <li><code>checkPermissions</code>：工具自报的权限意见（allow/ask/deny），只在 validateInput 通过后调用。它和通用权限系统（<code>hasPermissionsToUseTool</code>）叠加，工具说 ask 不代表最终一定问用户。</li>
+  <li><code>isConcurrencySafe</code>：决定本工具能否和其他只读工具并行批量跑。默认 false（保守），Read/Glob/Grep 返回 true，Bash 仅当命令被判为只读时返回 true。</li>
+  <li><code>isReadOnly</code> / <code>isDestructive</code>：语义标签，影响 UI 折叠、自动分类器输入等。</li>
+  <li><code>call</code>：真正干活的函数，拿到已通过权限的 input 和上下文，返回 <code>ToolResult</code>。</li>
+  <li><code>mapToolResultToToolResultBlockParam</code>：把 call 的输出序列化成发给模型的 <code>tool_result</code> 文本/图片块。</li>
+  <li><code>renderToolUseMessage</code> / <code>renderToolResultMessage</code>：纯 UI 渲染，不影响发给模型的内容。</li>
+</ul>
+
+<p><code>buildTool(def)</code> 是个工厂：把工具定义和一组"安全默认值"合并（isEnabled 默认 true、isConcurrencySafe 默认 false、checkPermissions 默认 allow），这样单个工具可以省略常用桩方法，调用方也永远拿到完整对象。默认值是"fail-closed"取向——不确定就当不安全、当需要权限。</p>
+
+<h2>三、单次工具调用的完整数据流</h2>
+
+<p>这是本模块的核心。模型一轮里可能同时发好几个 tool_use 块。<code>runTools</code> 先把它们按"是否并发安全"分批：连续的只读工具合成一个并发批，每个写/不确定的工具各自成串行批。然后对每个块走 <code>runToolUse</code> → <code>checkPermissionsAndCallTool</code> 这条主管线。下图把一次调用的关键阶段、分支和错误出口都画出来。</p>
+
+<pre class="mermaid">
+graph TD
+  find-tool["按名查找工具 findToolByName"] --> tool-found{"找到?"}
+  tool-found -->|否| unknown-tool["回 tool_result:No such tool available"]
+  tool-found -->|是| aborted{"会话已被中止?"}
+  aborted -->|是| cancel-msg["回 tool_result:已取消"]
+  aborted -->|否| parse-input["Zod 解析入参 inputSchema.safeParse"]
+  parse-input --> parse-ok{"类型合法?"}
+  parse-ok -->|否| zod-err["回 InputValidationError + schema 提示"]
+  parse-ok -->|是| validate-input["调 tool.validateInput 业务校验"]
+  validate-input --> validate-ok{"通过?"}
+  validate-ok -->|否| validate-err["回工具自定义错误信息"]
+  validate-ok -->|是| backfill["backfillObservableInput:展开~/相对路径供钩子看"]
+  backfill --> pre-hooks["运行 PreToolUse 钩子"]
+  pre-hooks --> hook-stop{"钩子要求 stop?"}
+  hook-stop -->|是| stop-msg["回 Execution stopped by hook"]
+  hook-stop -->|否| resolve-perm["resolveHookPermissionDecision + canUseTool"]
+  resolve-perm --> perm-decision{"决策?"}
+  perm-decision -->|deny / ask 被拒| deny-msg["回 is_error 权限拒绝消息 + 触发 PermissionDenied 钩子"]
+  perm-decision -->|allow| call-tool["调 tool.call 执行实际操作"]
+  call-tool --> call-ok{"执行成功?"}
+  call-ok -->|否| classify-err["classifyToolError + 跑 PostToolUseFailure 钩子"]
+  classify-err --> err-msg["回 is_error 异常消息"]
+  call-ok -->|是| map-result["mapToolResultToToolResultBlockParam 序列化"]
+  map-result --> post-hooks["运行 PostToolUse 钩子(可改写 MCP 输出)"]
+  post-hooks --> assemble["拼装 tool_result + acceptFeedback + 附加内容块"]
+  assemble --> yield-msg["产出用户消息,流回模型上下文"]
+</pre>
+
+<p>几个容易被忽略的细节：</p>
+
+<ul>
+  <li><b>入参先过 Zod 再过业务校验</b>。模型其实经常生成类型不对的入参（数组写成字符串之类），Zod 这一关会返回带"schema 未发送"提示的错误，引导模型先用 ToolSearch 加载延迟工具再重试。</li>
+  <li><b>backfill 在权限/钩子之前</b>。<code>backfillObservableInput</code> 把 <code>~</code>/相对路径展开成绝对路径，目的是不让钩子的 allowlist 被波浪号绕过。但它只改"给钩子看的副本"，<code>call()</code> 拿到的仍是模型原始字段——这样工具结果里嵌的路径字符串（"File created at: X"）和 transcript/VCR 哈希才稳定。</li>
+  <li><b>权限决策有三个来源叠加</b>：PreToolUse 钩子可以直接给 allow/deny/改 input；<code>resolveHookPermissionDecision</code> 优先采纳钩子结论；没有钩子结论才走 <code>canUseTool</code>（即 <code>hasPermissionsToUseTool</code>）。</li>
+  <li><b>权限拒绝也要跑钩子</b>：auto 模式下分类器判 deny 后，会跑 <code>PermissionDenied</code> 钩子；如果钩子说 retry，会额外塞一条"该命令现已批准，可重试"的元消息给模型。</li>
+  <li><b>错误也跑钩子</b>：<code>runPostToolUseFailureHooks</code> 让钩子能在工具抛异常时介入（比如自动修复）。中止（AbortError）和 Shell 错误有专门分支，不会无脑 logError。</li>
+  <li><b>结果可能比 30K/100K 字符大</b>：超过 <code>maxResultSizeChars</code> 会被持久化到磁盘文件，模型只收到带预览的 <code>persisted-output</code> 包装；Read 工具例外（设为 Infinity，避免"读文件→又触发读文件"的环）。</li>
+</ul>
+
+<h2>四、并发分批：为什么只读能并行</h2>
+
+<p><code>partitionToolCalls</code> 把模型本轮的 tool_use 序列扫一遍，对每个块调 <code>tool.isConcurrencySafe(input)</code>。连续返回 true 的合并进同一批走 <code>runToolsConcurrently</code>（用 <code>all</code> 工具按上限 10 并发拉起），遇到 false 就断开，那个写操作单独走 <code>runToolsSerially</code>。串行批里每个工具跑完才会更新 <code>currentContext</code>（因为写操作可能改 readFileState 等共享状态），并发批则把 contextModifier 攒到批末统一应用——读操作之间互不影响，所以可以放心并行。</p>
+
+<p>注意：<code>isConcurrencySafe</code> 解析失败（如 shell-quote 解析抛异常）会被 catch 成 false，保守地降级为串行。Bash 的并发安全等于"命令是否只读"：<code>isReadOnly</code> 调 <code>checkReadOnlyConstraints</code> 判定，含 <code>cd</code> 的复合命令会被特殊处理。</p>
+
+<h2>五、权限闸门内部：规则 + 钩子 + 分类器</h2>
+
+<p><code>hasPermissionsToUseTool</code>（<code>src/utils/permissions/permissions.ts</code>）是通用权限层。它综合工具自报的 <code>checkPermissions</code>、用户配置的 allow/ask/deny 规则、PreToolUse 钩子决策，以及（auto 模式下）AI 分类器结论，最终给出 allow/ask/deny。模式开关会影响出口：<code>dontAsk</code> 模式把 ask 直接转成 deny（不问用户）；<code>auto</code> 模式把 ask 交给分类器而不是弹交互框。</p>
+
+<pre class="mermaid">
+graph TD
+  tool-self["工具自检 checkPermissions"] --> rule-check["匹配 allow/ask/deny 规则"]
+  rule-check --> deny-hit{"命中 deny?"}
+  deny-hit -->|是| deny-out["behavior: deny"]
+  deny-hit -->|否| allow-hit{"命中 allow?"}
+  allow-hit -->|是| allow-out["behavior: allow"]
+  allow-hit -->|否| ask-out["behavior: ask"]
+  ask-out --> mode{"权限模式?"}
+  mode -->|dontAsk| ask-to-deny["转成 deny:DONT_ASK_REJECT_MESSAGE"]
+  mode -->|auto| classifier["调 AI 分类器(bash 用 Haiku side-query)"]
+  classifier --> cls-verdict{"分类结果?"}
+  cls-verdict -->|safe| allow-out
+  cls-verdict -->|unsafe| deny-out
+  cls-verdict -->|出错/不可用| fallback{"fail-closed?"}
+  fallback -->|是| deny-out
+  mode -->|default| prompt-user["弹交互框问用户"]
+  prompt-user --> user-say{"用户选?"}
+  user-say -->|接受| allow-out
+  user-say -->|拒绝| deny-out
+</pre>
+
+<p>Bash 的权限更复杂，在 <code>bashToolHasPermission</code> 里：先用 tree-sitter 做 AST 级安全解析（检测命令注入、eval、zsh 内建等），解析成 SimpleCommand[] 后再走"精确匹配 → 沙箱自动放行 → 前缀/wildcard 规则 → deny/ask 分类器"。AST 判为 too-complex（含命令替换/控制流）会尊重 deny 规则后降级为 ask，绝不悄悄放行。沙箱开启且命令适合沙箱时，会自动 allow（仍尊重显式 deny/ask）。</p>
+
+<h2>六、FileReadTool：读文件的去重与多类型</h2>
+
+<p>用户视角："Claude 要看一个文件"。Read 工具的 <code>call</code> 先查 <code>readFileState</code> 缓存：如果同一文件、同一 offset/limit 区间已经读过、且磁盘 mtime 没变，就直接返回 <code>file_unchanged</code> 桩（"文件未变"，不重发全文，省 cache token）。否则按扩展名分流：文本（带行号 + cyber-risk 提醒）、图片（base64 image 块）、PDF（按页提取图片或文档块）、notebook（映射 cell）。ENOENT 时会尝试找相似文件名给"Did you mean"提示。</p>
+
+<pre class="mermaid">
+graph TD
+  read-start["Read.call(file_path, offset, limit)"] --> dedup-lookup["查 readFileState 缓存"]
+  dedup-lookup --> dedup-hit{"同区间且 mtime 未变?"}
+  dedup-hit -->|是| unchanged-stub["返回 file_unchanged 桩"]
+  dedup-hit -->|否| skill-discover["后台发现/激活该路径下的 skills"]
+  skill-discover --> call-inner["进 callInner 按扩展名分流"]
+  call-inner --> ext-switch{"文件类型?"}
+  ext-switch -->|文本| text-branch["读字节→探测编码→规范化换行→加行号→附 cyber-risk 提醒"]
+  ext-switch -->|图片| image-branch["base64 编码为 image 块"]
+  ext-switch -->|PDF| pdf-branch["按 pages 参数提取页→Document/图片块"]
+  ext-switch -->|notebook| nb-branch["解析 cell→映射成 tool_result 文本"]
+  ext-switch -->|二进制其他| bin-err["报错:不能用 Read 读二进制"]
+  text-branch --> enoent-check
+  image-branch --> enoent-check
+  pdf-branch --> enoent-check
+  nb-branch --> enoent-check
+  enoent-check{"ENOENT?"}
+  enoent-check -->|是| suggest["找相似文件名/cwd 建议给 Did you mean"]
+  enoent-check -->|否| update-state["更新 readFileState(mtime/内容/区间)"]
+  suggest --> throw-err["抛友好错误"]
+  update-state --> read-map-result["mapToolResultToToolResultBlockParam 按类型序列化"]
+</pre>
+
+<p>关键点：<code>validateInput</code> 在权限之前就挡掉 deny 路径、UNC 路径（防 NTLM 凭据泄漏）、二进制扩展名、会阻塞的设备文件——这些都不需要权限就能判。<code>checkPermissions</code> 则委托给通用的 <code>checkReadPermissionForTool</code>。<code>maxResultSizeChars: Infinity</code> 是有意为之，避免"读大文件→持久化→模型再 Read 这个持久化文件"的环。</p>
+
+<h2>七、FileEditTool / FileWriteTool：陈旧检查与原子写</h2>
+
+<p>两个写工具的核心防御是"陈旧检查"（staleness check）：模型必须先 Read 过这个文件，并且自上次 Read 后磁盘 mtime 没变，才允许写。这防止模型基于几轮前的旧内容覆盖用户刚改的代码。Edit 走 read-modify-write：读原内容→用 <code>findActualString</code> 处理引号风格→生成 patch→写盘→更新 readFileState→通知 LSP（didChange/didSave）和 VSCode diff 视图。Write 是整文件替换，额外要求文件必须先 Read 且非 partial view。</p>
+
+<pre class="mermaid">
+graph TD
+  write-start["Edit/Write.call"] --> mkdir["确保父目录存在(在临界区外)"]
+  mkdir --> backup["fileHistory 备份旧内容(按内容 hash 幂等)"]
+  backup --> load-current["读当前文件内容+编码+换行"]
+  load-current --> stale-check{"已 Read 且 mtime 未变?"}
+  stale-check -->|否| stale-err["抛 FILE_UNEXPECTEDLY_MODIFIED_ERROR"]
+  stale-check -->|是| compute-new["Edit: getPatchForEdit 生成新内容 / Write: 直接用 input.content"]
+  compute-new --> write-disk["writeTextContent 原子写盘"]
+  write-disk --> lsp-notify["通知 LSP didChange/didSave + VSCode"]
+  lsp-notify --> update-state["更新 readFileState(写后 mtime)"]
+  update-state --> return-diff["返回 filePath/patch/userModified 等"]
+</pre>
+
+<p>几个重要约束：</p>
+
+<ul>
+  <li><b>临界区不能有 await</b>：从"读当前内容"到"写盘"之间不允许让出事件循环，否则并发编辑会交错。mkdir、备份都显式放在临界区外。</li>
+  <li><b>Write 不改写换行符</b>：模型在 content 里给什么换行就用什么，避免把 bash 脚本在 Linux 上写成 CRLF。</li>
+  <li><b>UNC 路径跳过 I/O 校验</b>：<code>validateInput</code> 对 UNC 路径直接 return true，把判定让给权限层——因为 <code>fs.existsSync</code> 在 Windows UNC 路径上会触发 SMB 认证、可能泄露凭据。</li>
+  <li><b>team memory 防泄密</b>：写入 team memory 文件前会扫 secrets，命中就拒绝。</li>
+</ul>
+
+<h2>八、BashTool：从命令到 shell 进程</h2>
+
+<p>用户视角："Claude 跑一条 shell 命令"。BashTool 的 <code>call</code> 先处理特殊的"模拟 sed 编辑"（直接落盘，保证用户预览的就是写的），否则进 <code>runShellCommand</code> 这个 async generator：用 <code>exec</code> 起一个 shell 进程，边跑边通过 <code>onProgress</code> 回调把最新输出喂给 generator yield 成 <code>bash_progress</code> 事件。超时、显式 <code>run_in_background</code>、或 assistant 模式下的阻塞预算超限都会把命令转后台跑，返回 <code>backgroundTaskId</code> 让模型后续用 TaskOutput 取结果。</p>
+
+<pre class="mermaid">
+graph TD
+  bash-start["Bash.call(input)"] --> sed-check{"_simulatedSedEdit?"}
+  sed-check -->|是| apply-sed["直接 applySedEdit 落盘"]
+  sed-check -->|否| start-exec["exec 起 shell 进程(timeout/sandbox/onProgress)"]
+  start-exec --> bg-req{"run_in_background?"}
+  bg-req -->|是| spawn-bg["spawnShellTask 转后台,返回 backgroundTaskId"]
+  spawn-bg --> bg-return["返回 stdout 空 + backgroundTaskId"]
+  bg-req -->|否| race["Promise.race(结果 vs 进度阈值)"]
+  race --> early-done{"命令快速结束?"}
+  early-done -->|是| return-result["直接返回 ExecResult"]
+  early-done -->|否| auto-bg{"超时/assistant 预算到?"}
+  auto-bg -->|是且允许| to-bg["转后台继续跑,后续通知完成"]
+  auto-bg -->|否| stream-progress["循环 yield bash_progress 事件"]
+  stream-progress --> final-result["拿到最终 stdout/code/interrupted"]
+  return-result --> final-result
+  to-bg --> final-result
+  final-result --> interpret["interpretCommandResult 语义解读退出码"]
+  interpret --> persist-check{"输出文件 &gt; 阈值?"}
+  persist-check -->|是| copy-dest["复制到 tool-results 目录,模型走 Read 取"]
+  persist-check -->|否| use-stdout["直接用 stdout"]
+  copy-dest --> assemble-out["组装 Out(stdout/isImage/persistedOutputPath...)"]
+  use-stdout --> assemble-out
+  assemble-out --> bash-map-result["mapToolResult...:大输出包 persisted-output,图片走 image 块"]
+</pre>
+
+<p>Bash 的并发安全取决于命令是否只读：<code>isReadOnly</code> 调 <code>checkReadOnlyConstraints</code>，<code>isConcurrencySafe</code> 直接复用 <code>isReadOnly</code> 的结果。所以 <code>ls</code>/<code>cat</code> 这类会和别的只读工具并行，<code>git push</code> 这种则串行。<code>preparePermissionMatcher</code> 会把复合命令拆成子命令列表，让 <code>Bash(git *)</code> 这种钩子规则能命中 <code>ls && git push</code> 里的 git 子命令——拆不动就 fail-safe 让钩子跑。</p>
+
+<h2>九、GlobTool / GrepTool：ripgrep 封装</h2>
+
+<p>两个搜索工具都是只读、并发安全、走 <code>checkReadPermissionForTool</code>。Glob 调内部的 <code>glob</code> 函数按 pattern 找文件名；Grep 真正调 ripgrep（<code>rg</code>）做内容搜索。Grep 的 <code>call</code> 把模型参数翻译成 rg 命令行：<code>--hidden</code>、排除 VCS 目录、<code>--max-columns 500</code>（防 base64/压缩文件刷屏）、<code>-l/-c/-n/-i/-C/-A/-B/-U</code> 等，再叠加权限上下文里的 ignore pattern 和插件缓存排除项。路径用绝对路径调 <code>ripgrep</code>，结果再把绝对路径相对化成 cwd 相对路径省 token。</p>
+
+<pre class="mermaid">
+graph TD
+  grep-start["Grep.call(pattern, path, output_mode, ...)"] --> build-args["组装 rg 参数:--hidden/排除 VCS/--max-columns/模式标志"]
+  build-args --> add-ignore["叠加 readFile ignore pattern + 插件缓存排除"]
+  add-ignore --> call-rg["ripgrep(args, absolutePath, abortSignal)"]
+  call-rg --> rg-done{"rg 返回?"}
+  rg-done --> timeout{"RipgrepTimeoutError?"}
+  timeout -->|是| propagate["向上抛(让模型知道没搜完,而非误以为无匹配)"]
+  timeout -->|否| mode-switch{"output_mode?"}
+  mode-switch -->|content| content-branch["应用 head_limit/offset→相对化路径→拼内容行"]
+  mode-switch -->|count| count-branch["输出 filename:count + 总计摘要"]
+  mode-switch -->|files_with_matches| files-branch["Found N files + 文件名列表"]
+  content-branch --> map-out
+  count-branch --> map-out
+  files-branch --> map-out["mapToolResultToToolResultBlockParam 序列化"]
+</pre>
+
+<p>Grep 的 <code>validateInput</code> 只做路径存在性检查（UNC 跳过）。<code>head_limit</code> 在相对化路径之前应用，避免给上千行刷掉只剩几十行的宽模式做无用的逐行处理。Glob 的 <code>call</code> 类似但更简单：调 <code>glob</code> 取文件列表，相对化，返回 filenames + 是否截断。</p>
+
+<script>
+window.__sourceMap = {
+  "base-list": { "file": "src/tools.ts", "startLine": 193, "endLine": 251 },
+  "feat-gate": { "file": "src/tools.ts", "startLine": 16, "endLine": 135 },
+  "skip": { "file": "src/tools.ts", "startLine": 16, "endLine": 135 },
+  "enabled-check": { "file": "src/tools.ts", "startLine": 179, "endLine": 183 },
+  "deny-check": { "file": "src/tools.ts", "startLine": 262, "endLine": 269 },
+  "hide": { "file": "src/tools.ts", "startLine": 262, "endLine": 269 },
+  "keep": { "file": "src/tools.ts", "startLine": 307, "endLine": 327 },
+  "merge-mcp": { "file": "src/tools.ts", "startLine": 345, "endLine": 367 },
+  "dedup": { "file": "src/tools.ts", "startLine": 345, "endLine": 367 },
+  "final-pool": { "file": "src/tools.ts", "startLine": 271, "endLine": 327 },
+  "simple-mode": { "file": "src/tools.ts", "startLine": 273, "endLine": 298 },
+  "simple-only": { "file": "src/tools.ts", "startLine": 287, "endLine": 297 },
+  "find-tool": { "file": "src/services/tools/toolExecution.ts", "startLine": 345, "endLine": 356 },
+  "tool-found": { "file": "src/services/tools/toolExecution.ts", "startLine": 369, "endLine": 411 },
+  "unknown-tool": { "file": "src/services/tools/toolExecution.ts", "startLine": 396, "endLine": 410 },
+  "aborted": { "file": "src/services/tools/toolExecution.ts", "startLine": 415, "endLine": 453 },
+  "cancel-msg": { "file": "src/services/tools/toolExecution.ts", "startLine": 443, "endLine": 452 },
+  "parse-input": { "file": "src/services/tools/toolExecution.ts", "startLine": 615, "endLine": 616 },
+  "parse-ok": { "file": "src/services/tools/toolExecution.ts", "startLine": 616, "endLine": 680 },
+  "zod-err": { "file": "src/services/tools/toolExecution.ts", "startLine": 664, "endLine": 679 },
+  "validate-input": { "file": "src/services/tools/toolExecution.ts", "startLine": 683, "endLine": 686 },
+  "validate-ok": { "file": "src/services/tools/toolExecution.ts", "startLine": 687, "endLine": 733 },
+  "validate-err": { "file": "src/services/tools/toolExecution.ts", "startLine": 717, "endLine": 732 },
+  "backfill": { "file": "src/services/tools/toolExecution.ts", "startLine": 775, "endLine": 793 },
+  "pre-hooks": { "file": "src/services/tools/toolExecution.ts", "startLine": 800, "endLine": 862 },
+  "hook-stop": { "file": "src/services/tools/toolExecution.ts", "startLine": 848, "endLine": 861 },
+  "stop-msg": { "file": "src/services/tools/toolExecution.ts", "startLine": 853, "endLine": 860 },
+  "resolve-perm": { "file": "src/services/tools/toolExecution.ts", "startLine": 921, "endLine": 929 },
+  "perm-decision": { "file": "src/services/tools/toolExecution.ts", "startLine": 930, "endLine": 995 },
+  "deny-msg": { "file": "src/services/tools/toolExecution.ts", "startLine": 995, "endLine": 1104 },
+  "call-tool": { "file": "src/services/tools/toolExecution.ts", "startLine": 1206, "endLine": 1222 },
+  "call-ok": { "file": "src/services/tools/toolExecution.ts", "startLine": 1589, "endLine": 1737 },
+  "classify-err": { "file": "src/services/tools/toolExecution.ts", "startLine": 1696, "endLine": 1714 },
+  "err-msg": { "file": "src/services/tools/toolExecution.ts", "startLine": 1715, "endLine": 1737 },
+  "map-result": { "file": "src/services/tools/toolExecution.ts", "startLine": 1292, "endLine": 1296 },
+  "post-hooks": { "file": "src/services/tools/toolExecution.ts", "startLine": 1483, "endLine": 1531 },
+  "assemble": { "file": "src/services/tools/toolExecution.ts", "startLine": 1403, "endLine": 1474 },
+  "yield-msg": { "file": "src/services/tools/toolExecution.ts", "startLine": 1456, "endLine": 1473 },
+  "tool-self": { "file": "src/Tool.ts", "startLine": 500, "endLine": 503 },
+  "rule-check": { "file": "src/utils/permissions/permissions.ts", "startLine": 1158, "endLine": 1328 },
+  "deny-hit": { "file": "src/utils/permissions/permissions.ts", "startLine": 1158, "endLine": 1328 },
+  "allow-hit": { "file": "src/utils/permissions/permissions.ts", "startLine": 1158, "endLine": 1328 },
+  "ask-out": { "file": "src/utils/permissions/permissions.ts", "startLine": 1158, "endLine": 1328 },
+  "mode": { "file": "src/utils/permissions/permissions.ts", "startLine": 505, "endLine": 518 },
+  "ask-to-deny": { "file": "src/utils/permissions/permissions.ts", "startLine": 508, "endLine": 517 },
+  "classifier": { "file": "src/utils/permissions/permissions.ts", "startLine": 518, "endLine": 540 },
+  "cls-verdict": { "file": "src/utils/permissions/permissions.ts", "startLine": 843, "endLine": 920 },
+  "fallback": { "file": "src/utils/permissions/permissions.ts", "startLine": 843, "endLine": 862 },
+  "prompt-user": { "file": "src/hooks/toolPermission/handlers/interactiveHandler.ts", "startLine": 1, "endLine": 536 },
+  "user-say": { "file": "src/hooks/toolPermission/handlers/interactiveHandler.ts", "startLine": 1, "endLine": 536 },
+  "deny-out": { "file": "src/utils/permissions/permissions.ts", "startLine": 904, "endLine": 920 },
+  "allow-out": { "file": "src/utils/permissions/permissions.ts", "startLine": 919, "endLine": 920 },
+  "read-start": { "file": "src/tools/FileReadTool/FileReadTool.ts", "startLine": 496, "endLine": 502 },
+  "dedup-lookup": { "file": "src/tools/FileReadTool/FileReadTool.ts", "startLine": 536, "endLine": 542 },
+  "dedup-hit": { "file": "src/tools/FileReadTool/FileReadTool.ts", "startLine": 547, "endLine": 573 },
+  "unchanged-stub": { "file": "src/tools/FileReadTool/FileReadTool.ts", "startLine": 562, "endLine": 568 },
+  "skill-discover": { "file": "src/tools/FileReadTool/FileReadTool.ts", "startLine": 575, "endLine": 591 },
+  "call-inner": { "file": "src/tools/FileReadTool/FileReadTool.ts", "startLine": 593, "endLine": 607 },
+  "ext-switch": { "file": "src/tools/FileReadTool/FileReadTool.ts", "startLine": 518, "endLine": 518 },
+  "text-branch": { "file": "src/tools/FileReadTool/FileReadTool.ts", "startLine": 593, "endLine": 607 },
+  "image-branch": { "file": "src/tools/FileReadTool/FileReadTool.ts", "startLine": 654, "endLine": 669 },
+  "pdf-branch": { "file": "src/tools/FileReadTool/FileReadTool.ts", "startLine": 672, "endLine": 678 },
+  "nb-branch": { "file": "src/tools/FileReadTool/FileReadTool.ts", "startLine": 670, "endLine": 671 },
+  "bin-err": { "file": "src/tools/FileReadTool/FileReadTool.ts", "startLine": 469, "endLine": 482 },
+  "enoent-check": { "file": "src/tools/FileReadTool/FileReadTool.ts", "startLine": 608, "endLine": 650 },
+  "suggest": { "file": "src/tools/FileReadTool/FileReadTool.ts", "startLine": 639, "endLine": 647 },
+  "update-state": { "file": "src/tools/FileReadTool/FileReadTool.ts", "startLine": 519, "endLine": 525 },
+  "throw-err": { "file": "src/tools/FileReadTool/FileReadTool.ts", "startLine": 647, "endLine": 648 },
+  "read-map-result": { "file": "src/tools/FileReadTool/FileReadTool.ts", "startLine": 652, "endLine": 717 },
+  "write-start": { "file": "src/tools/FileEditTool/FileEditTool.ts", "startLine": 387, "endLine": 398 },
+  "mkdir": { "file": "src/tools/FileEditTool/FileEditTool.ts", "startLine": 427, "endLine": 430 },
+  "backup": { "file": "src/tools/FileEditTool/FileEditTool.ts", "startLine": 431, "endLine": 440 },
+  "load-current": { "file": "src/tools/FileEditTool/FileEditTool.ts", "startLine": 442, "endLine": 449 },
+  "stale-check": { "file": "src/tools/FileEditTool/FileEditTool.ts", "startLine": 451, "endLine": 468 },
+  "stale-err": { "file": "src/tools/FileEditTool/FileEditTool.ts", "startLine": 465, "endLine": 466 },
+  "compute-new": { "file": "src/tools/FileEditTool/FileEditTool.ts", "startLine": 470, "endLine": 491 },
+  "write-disk": { "file": "src/tools/FileEditTool/FileEditTool.ts", "startLine": 491, "endLine": 491 },
+  "lsp-notify": { "file": "src/tools/FileEditTool/FileEditTool.ts", "startLine": 494, "endLine": 514 },
+  "return-diff": { "file": "src/tools/FileEditTool/FileEditTool.ts", "startLine": 560, "endLine": 573 },
+  "bash-start": { "file": "src/tools/BashTool/BashTool.tsx", "startLine": 624, "endLine": 629 },
+  "sed-check": { "file": "src/tools/BashTool/BashTool.tsx", "startLine": 627, "endLine": 629 },
+  "apply-sed": { "file": "src/tools/BashTool/BashTool.tsx", "startLine": 628, "endLine": 628 },
+  "start-exec": { "file": "src/tools/BashTool/BashTool.tsx", "startLine": 881, "endLine": 898 },
+  "bg-req": { "file": "src/tools/BashTool/BashTool.tsx", "startLine": 989, "endLine": 1001 },
+  "spawn-bg": { "file": "src/tools/BashTool/BashTool.tsx", "startLine": 904, "endLine": 921 },
+  "bg-return": { "file": "src/tools/BashTool/BashTool.tsx", "startLine": 994, "endLine": 1000 },
+  "race": { "file": "src/tools/BashTool/BashTool.tsx", "startLine": 1007, "endLine": 1024 },
+  "early-done": { "file": "src/tools/BashTool/BashTool.tsx", "startLine": 1011, "endLine": 1014 },
+  "return-result": { "file": "src/tools/BashTool/BashTool.tsx", "startLine": 1012, "endLine": 1013 },
+  "auto-bg": { "file": "src/tools/BashTool/BashTool.tsx", "startLine": 967, "endLine": 983 },
+  "to-bg": { "file": "src/tools/BashTool/BashTool.tsx", "startLine": 969, "endLine": 971 },
+  "stream-progress": { "file": "src/tools/BashTool/BashTool.tsx", "startLine": 662, "endLine": 679 },
+  "final-result": { "file": "src/tools/BashTool/BashTool.tsx", "startLine": 682, "endLine": 720 },
+  "interpret": { "file": "src/tools/BashTool/BashTool.tsx", "startLine": 690, "endLine": 701 },
+  "persist-check": { "file": "src/tools/BashTool/BashTool.tsx", "startLine": 732, "endLine": 753 },
+  "copy-dest": { "file": "src/tools/BashTool/BashTool.tsx", "startLine": 736, "endLine": 752 },
+  "use-stdout": { "file": "src/tools/BashTool/BashTool.tsx", "startLine": 726, "endLine": 727 },
+  "assemble-out": { "file": "src/tools/BashTool/BashTool.tsx", "startLine": 803, "endLine": 816 },
+  "grep-start": { "file": "src/tools/GrepTool/GrepTool.ts", "startLine": 310, "endLine": 328 },
+  "build-args": { "file": "src/tools/GrepTool/GrepTool.ts", "startLine": 330, "endLine": 409 },
+  "add-ignore": { "file": "src/tools/GrepTool/GrepTool.ts", "startLine": 411, "endLine": 434 },
+  "call-rg": { "file": "src/tools/GrepTool/GrepTool.ts", "startLine": 441, "endLine": 441 },
+  "rg-done": { "file": "src/tools/GrepTool/GrepTool.ts", "startLine": 441, "endLine": 442 },
+  "timeout": { "file": "src/tools/GrepTool/GrepTool.ts", "startLine": 436, "endLine": 440 },
+  "propagate": { "file": "src/tools/GrepTool/GrepTool.ts", "startLine": 440, "endLine": 440 },
+  "mode-switch": { "file": "src/tools/GrepTool/GrepTool.ts", "startLine": 443, "endLine": 443 },
+  "content-branch": { "file": "src/tools/GrepTool/GrepTool.ts", "startLine": 446, "endLine": 465 },
+  "count-branch": { "file": "src/tools/GrepTool/GrepTool.ts", "startLine": 480, "endLine": 499 },
+  "files-branch": { "file": "src/tools/GrepTool/GrepTool.ts", "startLine": 502, "endLine": 520 },
+  "bash-map-result": { "file": "src/tools/BashTool/BashTool.tsx", "startLine": 555, "endLine": 623 },
+  "map-out": { "file": "src/tools/GrepTool/GrepTool.ts", "startLine": 254, "endLine": 309 }
+};
+</script>
+
+<aside id="source-panel"><div id="source-header"></div><div id="monaco-container"></div></aside>
+<script src="../assets/codeindex-runtime.js"></script>
+<script src="../assets/codeindex.js"></script>
+</body>
+</html>

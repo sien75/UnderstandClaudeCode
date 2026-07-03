@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Web Client (claude.ai/code-style browser interface)</title>
+<link rel="stylesheet" href="../assets/codeindex.css">
+</head>
+<body>
+<nav class="topnav"><a href="../index.html">← Back to overview</a></nav>
+<h1>Web Client (claude.ai/code-style browser interface)</h1>
+
+<p>When the user opens this Next.js page in the browser, they get a chat interface similar to claude.ai/code: a conversation list on the left and the current conversation's message stream plus input box on the right. The user types in the input box and presses Enter to send; messages stream in chunk by chunk; they can stop generation midway, switch/create/delete conversations, change theme, adjust font, search history, and export conversations. Behind the scenes it forwards requests to the real backend Claude Code session (default <code>http://localhost:3001</code>) through a Next.js API route, and passes the backend's SSE stream straight through to the browser.</p>
+
+<p>This subproject actually contains <strong>two</strong> backend-facing client implementations: one is the lightweight <code>streamChat</code> in <code>lib/api.ts</code>, which is what the UI currently uses, going through Next.js's <code>/api/chat</code> proxy route; the other is the fuller client under <code>lib/api/</code> (<code>client.ts</code> with retries/timeouts/request deduplication, <code>stream.ts</code> with reconnect and progress callbacks, <code>conversations.ts</code>/<code>messages.ts</code>/<code>files.ts</code> wrapping various resource operations), but the current UI has not been wired to this fuller layer yet—it is a "prepared, more complete layer". The data flow below focuses primarily on the lightweight path that is actually in use, with supplementary notes on the fuller layer.</p>
+
+<dl>
+  <dt>Input</dt>
+  <dd>Text the user types into the input box + history messages of the current conversation + model/API address selected in settings</dd>
+  <dt>Output</dt>
+  <dd>Claude replies rendered chunk by chunk (with Markdown rendering, code highlighting, and tool-call block display), plus conversation records persisted to localStorage</dd>
+</dl>
+
+<h2>Main Data Flow: Sending a Message to Receiving a Reply</h2>
+
+<p>After the user finishes typing and presses Enter (or clicks the send button), the frontend first writes the user message into the local state store (zustand's <code>useChatStore</code>), immediately creates a "placeholder" empty assistant message (status marked streaming), and then initiates a fetch request with an <code>AbortController</code>. The request hits the same-origin Next.js route <code>/api/chat</code>, which forwards the request body as-is to the real backend (<code>NEXT_PUBLIC_API_URL</code>, default <code>localhost:3001</code>) and streams the backend's SSE response straight back to the browser. The browser reads the stream line by line, appending text deltas to that placeholder assistant message; the interface grows chunk by chunk. After reading <code>[DONE]</code> or when the user interrupts midway, the message status is changed to complete.</p>
+
+<pre class="mermaid">
+graph TD
+  user-type["User types in input box and presses Enter"] --> input-guard{"Input empty or already generating?"}
+  input-guard -->|Yes| no-op["Do nothing"]
+  input-guard -->|No| add-user-msg["Write user message into store"]
+  add-user-msg --> add-placeholder["Create empty assistant message(status=streaming)"]
+  add-placeholder --> build-msgs["Build history message array to send to backend"]
+  build-msgs --> fetch-stream["fetch /api/chat starts streaming request(with AbortController)"]
+  fetch-stream --> proxy-route["Next.js /api/chat route proxies to backend"]
+  proxy-route --> backend{"Backend response OK?"}
+  backend -->|Non-200| yield-error["Yield error chunk"]
+  backend -->|200| read-sse["Browser reads SSE stream, parses data: lines"]
+  read-sse --> chunk-type{"Chunk type?"}
+  chunk-type -->|text| append-text["Append text delta to assistant message, UI grows in real time"]
+  chunk-type -->|done| finish-done["End loop"]
+  chunk-type -->|error| mark-error["Mark assistant message error and show error text"]
+  append-text --> read-sse
+  finish-done --> mark-complete["Mark assistant message complete"]
+  mark-error --> cleanup
+  mark-complete --> cleanup["Clear isStreaming/abortRef"]
+  yield-error --> cleanup
+</pre>
+
+<ul>
+  <li>Clicking the "Stop generation" button calls <code>abortRef.current.abort()</code>, cancelling the fetch; the caught AbortError preserves the text already generated and marks it complete (not a failure).</li>
+  <li>The <code>/api/chat</code> route is a pure pass-through proxy: it does not parse the stream content, only returns the backend's <code>response.body</code> as the Next.js response body and preserves Content-Type. The backend address is determined by <code>NEXT_PUBLIC_API_URL</code> and may include <code>ANTHROPIC_API_KEY</code> for Bearer auth.</li>
+  <li>History messages are taken directly from the messages array of the current conversation in the zustand store and assembled into the request body—meaning "memory" is entirely maintained on the browser side, and the full history is resent every request.</li>
+</ul>
+
+<h2>Message Rendering: From Markdown to Code Highlighting</h2>
+
+<p>Assistant messages go to <code>MessageBubble</code>: user messages are rendered as plain text (preserving line breaks), while assistant messages are handed to <code>MarkdownContent</code> which uses react-markdown + remark-gfm to render rich text. If the message status is still streaming, a blinking cursor block is shown at the end of the bubble. Code block syntax highlighting is handled by the <code>SyntaxHighlight</code> component—it lazily loads Shiki on the main thread (imported only on first use), generates highlighted HTML by language/theme and injects it via <code>dangerouslySetInnerHTML</code>; unknown languages fall back to plain text. Note: <code>lib/workers/highlight.worker.ts</code> contains a parallel "move highlighting to Web Worker" implementation, but the current UI does not instantiate it anywhere with <code>new Worker</code>, so highlighting currently runs on the main thread.</p>
+
+<pre class="mermaid">
+graph TD
+  msg-bubble["MessageBubble receives a Message"] --> is-user{"Is user message?"}
+  is-user -->|Yes| render-plain["Render as plain text (preserve line breaks)"]
+  is-user -->|No| is-error{"status=error?"}
+  is-error -->|Yes| render-error["Red error bubble + AlertCircle icon"]
+  is-error -->|No| render-md["MarkdownContent: react-markdown+remark-gfm"]
+  render-md --> md-out["Output rich-text HTML"]
+  md-out --> has-code{"Contains code block?"}
+  has-code -->|No| show-bubble["Show bubble"]
+  has-code -->|Yes| shiki-lazy["SyntaxHighlight: lazily load Shiki"]
+  shiki-lazy --> lang-ok{"Recognize language?"}
+  lang-ok -->|Yes| shiki-html["codeToHtml generates highlighted HTML"]
+  lang-ok -->|No| plain-code["Fall back to plain text pre/code"]
+  shiki-html --> show-bubble
+  plain-code --> show-bubble
+  show-bubble --> streaming{"status=streaming?"}
+  streaming -->|Yes| cursor["Show blinking cursor block at end"]
+  streaming -->|No| done["Done"]
+</pre>
+
+<ul>
+  <li>Shiki's highlighter is a singleton (<code>highlighterPromise</code> initialized only once), preloaded with github-dark/github-light themes and about 20+ languages.</li>
+  <li><code>lib/workers/markdown.worker.ts</code> is likewise "prepared but not wired": it performs lightweight Markdown pre-segmentation (classifying lines into heading/code-fence/list, etc.), but no UI consumes it; current Markdown is parsed by react-markdown on the main thread.</li>
+</ul>
+
+<h2>Theme Switching</h2>
+
+<p>The theme is provided by <code>ThemeProvider</code> (<code>lib/theme.tsx</code>) through React Context, supporting dark / light / system. When system is selected, it listens to the <code>prefers-color-scheme</code> media query and follows the system's light/dark changes. The actual effect is achieved by adding/removing the <code>light</code> class on the <code>&lt;html&gt;</code> root element (default is dark, the layout uses <code>&lt;html class="dark"&gt;</code>), and Tailwind's dark: variants switch accordingly. The selection is stored in localStorage (key <code>ui-theme</code>) and read back next time. Note this theme only controls UI colors; the code highlighting light/dark theme is independent on the Shiki side as <code>github-dark</code>/<code>github-light</code>.</p>
+
+<h2>Search: Full-Text Search of History Conversations in the Browser</h2>
+
+<p>Search uses <code>client-search.ts</code>—pure frontend, running on the main thread, directly iterating over the conversation array in the store. It first tokenizes the query (lowercase, split by non-word characters), then scores each message: title hit weight ×1.5, body score by token hit count + word-boundary bonus + multiple-occurrence bonus, and partial matches are also penalized proportionally. Besides keywords, it can filter by date, conversation, model, role, content type (text/tool_use/code/file), and tags. Results are sorted by total score descending, each conversation keeps at most 5 matches, and highlighted snippets are included. <code>lib/search/highlighter.ts</code> is responsible for excerpt snippets and wrapping hit words in highlight markers.</p>
+
+<p>There is also a "prepared but not wired" parallel implementation: <code>lib/workers/search.worker.ts</code> maintains an inverted index (term → set of message indices), designed to be fed data, queried, and deleted via postMessage, but currently no UI starts it with <code>new Worker</code>. <code>lib/search/search-api.ts</code> is a stub reserved for a future backend search endpoint—the comments say "replace clientSearch calls with apiSearch once the backend search endpoint is ready".</p>
+
+<h2>Export Conversations</h2>
+
+<p>In the export panel the user picks a format (markdown / json / html / plaintext; pdf uses client-side <code>window.print()</code>) and options (whether to include tool calls, thinking process, timestamps, file contents, etc.). After clicking export, the frontend POSTs the entire Conversation object + options to <code>/api/export</code>. This route calls the corresponding conversion function (<code>lib/export/markdown.ts</code>, etc.) by format, uses the conversation title slug as the filename, and returns the file as a download with Content-Disposition: attachment. All conversion happens in the server-side route; the frontend receives the finished file.</p>
+
+<h2>Auxiliary View: Message State Machine</h2>
+
+<p>Each Message has a status field with values pending / streaming / complete / error, which determines how it is displayed and how it participates in subsequent requests. State transitions mainly happen in <code>ChatInput.handleSubmit</code>: when sending, the newly created assistant message starts at streaming, each received text chunk updates its content while keeping it streaming, the stream ending (done) moves it to complete, an error chunk or non-abort exception moves it to error; when the user actively interrupts (AbortError) it is treated as complete—the generated content is preserved.</p>
+
+<pre class="mermaid">
+graph TD
+  new-user["Create user message"] --> user-complete["status=complete(immediately)"]
+  new-assistant["Create placeholder assistant message"] --> st-streaming["status=streaming"]
+  st-streaming --> on-text["Receive text chunk: accumulate content, stay streaming"]
+  on-text --> st-streaming
+  st-streaming --> on-done["Receive done chunk"] --> st-complete["status=complete"]
+  st-streaming --> on-err-chunk["Receive error chunk"] --> st-error["status=error, show error text"]
+  st-streaming --> on-abort["User interrupts (AbortError)"] --> st-complete
+  st-streaming --> on-fail["Other exception"] --> st-error
+</pre>
+
+<h2>Auxiliary View: Permissions and Lifecycle</h2>
+
+<p><strong>Permissions</strong>: Settings include a permission configuration—switches for auto-approval by tool type (file_read / file_write / bash / web_search) plus a restricted directory list. This configuration lives in the zustand store's settings and is persisted to localStorage, but it currently <strong>only exists as local configuration</strong>: the chat request body sent to the backend only contains <code>{messages, model, stream}</code>; permission settings are neither sent to the backend nor validated when sending messages. The UI only has the <code>PermissionSettings</code> component reading and writing it. It is essentially "switches prepared now, to be wired once the backend can understand them".</p>
+
+<p><strong>Lifecycle</strong>: Almost the entire data lifecycle of this web subproject is tied to browser localStorage. The zustand store uses the <code>persist</code> middleware to persist conversations, activeConversationId, settings, pinnedIds, recentSearches, and tags (key <code>claude-code-chat</code>), reading them back after refresh; while pure UI states like isSearchOpen, settingsOpen, sidebarTab, and selectedConversationIds are forcibly reset to defaults during <code>merge</code> and are not persisted. The conversation "memory" is also entirely in the local store—each message sends the full history of the current conversation from the store to the backend; the backend does not keep context for the browser. This means clearing localStorage or switching browsers wipes the history and context.</p>
+
+<p><strong>Relationship with the main project's src/server/web</strong>: The main project's <code>src/server/web/</code> is another independent terminal web service (pty-server, session-manager, terminal.js, etc., using xterm to embed a real terminal in the webpage). The web/ subproject does not reuse code from src/server/web—it uses the SSE streaming conversation path rather than the terminal PTY path. The two only intersect at the configuration layer: web/ points to the backend via <code>NEXT_PUBLIC_API_URL</code> (default localhost:3001). Which exact backend service that is (src/server or another service) is decided by deployment and is not hard-coded. <code>lib/terminal-compat.ts</code> is a stub "for moving Ink-based terminal components from src/components into the browser"—providing browser-side default implementations for process.stdout.columns/rows, process.exit, useInput/useApp and other Ink/Node APIs—but currently no file in web/ imports it; it is a shim reserved for future porting of terminal components.</p>
+
+<ul>
+  <li>The <code>/api/share</code> route (generates shareable links) and <code>/api/files/read|write</code> routes are another group of backend proxies, following the same pattern as /api/chat: receive frontend requests and forward them to the real backend. Sharing supports public/unlisted/password visibility and multiple expiration durations.</li>
+  <li>PDF is a special case in the export route: the server side does not handle it, and directly returns 400 indicating "handled by client-side window.print()".</li>
+</ul>
+
+<script>
+window.__sourceMap = {
+  "user-type": { "file": "web/components/chat/ChatInput.tsx", "startLine": 23, "endLine": 29 },
+  "input-guard": { "file": "web/components/chat/ChatInput.tsx", "startLine": 24, "endLine": 25 },
+  "no-op": { "file": "web/components/chat/ChatInput.tsx", "startLine": 25, "endLine": 25 },
+  "add-user-msg": { "file": "web/components/chat/ChatInput.tsx", "startLine": 31, "endLine": 35 },
+  "add-placeholder": { "file": "web/components/chat/ChatInput.tsx", "startLine": 38, "endLine": 42 },
+  "build-msgs": { "file": "web/components/chat/ChatInput.tsx", "startLine": 47, "endLine": 53 },
+  "fetch-stream": { "file": "web/lib/api.ts", "startLine": 24, "endLine": 29 },
+  "proxy-route": { "file": "web/app/api/chat/route.ts", "startLine": 8, "endLine": 17 },
+  "backend": { "file": "web/lib/api.ts", "startLine": 31, "endLine": 35 },
+  "yield-error": { "file": "web/lib/api.ts", "startLine": 32, "endLine": 34 },
+  "read-sse": { "file": "web/lib/api.ts", "startLine": 47, "endLine": 69 },
+  "chunk-type": { "file": "web/lib/api.ts", "startLine": 55, "endLine": 68 },
+  "append-text": { "file": "web/components/chat/ChatInput.tsx", "startLine": 59, "endLine": 64 },
+  "finish-done": { "file": "web/lib/api.ts", "startLine": 58, "endLine": 60 },
+  "mark-error": { "file": "web/components/chat/ChatInput.tsx", "startLine": 67, "endLine": 72 },
+  "mark-complete": { "file": "web/components/chat/ChatInput.tsx", "startLine": 76, "endLine": 76 },
+  "cleanup": { "file": "web/components/chat/ChatInput.tsx", "startLine": 86, "endLine": 89 },
+  "msg-bubble": { "file": "web/components/chat/MessageBubble.tsx", "startLine": 12, "endLine": 16 },
+  "is-user": { "file": "web/components/chat/MessageBubble.tsx", "startLine": 13, "endLine": 13 },
+  "render-plain": { "file": "web/components/chat/MessageBubble.tsx", "startLine": 63, "endLine": 64 },
+  "is-error": { "file": "web/components/chat/MessageBubble.tsx", "startLine": 14, "endLine": 14 },
+  "render-error": { "file": "web/components/chat/MessageBubble.tsx", "startLine": 53, "endLine": 61 },
+  "render-md": { "file": "web/components/chat/MarkdownContent.tsx", "startLine": 12, "endLine": 31 },
+  "md-out": { "file": "web/components/chat/MarkdownContent.tsx", "startLine": 29, "endLine": 30 },
+  "has-code": { "file": "web/components/tools/SyntaxHighlight.tsx", "startLine": 138, "endLine": 144 },
+  "show-bubble": { "file": "web/components/chat/MessageBubble.tsx", "startLine": 17, "endLine": 76 },
+  "shiki-lazy": { "file": "web/components/tools/SyntaxHighlight.tsx", "startLine": 9, "endLine": 45 },
+  "lang-ok": { "file": "web/components/tools/SyntaxHighlight.tsx", "startLine": 115, "endLine": 122 },
+  "shiki-html": { "file": "web/components/tools/SyntaxHighlight.tsx", "startLine": 116, "endLine": 117 },
+  "plain-code": { "file": "web/components/tools/SyntaxHighlight.tsx", "startLine": 118, "endLine": 121 },
+  "streaming": { "file": "web/components/chat/MessageBubble.tsx", "startLine": 68, "endLine": 73 },
+  "cursor": { "file": "web/components/chat/MessageBubble.tsx", "startLine": 69, "endLine": 73 },
+  "done": { "file": "web/components/chat/MessageBubble.tsx", "startLine": 68, "endLine": 68 },
+  "new-user": { "file": "web/components/chat/ChatInput.tsx", "startLine": 31, "endLine": 35 },
+  "user-complete": { "file": "web/components/chat/ChatInput.tsx", "startLine": 34, "endLine": 34 },
+  "new-assistant": { "file": "web/components/chat/ChatInput.tsx", "startLine": 38, "endLine": 42 },
+  "st-streaming": { "file": "web/components/chat/ChatInput.tsx", "startLine": 41, "endLine": 41 },
+  "on-text": { "file": "web/components/chat/ChatInput.tsx", "startLine": 59, "endLine": 64 },
+  "on-done": { "file": "web/components/chat/ChatInput.tsx", "startLine": 65, "endLine": 66 },
+  "st-complete": { "file": "web/components/chat/ChatInput.tsx", "startLine": 76, "endLine": 76 },
+  "on-err-chunk": { "file": "web/components/chat/ChatInput.tsx", "startLine": 67, "endLine": 72 },
+  "st-error": { "file": "web/components/chat/ChatInput.tsx", "startLine": 69, "endLine": 71 },
+  "on-abort": { "file": "web/components/chat/ChatInput.tsx", "startLine": 78, "endLine": 84 },
+  "on-fail": { "file": "web/components/chat/ChatInput.tsx", "startLine": 78, "endLine": 82 }
+};
+</script>
+
+<aside id="source-panel"><div id="source-header"></div><div id="monaco-container"></div></aside>
+<script src="../assets/codeindex-runtime.js"></script>
+<script src="../assets/codeindex.js"></script>
+</body>
+</html>

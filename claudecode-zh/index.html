@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Claude Code CLI（泄露源码）</title>
+<link rel="stylesheet" href="assets/codeindex.css">
+</head>
+<body>
+<h1>Claude Code CLI（泄露源码）</h1>
+
+<p>这是 Anthropic 的终端原生 AI 编程助手 Claude Code 的泄露源码（2026-03-31，非官方发布）。一个 Bun 运行的单二进制 CLI，整个终端界面用 React + Ink 渲染。核心管道是：<b>用户输入 → CLI 解析 → 对话引擎(QueryEngine) → 调 LLM API 流式返回 → 若模型要调工具就执行工具把结果喂回去循环 → 终端 UI 渲染</b>。语言 TypeScript，包管理 Bun，校验 Zod，权限用规则模式 + auto 分类器，外部能力靠 MCP，IDE 集成靠 bridge，扩展靠 skill/plugin，记忆靠 CLAUDE.md。</p>
+
+<p>本报告按"用户/外部触发者能做什么"纵向切成 13 个业务模块，每个模块顺着数据流讲清"什么变成什么"。主视图为<b>数据流</b>，遇到状态机/权限/生命周期等模式时辅助标注。覆盖以核心管道深度精读为主、长尾知晓职责为辅，非运行时资产（lock/生成的 terminal.js/构建脚本/docker/CI）已排除。</p>
+
+<h2>用户与外部能做什么</h2>
+<ul>
+  <li>在终端敲 <code>claude</code> 启动、进入 REPL 交互 → <a href="modules/cli-startup-init.html">CLI 启动与会话初始化</a>、<a href="modules/terminal-ui.html">终端 UI 层</a></li>
+  <li>提问、看流式回复（中途 Claude 可能自己调工具若干轮）→ <a href="modules/query-engine-llm-stream.html">对话引擎与 LLM 流式调用</a>、<a href="modules/terminal-ui.html">终端 UI 层</a></li>
+  <li>让 Claude 读写文件、跑 shell 命令、搜索代码 → <a href="modules/tool-system-file-shell.html">工具系统与文件/Shell 工具</a></li>
+  <li>敲 <code>/commit</code> <code>/review</code> <code>/compact</code> 等斜杠命令 → <a href="modules/slash-commands.html">斜杠命令系统</a></li>
+  <li>（系统侧，每次操作自动发生）操作前过权限闸门：放行/问用户/拒绝 → <a href="modules/permission-system.html">权限系统</a></li>
+  <li>派子智能体、起后台任务、组多智能体团队协同 → <a href="modules/agent-task-coordinator.html">智能体、任务与多智能体编排</a></li>
+  <li>连接外部 MCP server 用其工具/资源，或把 Claude 自己暴露成 MCP server → <a href="modules/mcp-subsystem.html">MCP 子系统</a></li>
+  <li>用 VS Code/JetBrains 扩展连上本地 CLI 后端 → <a href="modules/ide-bridge.html">IDE Bridge</a></li>
+  <li>装 plugin 扩展能力、调预置 skill 工作流、让 Claude 持久记住事实 → <a href="modules/skills-plugins-memory.html">技能、插件与记忆系统</a></li>
+  <li>在浏览器用 claude.ai/code 风格的网页版（记忆全在浏览器）→ <a href="modules/web-app.html">Web 端</a></li>
+  <li>让别的 AI 客户端通过 MCP 浏览本仓库源码 → <a href="modules/mcp-server-subproject.html">MCP 探索服务器</a></li>
+  <li>（支撑层）消息处理、会话存储、bash 安全解析、插件加载、OAuth/埋点/LSP/策略限制等 → <a href="modules/core-utils-services.html">核心工具函数与服务层补充</a></li>
+</ul>
+
+<a class="module-card" href="modules/cli-startup-init.html">
+  <section>
+    <h2>CLI 启动与会话初始化</h2>
+    <p>把"用户在终端敲下 claude 回车"变成"一个鉴权过、配置加载好、就绪可交互的 REPL 会话"。</p>
+  </section>
+</a>
+
+<a class="module-card" href="modules/query-engine-llm-stream.html">
+  <section>
+    <h2>对话引擎与 LLM 流式调用</h2>
+    <p>把"用户的一句提问"变成"流式返回的最终回复"——中途若模型要调工具，就执行工具把结果喂回去循环，还要管 thinking、重试退避、token/成本计数、上下文压缩。</p>
+  </section>
+</a>
+
+<a class="module-card" href="modules/tool-system-file-shell.html">
+  <section>
+    <h2>工具系统与文件/Shell 工具</h2>
+    <p>把"模型要读写文件或执行命令的请求"变成"经 Zod 校验、过权限闸门、执行完、结果回传给模型"——含 FileRead/Edit/Write、Bash（AST 安全解析）、Glob、Grep。</p>
+  </section>
+</a>
+
+<a class="module-card" href="modules/slash-commands.html">
+  <section>
+    <h2>斜杠命令系统</h2>
+    <p>把"用户敲的 /xxx 斜杠命令"变成"对应的执行结果"——三类命令（送提示词给模型 / 跑本地代码返文本 / 弹 Ink 面板返 JSX）各有路径。</p>
+  </section>
+</a>
+
+<a class="module-card" href="modules/permission-system.html">
+  <section>
+    <h2>权限系统</h2>
+    <p>把"模型要执行一个可能改东西的操作"变成"放行 / 问用户 / 拒绝"的决策——硬规则前置 + 四模式分流（default/plan/bypassPermissions/auto），auto 模式有分类器与熔断。</p>
+  </section>
+</a>
+
+<a class="module-card" href="modules/agent-task-coordinator.html">
+  <section>
+    <h2>智能体、任务与多智能体编排</h2>
+    <p>把"Claude 想并行处理子任务"变成"派生的子智能体 / 后台 shell 任务 / 多智能体团队"——任务有完整生命周期（创建→运行→完成/停止），智能体间能互发消息，前台后台可逆切换。</p>
+  </section>
+</a>
+
+<a class="module-card" href="modules/mcp-subsystem.html">
+  <section>
+    <h2>MCP 子系统</h2>
+    <p>把"外部 MCP server 暴露的工具/资源"变成"Claude 能调用的能力"（七种 transport、OAuth 鉴权、断连重连）；反过来也能把 Claude 自己作为 MCP server 暴露给别的 AI。</p>
+  </section>
+</a>
+
+<a class="module-card" href="modules/ide-bridge.html">
+  <section>
+    <h2>IDE Bridge（IDE 集成）</h2>
+    <p>把"VS Code/JetBrains 扩展的连接请求"变成"CLI 后端的一个双向通信会话"——双方都连服务端中转，OAuth + JWT 双 token 鉴权，消息路由、权限代理、断连/休眠恢复。</p>
+  </section>
+</a>
+
+<a class="module-card" href="modules/skills-plugins-memory.html">
+  <section>
+    <h2>技能、插件与记忆系统</h2>
+    <p>把"可复用工作流 / 扩展能力 / 要记住的事实"分别变成"加载执行的 skill、安装的 plugin、持久化到 CLAUDE.md 并按需回忆/团队同步的记忆"。</p>
+  </section>
+</a>
+
+<a class="module-card" href="modules/terminal-ui.html">
+  <section>
+    <h2>终端 UI 层（React + Ink）</h2>
+    <p>把"用户的敲键与引擎的流式事件"变成"终端里实时渲染的对话界面"——以 messages 数组为数据流主轴，权限弹窗、工具卡片、diff、虚拟滚动皆 React 组件。</p>
+  </section>
+</a>
+
+<a class="module-card" href="modules/web-app.html">
+  <section>
+    <h2>Web 端</h2>
+    <p>把"浏览器里发的一条消息"变成"流式渲染的回复"——Next.js 前端，走 /api/chat 透传后端 SSE；记忆与权限全在浏览器 localStorage，存在"备好但未接线"的第二套 API/Worker 层。</p>
+  </section>
+</a>
+
+<a class="module-card" href="modules/mcp-server-subproject.html">
+  <section>
+    <h2>MCP 探索服务器</h2>
+    <p>把"外部 AI 客户端的读源码请求"变成"对本仓库文件的定位/读取/搜索结果"——独立部署的 MCP server，一个 createServer 内核 + STDIO/HTTP/Vercel 三种外壳。</p>
+  </section>
+</a>
+
+<a class="module-card" href="modules/core-utils-services.html">
+  <section>
+    <h2>核心工具函数与服务层补充</h2>
+    <p>把前面模块没覆盖的消息处理、会话存储、bash 安全解析、附件收集、插件加载、OAuth、埋点、LSP、策略限制等支撑文件，补齐到"知晓职责、关键函数精读"。</p>
+  </section>
+</a>
+
+<section class="coverage">
+<h2>覆盖率说明</h2>
+<p>覆盖率（全仓 573780 行）：Deep 49029 (8.5%) · Mapped 109488 (19.1%) · Ignored 38858 (6.8%) · 总覆盖 34.4%。核心管道（启动→对话引擎→工具→权限→命令→UI）已深度精读，长尾组件/hooks/命令按代表抽样、非运行时资产（lock/生成的 terminal.js/构建脚本/docker/CI/泄露的系统提示文档）已排除。<b>源码已通过 codeindex-pack 内嵌（108 文件 / 5.8MB），无需本地文件即可点击流程图节点看源码，可直接部署到任意静态托管。</b></p>
+</section>
+<script src="assets/codeindex-runtime.js"></script>
+<script src="assets/codeindex.js"></script>
+</body>
+</html>

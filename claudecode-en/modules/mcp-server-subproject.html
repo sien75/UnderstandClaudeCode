@@ -1,0 +1,342 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MCP Exploration Server (lets external AI clients browse this repo)</title>
+<link rel="stylesheet" href="../assets/codeindex.css">
+</head>
+<body>
+<nav class="topnav"><a href="../index.html">← Back to overview</a></nav>
+<h1>MCP Exploration Server (lets external AI clients browse this repo)</h1>
+
+<p>This is a stand-alone MCP (Model Context Protocol) server with a straightforward purpose: any MCP-compatible AI client (Claude Desktop, Cursor, VS Code Copilot, etc.) that connects to it can browse this repository's source code like flipping through a book—listing directories, reading files, searching by regex, viewing architecture overviews, and even listing all built-in "tools" and "slash commands" of Claude Code and reading their implementations. In other words, it turns a local source tree into a set of AI-callable tools, so a remote client can "look at the code" without cloning the repository.</p>
+
+<p>It is not coupled to the main Claude Code project: the main project is the object it "displays", while the server itself only exposes capabilities externally. There are two deployment forms—local STDIO (the client spawns a node process directly) and remote HTTP (deployed on Railway/Vercel/Docker, shared by multiple clients via Bearer Token auth). Three transport protocols coexist: STDIO, Streamable HTTP (modern MCP), and Legacy SSE (for older clients).</p>
+
+<dl>
+  <dt>Input</dt>
+  <dd>MCP requests from an external AI client: invoking a tool (e.g. read_source_file with a relative path), reading a resource URI, or rendering a prompt template. In HTTP mode a Bearer Token is also attached for auth.</dd>
+  <dt>Output</dt>
+  <dd>The corresponding tool execution result: file content snippets, directory listings, search hit lines, architecture JSON, tool/command lists, etc., packaged in MCP protocol format and returned to the client for display or for feeding into its own LLM.</dd>
+</dl>
+
+<h2>Entry Points and Transport Layer</h2>
+
+<p>The user (external AI client) can trigger three entry paths, all converging on the same "shared MCP server". The local scenario is simplest: the client writes a command in its config that spawns <code>node dist/index.js</code>, and the process exchanges JSON-RPC messages with the client over STDIO. The remote scenario is a persistent Express process; the client sends HTTP requests to <code>/mcp</code> (modern) or <code>/sse + /messages</code> (legacy protocol).</p>
+
+<pre class="mermaid">
+graph TD
+  client["External AI client initiates request"] -->|"STDIO spawns node process"| stdio-entry["index.ts main function"]
+  client -->|"POST/GET /mcp"| http-entry["http.ts main function"]
+  client -->|"GET /sse + POST /messages"| http-entry
+  stdio-entry --> validate-stdio["validateSrcRoot validates source root"]
+  http-entry --> validate-http["validateSrcRoot validates source root"]
+  http-entry --> auth-mw{"MCP_API_KEY set?"}
+  auth-mw -->|No| skip-auth["Allow directly"]
+  auth-mw -->|Yes| check-bearer{"Authorization: Bearer matches?"}
+  check-bearer -->|No| unauth["Return 401 Unauthorized"]
+  check-bearer -->|Yes| skip-auth
+  validate-stdio --> create-server-stdio["createServer() creates shared MCP instance"]
+  skip-auth --> create-server-http["createServer() creates shared MCP instance"]
+  create-server-stdio --> connect-stdio["StdioServerTransport connects"]
+  create-server-http --> route-mcp{"Route dispatch"}
+  route-mcp -->|"/mcp POST"| stream-http["StreamableHTTP transport handles"]
+  route-mcp -->|"/mcp GET"| stream-http
+  route-mcp -->|"/sse"| legacy-sse["SSE transport establishes/reuses session"]
+  route-mcp -->|"/messages POST"| legacy-sse
+  route-mcp -->|"/health"| health["Return health status JSON"]
+  route-mcp -->|"/mcp DELETE"| delete-sess["Close and clean up session"]
+</pre>
+
+<p>The STDIO entry point is only 25 lines and does three things before exiting: validate the source root, create the shared MCP instance, and attach StdioServerTransport. The HTTP entry point is more complex; its core is three middleware/route pieces: auth, health check, and session management for the two transport protocols.</p>
+
+<ul>
+  <li>Auth is optional: it only takes effect when <code>MCP_API_KEY</code> is set, and <code>/health</code> is always exempt (convenient for deployment platform health probes).</li>
+  <li>Streamable HTTP uses a <code>Map&lt;sessionId, transport&gt;</code> to maintain multiple sessions in memory; <code>POST /mcp</code> creates/reuses a session, <code>GET /mcp</code> pulls the SSE stream, and <code>DELETE /mcp</code> actively cleans up.</li>
+  <li>Legacy SSE follows the old protocol: the client first <code>GET /sse</code> to establish a long-lived connection and obtain a sessionId, then sends subsequent commands via <code>POST /messages?sessionId=xxx</code>.</li>
+  <li>Every HTTP session calls <code>createServer()</code> once—meaning each session gets its own independent MCP instance, isolated from the others; STDIO has only one instance for the whole run.</li>
+</ul>
+
+<h2>Shared MCP Server: How Requests Arrive, Read Source, and Return</h2>
+
+<p>All transport protocols eventually hand JSON-RPC requests to the Server instance produced by the same factory function <code>createServer()</code>. At construction time this instance registers handlers for three categories of capabilities: <b>resources</b> (passively readable data, fetched by URI), <b>tools</b> (callable functions with input schemas), and <b>prompts</b> (prebuilt prompt templates, injected with source context and handed to the client's LLM). The client first calls list-style interfaces to get the menu, then calls the specific call/read/get to retrieve actual content.</p>
+
+<p>There are only three underlying source-reading primitives: <code>fs.readFile</code> (read a single file), <code>fs.readdir</code> (list a directory), and <code>walkFiles</code> (recursively walk the whole tree for search). Every user-supplied path first passes through <code>safePath()</code>—it uses <code>path.resolve</code> to join the relative path under <code>SRC_ROOT</code>, then verifies the result still starts with <code>SRC_ROOT</code>; otherwise it returns null. This blocks directory-traversal attacks like <code>../../etc/passwd</code> and is the service's sole permission boundary.</p>
+
+<dl>
+  <dt>Input</dt>
+  <dd>Three list requests (ListTools / ListResources / ListPrompts) only return static menus; three call requests (CallTool / ReadResource / GetPrompt) carry tool name/URI/prompt name plus parameters, where parameters are usually a relative path or tool name.</dd>
+  <dt>Output</dt>
+  <dd>Responses in MCP protocol format: tools return <code>content: [{type:"text", text:...}]</code>; resources return <code>contents: [{uri, mimeType, text}]</code>; prompts return <code>messages: [{role:"user", content:{type:"text", text}}]</code>. Text content is the original file, directory listing, search hit lines, or assembled prompt.</dd>
+</dl>
+
+<h3>Main Data Flow: Tool Calls (CallTool)</h3>
+
+<p>When a client invokes a tool, the request carries <code>name</code> and <code>arguments</code>; the server dispatches via a switch to one of eight tools. The core of each tool is "locate file → read content → assemble text return"; only the locate logic differs.</p>
+
+<pre class="mermaid">
+graph TD
+  call["Client calls CallTool(name, args)"] --> switch{"Dispatch by tool name"}
+  switch -->|"list_tools"| t-list-tools["Scan src/tools/ directory"]
+  switch -->|"list_commands"| t-list-cmds["Scan src/commands/ directory"]
+  switch -->|"get_tool_source"| t-get-tool{"toolName required?"}
+  switch -->|"get_command_source"| t-get-cmd{"commandName required?"}
+  switch -->|"read_source_file"| t-read{"path required?"}
+  switch -->|"search_source"| t-search{"pattern required?"}
+  switch -->|"list_directory"| t-listdir["safePath validates directory"]
+  switch -->|"get_architecture"| t-arch["Aggregate top-level dirs + tools + commands"]
+  t-get-tool -->|Missing| err-tool["Throw: toolName required"]
+  t-get-tool -->|Present| safe-tool["safePath tools/toolName"]
+  safe-tool -->|Invalid path / not exists| err-tool2["Throw: Tool not found"]
+  safe-tool -->|Exists| pick-main["Pick main file if fileName not provided"]
+  pick-main --> read-tool["fs.readFile source code"]
+  read-tool --> out-tool["Return source with line count comments"]
+  t-read -->|Missing| err-path["Throw: path required"]
+  t-read -->|Present| safe-read["safePath validation"]
+  safe-read -->|Invalid / not exists| err-read["Throw: File not found"]
+  safe-read -->|Exists| slice-read["Slice by startLine/endLine"]
+  slice-read --> out-read["Return code snippet with line numbers"]
+  t-search -->|Missing| err-pat["Throw: pattern required"]
+  t-search -->|Present| compile-regex["new RegExp(pattern, 'i')"]
+  compile-regex -->|Invalid regex| err-regex["Throw: Invalid regex"]
+  compile-regex -->|OK| walk-all["walkFiles recursively lists all files"]
+  walk-all --> filter-ext["Filter extensions by filePattern"]
+  filter-ext --> scan-lines["Regex.test file by file, line by line"]
+  scan-lines --> cap-max{"Reached maxResults?"}
+  cap-max -->|Yes| stop-scan["Stop scanning"]
+  cap-max -->|No| out-search["Return hit lines file:line: content"]
+  stop-scan --> out-search
+</pre>
+
+<h3>Resource Reading Flow (ReadResource)</h3>
+
+<p>Resources are read-only data "fetched directly by URI". The server registers 3 fixed URIs and 1 template URI <code>claude-code://source/{path}</code>. The template URI also goes through safePath, sharing the same secure path as the <code>read_source_file</code> tool, only at the protocol layer differently.</p>
+
+<pre class="mermaid">
+graph TD
+  readres["Client ReadResource(uri)"] --> arch?{"uri = architecture?"}
+  arch -->|Yes| read-readme["Read SRC_ROOT/../README.md"]
+  read-readme --> out-arch["Return markdown"]
+  arch -->|No| tools?{"uri = tools?"}
+  tools -->|Yes| call-gettools["getToolList scans directory"]
+  call-gettools --> out-tools["Return tool list JSON"]
+  tools -->|No| cmds?{"uri = commands?"}
+  cmds -->|Yes| call-getcmds["getCommandList scans directory"]
+  call-getcmds --> out-cmds["Return command list JSON"]
+  cmds -->|No| src?{"uri starts with source/?"}
+  src -->|Yes| safe-res["safePath validates relative path"]
+  safe-res -->|Invalid| err-res["Throw: Invalid path"]
+  safe-res -->|OK| read-res["fs.readFile reads file"]
+  read-res --> out-res["Return text/plain full text"]
+  src -->|No| err-unknown["Throw: Unknown resource"]
+</pre>
+
+<h3>Prompt Rendering Flow (GetPrompt)</h3>
+
+<p>The 5 prompt templates serve the purpose of "pre-feeding source context for the client's LLM". After the server receives the request, it locates the relevant source files by prompt name, reads them, and stuffs them into a preset question text, assembling the whole thing into a single user message returned to the client. What the client gets is a prompt ready to feed to its LLM.</p>
+
+<pre class="mermaid">
+graph TD
+  getprompt["Client GetPrompt(name, args)"] --> pswitch{"Dispatch by prompt name"}
+  pswitch -->|"explain_tool"| p-tool["Locate tools/toolName main file"]
+  pswitch -->|"explain_command"| p-cmd["Locate commands/commandName"]
+  pswitch -->|"architecture_overview"| p-arch["Read README + scan top level + tool/command lists"]
+  pswitch -->|"how_does_it_work"| p-how["Look up featureMap for related paths"]
+  pswitch -->|"compare_tools"| p-cmp["Read main source of two tools"]
+  p-tool --> p-tool-read["Read main file source"]
+  p-tool-read --> p-tool-out["Assemble 6-dimension analysis question"]
+  p-cmd --> p-cmd-find["Try three candidates: directory/single file"]
+  p-cmd-find --> p-cmd-out["Assemble command explanation question"]
+  p-arch --> p-arch-out["Assemble architecture overview question"]
+  p-how --> p-how-map{"feature in featureMap?"}
+  p-how-map -->|Yes| p-how-read["Read files/list dirs by path (first 200 lines)"]
+  p-how-map -->|No| p-how-empty["Prompt to use search/read to find it yourself"]
+  p-how-read --> p-how-out["Assemble subsystem explanation question"]
+  p-how-empty --> p-how-out
+  p-cmp --> p-cmp-read["Read main source of both tools"]
+  p-cmp-read --> p-cmp-out["Assemble comparison analysis question"]
+</pre>
+
+<ul>
+  <li><code>how_does_it_work</code> has a built-in featureMap that maps human colloquialisms ("permission system", "mcp client", "bridge") to a set of source paths—this is the only place in the service that carries "business knowledge"; all other tools are pure filesystem operations.</li>
+  <li>All prompts return a single user message with no system message; the client can overlay its own system prompt.</li>
+  <li>When reading source, <code>how_does_it_work</code> only takes the first 200 lines to avoid overly long prompts; the <code>read_source_file</code> tool supports precise startLine/endLine slicing so the client can page through itself.</li>
+</ul>
+
+<h2>Auxiliary View: Permission Boundary</h2>
+
+<p>The service's permission model is very thin, with only two layers: HTTP-layer Bearer Token (optional), and filesystem-layer safePath (mandatory).</p>
+
+<pre class="mermaid">
+graph TD
+  req["Incoming request"] --> http-layer{"HTTP mode &amp; MCP_API_KEY set?"}
+  http-layer -->|Yes| bearer{"Authorization: Bearer matches?"}
+  http-layer -->|No| pass-http["Allow"]
+  bearer -->|No| deny-401["401 Unauthorized"]
+  bearer -->|Yes| pass-http
+  pass-http --> tool-call["Enter tool/resource handler"]
+  tool-call --> path-arg{"Parameter contains relative path?"}
+  path-arg -->|Yes| safepath["safePath: resolve + startsWith validation"]
+  path-arg -->|No| direct["Scan fixed directories directly"]
+  safepath -->|Escapes SRC_ROOT| deny-null["Return null → throw"]
+  safepath -->|Inside SRC_ROOT| allow-read["Allow fs.readFile/readdir"]
+</pre>
+
+<ul>
+  <li><code>/health</code> (and Vercel's <code>/api</code>) is always exempt from auth for deployment platform health probes.</li>
+  <li>STDIO mode has no HTTP auth—the client that can spawn this process is already considered trusted.</li>
+  <li>safePath uses <code>resolved.startsWith(SRC_ROOT)</code>; note that SRC_ROOT itself is an absolute path from <code>path.resolve</code> with no trailing slash, so paths exactly equal to SRC_ROOT also pass.</li>
+  <li>There is no per-tool permission granularity—any authenticated client can call all 8 tools and read any file under SRC_ROOT. This is a read-only exploration service, so the model is sufficient.</li>
+</ul>
+
+<h2>Auxiliary View: Session Lifecycle and State Machine</h2>
+
+<p>In HTTP mode each session has its own independent lifecycle. Streamable HTTP identifies sessions via the <code>mcp-session-id</code> header, Legacy SSE uses the query parameter <code>sessionId</code>. Both maintain transports in an in-memory Map; they are lost when the process restarts.</p>
+
+<pre class="mermaid">
+graph TD
+  new-req["New request (no sessionId)"] --> create-sess["createServer + new transport"]
+  create-sess --> gen-id["Generate sessionId (UUID)"]
+  gen-id --> store-map["Store in transports Map"]
+  store-map --> state-active["State: active"]
+  reuse-req["Request with sessionId"] --> lookup{"Exists in Map?"}
+  lookup -->|Yes| reuse-sess["Reuse transport to handle"]
+  lookup -->|No| reject-400["400 Invalid/Missing session"]
+  reuse-sess --> state-active
+  state-active -->|"Client DELETE /mcp"| close-sess["transport.close()"]
+  state-active -->|"transport.onclose fires"| del-map["Remove from Map"]
+  close-sess --> del-map
+  del-map --> state-gone["State: destroyed"]
+  state-gone -->|"Client comes again"| reject-400
+</pre>
+
+<ul>
+  <li>Each session independently calls <code>createServer()</code>, meaning each session has its own MCP Server instance, but all read the same on-disk source underneath—stateless business, naturally concurrent.</li>
+  <li>Vercel deployment is serverless: the Map does not persist across invocations, so Streamable HTTP session reuse basically fails; legacy SSE and stateless tool calls still work. The README explicitly recommends Railway/Docker for production.</li>
+  <li>STDIO mode has no "session" concept; there is one transport for the whole run, and it ends when the process exits.</li>
+</ul>
+
+<h2>Deployment Forms</h2>
+
+<p>The same <code>createServer()</code> core wrapped in different shells becomes different deployment options: local STDIO (<code>src/index.ts</code>), remote HTTP (<code>src/http.ts</code>), and Vercel serverless (<code>api/vercelApp.ts</code> exports an Express app). The Dockerfile copies the whole repository into the image, builds <code>dist/</code>, then starts with <code>node dist/http.js</code>, with <code>CLAUDE_CODE_SRC_ROOT=/app/src</code> pointing to the source copy inside the image. Railway uses the same Dockerfile with healthcheckPath=/health for automatic health probes.</p>
+
+<ul>
+  <li>The Docker image bundles both mcp-server/dist and the main project's src/—the "source" this server explores is baked into the image at deployment time and does not depend on the host filesystem.</li>
+  <li><code>src/index.ts.new</code> is a same-name copy of index.ts (content identical), likely leftover from development and not part of the build.</li>
+</ul>
+
+<script>
+window.__sourceMap = {
+  "client": { "file": "mcp-server/src/index.ts", "startLine": 13, "endLine": 19 },
+  "stdio-entry": { "file": "mcp-server/src/index.ts", "startLine": 13, "endLine": 19 },
+  "http-entry": { "file": "mcp-server/src/http.ts", "startLine": 138, "endLine": 167 },
+  "validate-stdio": { "file": "mcp-server/src/server.ts", "startLine": 945, "endLine": 956 },
+  "validate-http": { "file": "mcp-server/src/server.ts", "startLine": 945, "endLine": 956 },
+  "auth-mw": { "file": "mcp-server/src/http.ts", "startLine": 29, "endLine": 44 },
+  "check-bearer": { "file": "mcp-server/src/http.ts", "startLine": 38, "endLine": 42 },
+  "unauth": { "file": "mcp-server/src/http.ts", "startLine": 40, "endLine": 41 },
+  "create-server-stdio": { "file": "mcp-server/src/index.ts", "startLine": 15, "endLine": 15 },
+  "create-server-http": { "file": "mcp-server/src/server.ts", "startLine": 148, "endLine": 158 },
+  "connect-stdio": { "file": "mcp-server/src/index.ts", "startLine": 16, "endLine": 17 },
+  "route-mcp": { "file": "mcp-server/src/http.ts", "startLine": 155, "endLine": 157 },
+  "stream-http": { "file": "mcp-server/src/http.ts", "startLine": 50, "endLine": 104 },
+  "legacy-sse": { "file": "mcp-server/src/http.ts", "startLine": 110, "endLine": 132 },
+  "health": { "file": "mcp-server/src/http.ts", "startLine": 146, "endLine": 153 },
+  "delete-sess": { "file": "mcp-server/src/http.ts", "startLine": 95, "endLine": 103 },
+  "call": { "file": "mcp-server/src/server.ts", "startLine": 379, "endLine": 386 },
+  "switch": { "file": "mcp-server/src/server.ts", "startLine": 386, "endLine": 386 },
+  "t-list-tools": { "file": "mcp-server/src/server.ts", "startLine": 387, "endLine": 394 },
+  "t-list-cmds": { "file": "mcp-server/src/server.ts", "startLine": 396, "endLine": 406 },
+  "t-get-tool": { "file": "mcp-server/src/server.ts", "startLine": 408, "endLine": 411 },
+  "t-get-cmd": { "file": "mcp-server/src/server.ts", "startLine": 444, "endLine": 447 },
+  "t-read": { "file": "mcp-server/src/server.ts", "startLine": 499, "endLine": 501 },
+  "t-search": { "file": "mcp-server/src/server.ts", "startLine": 531, "endLine": 534 },
+  "t-listdir": { "file": "mcp-server/src/server.ts", "startLine": 584, "endLine": 590 },
+  "t-arch": { "file": "mcp-server/src/server.ts", "startLine": 604, "endLine": 642 },
+  "err-tool": { "file": "mcp-server/src/server.ts", "startLine": 411, "endLine": 411 },
+  "safe-tool": { "file": "mcp-server/src/server.ts", "startLine": 412, "endLine": 413 },
+  "err-tool2": { "file": "mcp-server/src/server.ts", "startLine": 414, "endLine": 414 },
+  "pick-main": { "file": "mcp-server/src/server.ts", "startLine": 419, "endLine": 428 },
+  "read-tool": { "file": "mcp-server/src/server.ts", "startLine": 433, "endLine": 433 },
+  "out-tool": { "file": "mcp-server/src/server.ts", "startLine": 434, "endLine": 441 },
+  "err-path": { "file": "mcp-server/src/server.ts", "startLine": 501, "endLine": 501 },
+  "safe-read": { "file": "mcp-server/src/server.ts", "startLine": 502, "endLine": 504 },
+  "err-read": { "file": "mcp-server/src/server.ts", "startLine": 504, "endLine": 504 },
+  "slice-read": { "file": "mcp-server/src/server.ts", "startLine": 505, "endLine": 515 },
+  "out-read": { "file": "mcp-server/src/server.ts", "startLine": 516, "endLine": 528 },
+  "err-pat": { "file": "mcp-server/src/server.ts", "startLine": 534, "endLine": 534 },
+  "compile-regex": { "file": "mcp-server/src/server.ts", "startLine": 540, "endLine": 542 },
+  "err-regex": { "file": "mcp-server/src/server.ts", "startLine": 544, "endLine": 544 },
+  "walk-all": { "file": "mcp-server/src/server.ts", "startLine": 547, "endLine": 547 },
+  "filter-ext": { "file": "mcp-server/src/server.ts", "startLine": 548, "endLine": 550 },
+  "scan-lines": { "file": "mcp-server/src/server.ts", "startLine": 553, "endLine": 568 },
+  "cap-max": { "file": "mcp-server/src/server.ts", "startLine": 554, "endLine": 554 },
+  "stop-scan": { "file": "mcp-server/src/server.ts", "startLine": 554, "endLine": 554 },
+  "out-search": { "file": "mcp-server/src/server.ts", "startLine": 571, "endLine": 581 },
+  "readres": { "file": "mcp-server/src/server.ts", "startLine": 201, "endLine": 203 },
+  "arch": { "file": "mcp-server/src/server.ts", "startLine": 206, "endLine": 206 },
+  "read-readme": { "file": "mcp-server/src/server.ts", "startLine": 207, "endLine": 210 },
+  "out-arch": { "file": "mcp-server/src/server.ts", "startLine": 214, "endLine": 214 },
+  "tools": { "file": "mcp-server/src/server.ts", "startLine": 217, "endLine": 217 },
+  "call-gettools": { "file": "mcp-server/src/server.ts", "startLine": 218, "endLine": 218 },
+  "out-tools": { "file": "mcp-server/src/server.ts", "startLine": 219, "endLine": 227 },
+  "cmds": { "file": "mcp-server/src/server.ts", "startLine": 230, "endLine": 230 },
+  "call-getcmds": { "file": "mcp-server/src/server.ts", "startLine": 231, "endLine": 231 },
+  "out-cmds": { "file": "mcp-server/src/server.ts", "startLine": 232, "endLine": 240 },
+  "src": { "file": "mcp-server/src/server.ts", "startLine": 243, "endLine": 243 },
+  "safe-res": { "file": "mcp-server/src/server.ts", "startLine": 245, "endLine": 246 },
+  "err-res": { "file": "mcp-server/src/server.ts", "startLine": 246, "endLine": 246 },
+  "read-res": { "file": "mcp-server/src/server.ts", "startLine": 247, "endLine": 247 },
+  "out-res": { "file": "mcp-server/src/server.ts", "startLine": 248, "endLine": 248 },
+  "err-unknown": { "file": "mcp-server/src/server.ts", "startLine": 251, "endLine": 251 },
+  "getprompt": { "file": "mcp-server/src/server.ts", "startLine": 707, "endLine": 712 },
+  "pswitch": { "file": "mcp-server/src/server.ts", "startLine": 714, "endLine": 714 },
+  "p-tool": { "file": "mcp-server/src/server.ts", "startLine": 715, "endLine": 729 },
+  "p-cmd": { "file": "mcp-server/src/server.ts", "startLine": 744, "endLine": 785 },
+  "p-arch": { "file": "mcp-server/src/server.ts", "startLine": 800, "endLine": 810 },
+  "p-how": { "file": "mcp-server/src/server.ts", "startLine": 825, "endLine": 827 },
+  "p-cmp": { "file": "mcp-server/src/server.ts", "startLine": 895, "endLine": 921 },
+  "p-tool-read": { "file": "mcp-server/src/server.ts", "startLine": 727, "endLine": 729 },
+  "p-tool-out": { "file": "mcp-server/src/server.ts", "startLine": 730, "endLine": 741 },
+  "p-cmd-find": { "file": "mcp-server/src/server.ts", "startLine": 748, "endLine": 767 },
+  "p-cmd-out": { "file": "mcp-server/src/server.ts", "startLine": 786, "endLine": 797 },
+  "p-arch-out": { "file": "mcp-server/src/server.ts", "startLine": 811, "endLine": 822 },
+  "p-how-map": { "file": "mcp-server/src/server.ts", "startLine": 862, "endLine": 862 },
+  "p-how-read": { "file": "mcp-server/src/server.ts", "startLine": 864, "endLine": 880 },
+  "p-how-empty": { "file": "mcp-server/src/server.ts", "startLine": 888, "endLine": 888 },
+  "p-how-out": { "file": "mcp-server/src/server.ts", "startLine": 881, "endLine": 892 },
+  "p-cmp-read": { "file": "mcp-server/src/server.ts", "startLine": 901, "endLine": 920 },
+  "p-cmp-out": { "file": "mcp-server/src/server.ts", "startLine": 922, "endLine": 933 },
+  "req": { "file": "mcp-server/src/http.ts", "startLine": 29, "endLine": 44 },
+  "http-layer": { "file": "mcp-server/src/http.ts", "startLine": 34, "endLine": 34 },
+  "bearer": { "file": "mcp-server/src/http.ts", "startLine": 38, "endLine": 39 },
+  "deny-401": { "file": "mcp-server/src/http.ts", "startLine": 40, "endLine": 41 },
+  "pass-http": { "file": "mcp-server/src/http.ts", "startLine": 43, "endLine": 43 },
+  "tool-call": { "file": "mcp-server/src/server.ts", "startLine": 379, "endLine": 386 },
+  "path-arg": { "file": "mcp-server/src/server.ts", "startLine": 386, "endLine": 386 },
+  "safepath": { "file": "mcp-server/src/server.ts", "startLine": 84, "endLine": 88 },
+  "deny-null": { "file": "mcp-server/src/server.ts", "startLine": 86, "endLine": 86 },
+  "allow-read": { "file": "mcp-server/src/server.ts", "startLine": 18, "endLine": 20 },
+  "new-req": { "file": "mcp-server/src/http.ts", "startLine": 54, "endLine": 60 },
+  "create-sess": { "file": "mcp-server/src/http.ts", "startLine": 61, "endLine": 65 },
+  "gen-id": { "file": "mcp-server/src/http.ts", "startLine": 63, "endLine": 63 },
+  "store-map": { "file": "mcp-server/src/http.ts", "startLine": 78, "endLine": 80 },
+  "state-active": { "file": "mcp-server/src/http.ts", "startLine": 75, "endLine": 75 },
+  "reuse-req": { "file": "mcp-server/src/http.ts", "startLine": 55, "endLine": 57 },
+  "lookup": { "file": "mcp-server/src/http.ts", "startLine": 57, "endLine": 57 },
+  "reuse-sess": { "file": "mcp-server/src/http.ts", "startLine": 75, "endLine": 75 },
+  "reject-400": { "file": "mcp-server/src/http.ts", "startLine": 87, "endLine": 88 },
+  "close-sess": { "file": "mcp-server/src/http.ts", "startLine": 99, "endLine": 99 },
+  "del-map": { "file": "mcp-server/src/http.ts", "startLine": 100, "endLine": 100 },
+  "state-gone": { "file": "mcp-server/src/http.ts", "startLine": 100, "endLine": 100 },
+  "skip-auth": { "file": "mcp-server/src/http.ts", "startLine": 43, "endLine": 44 },
+  "direct": { "file": "mcp-server/src/server.ts", "startLine": 387, "endLine": 388 }
+};
+</script>
+
+<aside id="source-panel"><div id="source-header"></div><div id="monaco-container"></div></aside>
+<script src="../assets/codeindex-runtime.js"></script>
+<script src="../assets/codeindex.js"></script>
+</body>
+</html>

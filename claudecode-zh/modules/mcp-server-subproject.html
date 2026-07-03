@@ -1,0 +1,342 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MCP 探索服务器（让外部 AI 客户端浏览本仓库源码）</title>
+<link rel="stylesheet" href="../assets/codeindex.css">
+</head>
+<body>
+<nav class="topnav"><a href="../index.html">← 返回总览</a></nav>
+<h1>MCP 探索服务器（让外部 AI 客户端浏览本仓库源码）</h1>
+
+<p>这是一个独立部署的 MCP（Model Context Protocol）服务器，作用很直接：任何兼容 MCP 的 AI 客户端（Claude Desktop、Cursor、VS Code Copilot 等）连上它之后，就能像翻书一样浏览本仓库的源码——列目录、读文件、按正则搜索、查看架构总览，甚至能列出 Claude Code 内置的全部"工具"和"斜杠命令"并读取它们的实现。换句话说，它把一个本地源码树变成了一组 AI 可调用的工具，让远端客户端不用 clone 仓库也能"看代码"。</p>
+
+<p>它本身和 Claude Code 主项目互不耦合：主项目是它"展示"的对象，而它自己只负责对外暴露能力。部署形态有两种——本地 STDIO（客户端直接拉起一个 node 进程通信）和远程 HTTP（部署在 Railway/Vercel/Docker 上，多客户端通过 Bearer Token 鉴权复用）。三种传输协议并存：STDIO、Streamable HTTP（现代 MCP）、Legacy SSE（兼容老客户端）。</p>
+
+<dl>
+  <dt>输入</dt>
+  <dd>来自外部 AI 客户端的 MCP 请求：调用某个工具（如 read_source_file 传一个相对路径）、读取某个 resource URI、或渲染某个 prompt 模板。HTTP 模式下还附带 Bearer Token 鉴权。</dd>
+  <dt>输出</dt>
+  <dd>对应工具的执行结果：文件内容片段、目录列表、搜索命中行、架构 JSON、工具/命令清单等，按 MCP 协议封装后返回给客户端，由客户端展示给用户或喂给它自己的 LLM。</dd>
+</dl>
+
+<h2>入口与传输层</h2>
+
+<p>用户（外部 AI 客户端）触发的链路有三种起点，但都汇到同一个"共享 MCP 服务器"上。本地场景最简单：客户端在配置里写一条 command，拉起 <code>node dist/index.js</code>，进程通过 STDIO 跟客户端收发 JSON-RPC 消息。远程场景则是一个常驻 Express 进程，客户端按 <code>/mcp</code>（现代）或 <code>/sse + /messages</code>（老协议）发 HTTP 请求。</p>
+
+<pre class="mermaid">
+graph TD
+  client["外部 AI 客户端发起请求"] -->|"STDIO 拉起 node 进程"| stdio-entry["index.ts main 函数"]
+  client -->|"POST/GET /mcp"| http-entry["http.ts main 函数"]
+  client -->|"GET /sse + POST /messages"| http-entry
+  stdio-entry --> validate-stdio["validateSrcRoot 校验源码根目录"]
+  http-entry --> validate-http["validateSrcRoot 校验源码根目录"]
+  http-entry --> auth-mw{"MCP_API_KEY 是否设置?"}
+  auth-mw -->|"否"| skip-auth["直接放行"]
+  auth-mw -->|"是"| check-bearer{"Authorization: Bearer 匹配?"}
+  check-bearer -->|"否"| unauth["返回 401 Unauthorized"]
+  check-bearer -->|"是"| skip-auth
+  validate-stdio --> create-server-stdio["createServer() 创建共享 MCP 实例"]
+  skip-auth --> create-server-http["createServer() 创建共享 MCP 实例"]
+  create-server-stdio --> connect-stdio["StdioServerTransport 连接"]
+  create-server-http --> route-mcp{"按路由分发"}
+  route-mcp -->|"/mcp POST"| stream-http["StreamableHTTP transport 处理"]
+  route-mcp -->|"/mcp GET"| stream-http
+  route-mcp -->|"/sse"| legacy-sse["SSE transport 建立/复用会话"]
+  route-mcp -->|"/messages POST"| legacy-sse
+  route-mcp -->|"/health"| health["返回健康状态 JSON"]
+  route-mcp -->|"/mcp DELETE"| delete-sess["关闭并清理会话"]
+</pre>
+
+<p>STDIO 入口只有 25 行，干完三件事就退场：校验源码根目录、创建共享 MCP 实例、把 StdioServerTransport 接上去。HTTP 入口复杂一些，核心是三块中间件/路由：鉴权、健康检查、两种传输协议的会话管理。</p>
+
+<ul>
+  <li>鉴权是可选的：只有设了 <code>MCP_API_KEY</code> 才生效，且 <code>/health</code> 永远免鉴权（方便部署平台探活）。</li>
+  <li>Streamable HTTP 用一个 <code>Map&lt;sessionId, transport&gt;</code> 在内存里维护多会话，<code>POST /mcp</code> 创建/复用会话，<code>GET /mcp</code> 拉 SSE 流，<code>DELETE /mcp</code> 主动收尾。</li>
+  <li>Legacy SSE 走老协议：客户端先 <code>GET /sse</code> 建立长连接拿到 sessionId，后续 <code>POST /messages?sessionId=xxx</code> 发指令。</li>
+  <li>每个 HTTP 会话都 <code>createServer()</code> 一次——也就是说每个会话拿到的是独立的 MCP 实例，互不串扰；STDIO 则全程只有一个实例。</li>
+</ul>
+
+<h2>共享 MCP 服务器：请求如何进来、如何读源码、如何返回</h2>
+
+<p>所有传输协议最终都把 JSON-RPC 请求交给同一个工厂函数 <code>createServer()</code> 造出来的 Server 实例。这个实例在构造时就把三类能力的 handler 一次性注册好：<b>resources</b>（被动可读的数据，按 URI 取）、<b>tools</b>（可调用的函数，带输入 schema）、<b>prompts</b>（预制的提示词模板，注入源码上下文后交给客户端的 LLM）。客户端先调 list 系列接口拿到菜单，再调具体的 call/read/get 取实际内容。</p>
+
+<p>所有源码读取的底层动作只有三类：<code>fs.readFile</code>（读单个文件）、<code>fs.readdir</code>（列目录）、<code>walkFiles</code>（递归走整棵树用于搜索）。所有用户传进来的路径都要先过一道 <code>safePath()</code>——它用 <code>path.resolve</code> 把相对路径拼到 <code>SRC_ROOT</code> 下，再校验结果是否仍以 <code>SRC_ROOT</code> 开头，否则返回 null。这一步挡住了 <code>../../etc/passwd</code> 之类的目录穿越攻击，是整个服务唯一的权限边界。</p>
+
+<dl>
+  <dt>输入</dt>
+  <dd>三条 list 请求（ListTools / ListResources / ListPrompts）只返回静态菜单；三条 call 请求（CallTool / ReadResource / GetPrompt）携带工具名/URI/prompt 名加参数，参数里多半是一个相对路径或工具名。</dd>
+  <dt>输出</dt>
+  <dd>MCP 协议格式的响应：tools 返回 <code>content: [{type:"text", text:...}]</code>；resources 返回 <code>contents: [{uri, mimeType, text}]</code>；prompts 返回 <code>messages: [{role:"user", content:{type:"text", text}}]</code>。文本内容就是文件原文、目录列表、搜索命中行或拼好的提示词。</dd>
+</dl>
+
+<h3>主数据流：工具调用（CallTool）</h3>
+
+<p>客户端调一个工具时，请求带 <code>name</code> 和 <code>arguments</code>，server 用一个 switch 分发到 8 个工具之一。每个工具的核心都是"定位文件 → 读内容 → 拼成文本返回"，区别只在定位逻辑。</p>
+
+<pre class="mermaid">
+graph TD
+  call["客户端调用 CallTool(name, args)"] --> switch{"按工具名分发"}
+  switch -->|"list_tools"| t-list-tools["扫 src/tools/ 目录"]
+  switch -->|"list_commands"| t-list-cmds["扫 src/commands/ 目录"]
+  switch -->|"get_tool_source"| t-get-tool{"toolName 必填?"}
+  switch -->|"get_command_source"| t-get-cmd{"commandName 必填?"}
+  switch -->|"read_source_file"| t-read{"path 必填?"}
+  switch -->|"search_source"| t-search{"pattern 必填?"}
+  switch -->|"list_directory"| t-listdir["safePath 校验目录"]
+  switch -->|"get_architecture"| t-arch["聚合顶层目录+工具+命令"]
+  t-get-tool -->|"缺参"| err-tool["抛错: toolName required"]
+  t-get-tool -->|"有参"| safe-tool["safePath tools/工具名"]
+  safe-tool -->|"非法路径/不存在"| err-tool2["抛错: Tool not found"]
+  safe-tool -->|"存在"| pick-main["未传 fileName 则挑主文件"]
+  pick-main --> read-tool["fs.readFile 读源码"]
+  read-tool --> out-tool["返回带行数注释的源码"]
+  t-read -->|"缺参"| err-path["抛错: path required"]
+  t-read -->|"有参"| safe-read["safePath 校验"]
+  safe-read -->|"非法/不存在"| err-read["抛错: File not found"]
+  safe-read -->|"存在"| slice-read["按 startLine/endLine 切片"]
+  slice-read --> out-read["返回带行号的代码片段"]
+  t-search -->|"缺参"| err-pat["抛错: pattern required"]
+  t-search -->|"有参"| compile-regex["new RegExp(pattern, 'i')"]
+  compile-regex -->|"正则非法"| err-regex["抛错: Invalid regex"]
+  compile-regex -->|"OK"| walk-all["walkFiles 递归列出全部文件"]
+  walk-all --> filter-ext["按 filePattern 过滤扩展名"]
+  filter-ext --> scan-lines["逐文件逐行 regex.test"]
+  scan-lines --> cap-max{"达到 maxResults?"}
+  cap-max -->|"是"| stop-scan["停止扫描"]
+  cap-max -->|"否"| out-search["返回 命中行 文件:行号: 内容"]
+  stop-scan --> out-search
+</pre>
+
+<h3>资源读取流（ReadResource）</h3>
+
+<p>资源是"按 URI 直接取"的只读数据。server 注册了 3 个固定 URI 和 1 个模板 URI <code>claude-code://source/{path}</code>。模板 URI 走的也是 safePath，跟 <code>read_source_file</code> 工具其实是同一条安全通路，只是协议层不同。</p>
+
+<pre class="mermaid">
+graph TD
+  readres["客户端 ReadResource(uri)"] --> arch?{"uri = architecture?"}
+  arch -->|"是"| read-readme["读 SRC_ROOT/../README.md"]
+  read-readme --> out-arch["返回 markdown"]
+  arch -->|"否"| tools?{"uri = tools?"}
+  tools -->|"是"| call-gettools["getToolList 扫目录"]
+  call-gettools --> out-tools["返回工具清单 JSON"]
+  tools -->|"否"| cmds?{"uri = commands?"}
+  cmds -->|"是"| call-getcmds["getCommandList 扫目录"]
+  call-getcmds --> out-cmds["返回命令清单 JSON"]
+  cmds -->|"否"| src?{"uri 以 source/ 开头?"}
+  src -->|"是"| safe-res["safePath 校验相对路径"]
+  safe-res -->|"非法"| err-res["抛错: Invalid path"]
+  safe-res -->|"OK"| read-res["fs.readFile 读文件"]
+  read-res --> out-res["返回 text/plain 全文"]
+  src -->|"否"| err-unknown["抛错: Unknown resource"]
+</pre>
+
+<h3>提示词渲染流（GetPrompt）</h3>
+
+<p>5 个 prompt 模板的作用是"替客户端的 LLM 把源码上下文喂好"。server 收到请求后，按 prompt 名定位相关源码文件、读出来、塞进一段预设的提问文本里，整个组装成一条 user 消息返回。客户端拿到的就是一条可以直接喂给 LLM 的 prompt。</p>
+
+<pre class="mermaid">
+graph TD
+  getprompt["客户端 GetPrompt(name, args)"] --> pswitch{"按 prompt 名分发"}
+  pswitch -->|"explain_tool"| p-tool["定位 tools/工具名 主文件"]
+  pswitch -->|"explain_command"| p-cmd["定位 commands/命令名"]
+  pswitch -->|"architecture_overview"| p-arch["读 README + 扫顶层 + 工具/命令清单"]
+  pswitch -->|"how_does_it_work"| p-how["查 featureMap 找相关路径"]
+  pswitch -->|"compare_tools"| p-cmp["读两个工具主源码"]
+  p-tool --> p-tool-read["读主文件源码"]
+  p-tool-read --> p-tool-out["拼成 6 维度分析提问"]
+  p-cmd --> p-cmd-find["尝试目录/单文件三种候选"]
+  p-cmd-find --> p-cmd-out["拼成命令解释提问"]
+  p-arch --> p-arch-out["拼成架构导览提问"]
+  p-how --> p-how-map{"feature 在 featureMap 中?"}
+  p-how-map -->|"是"| p-how-read["逐路径读文件/列目录(前200行)"]
+  p-how-map -->|"否"| p-how-empty["提示用 search/read 自行查找"]
+  p-how-read --> p-how-out["拼成子系统讲解提问"]
+  p-how-empty --> p-how-out
+  p-cmp --> p-cmp-read["两个工具各读主源码"]
+  p-cmp-read --> p-cmp-out["拼成对比分析提问"]
+</pre>
+
+<ul>
+  <li><code>how_does_it_work</code> 内置了一张 featureMap，把人类口语（"permission system"、"mcp client"、"bridge"）映射到一组源码路径——这是这个服务里唯一带"业务知识"的地方，其它工具都是纯文件系统操作。</li>
+  <li>所有 prompt 返回的都是单条 user 消息，不带 system 消息；客户端可以再叠自己的 system prompt。</li>
+  <li>读源码时 <code>how_does_it_work</code> 只取前 200 行，避免 prompt 过长；<code>read_source_file</code> 工具则支持 startLine/endLine 精确切片，客户端可自行翻页。</li>
+</ul>
+
+<h2>辅助视图：权限边界</h2>
+
+<p>整个服务的权限模型非常薄，只有两层：HTTP 层的 Bearer Token（可选）、文件层的 safePath（强制）。</p>
+
+<pre class="mermaid">
+graph TD
+  req["传入请求"] --> http-layer{"HTTP 模式 &amp; 设了 MCP_API_KEY?"}
+  http-layer -->|"是"| bearer{"Authorization: Bearer 匹配?"}
+  http-layer -->|"否"| pass-http["放行"]
+  bearer -->|"否"| deny-401["401 Unauthorized"]
+  bearer -->|"是"| pass-http
+  pass-http --> tool-call["进入工具/resource handler"]
+  tool-call --> path-arg{"参数含相对路径?"}
+  path-arg -->|"是"| safepath["safePath: resolve + startsWith 校验"]
+  path-arg -->|"否"| direct["直接扫固定目录"]
+  safepath -->|"穿越出 SRC_ROOT"| deny-null["返回 null → 抛错"]
+  safepath -->|"在 SRC_ROOT 内"| allow-read["允许 fs.readFile/readdir"]
+</pre>
+
+<ul>
+  <li><code>/health</code>（和 Vercel 的 <code>/api</code>）永远免鉴权，给部署平台探活用。</li>
+  <li>STDIO 模式没有 HTTP 鉴权——能拉起这个进程的客户端本来就视为可信。</li>
+  <li>safePath 用 <code>resolved.startsWith(SRC_ROOT)</code> 判断；注意 SRC_ROOT 本身是 <code>path.resolve</code> 出来的绝对路径，没有结尾斜杠，所以正好等于 SRC_ROOT 的路径也通过。</li>
+  <li>没有按工具粒度做权限区分——任意已鉴权客户端可调用全部 8 个工具、读 SRC_ROOT 下任意文件。这是个"只读探索"服务，不写不改，所以模型够用。</li>
+</ul>
+
+<h2>辅助视图：会话生命周期与状态机</h2>
+
+<p>HTTP 模式下每个会话有独立的生命周期。Streamable HTTP 用 <code>mcp-session-id</code> 头标识会话，Legacy SSE 用 query 参数 <code>sessionId</code>。两者都在内存 Map 里维护 transport，进程重启即丢失。</p>
+
+<pre class="mermaid">
+graph TD
+  new-req["新请求(无 sessionId)"] --> create-sess["createServer + 新 transport"]
+  create-sess --> gen-id["生成 sessionId(UUID)"]
+  gen-id --> store-map["存入 transports Map"]
+  store-map --> state-active["状态: 活跃"]
+  reuse-req["带 sessionId 的请求"] --> lookup{"Map 中存在?"}
+  lookup -->|"是"| reuse-sess["复用 transport 处理"]
+  lookup -->|"否"| reject-400["400 Invalid/Missing session"]
+  reuse-sess --> state-active
+  state-active -->|"客户端 DELETE /mcp"| close-sess["transport.close()"]
+  state-active -->|"transport.onclose 触发"| del-map["从 Map 删除"]
+  close-sess --> del-map
+  del-map --> state-gone["状态: 已销毁"]
+  state-gone -->|"客户端再来"| reject-400
+</pre>
+
+<ul>
+  <li>每个会话独立 <code>createServer()</code>，意味着每个会话有自己的 MCP Server 实例，但底层都读同一份磁盘源码——无状态业务，天然支持并发。</li>
+  <li>Vercel 部署是 serverless：Map 不跨调用持久化，Streamable HTTP 的会话复用基本失效；老 SSE 和无状态工具调用仍可用。README 明确建议生产用 Railway/Docker。</li>
+  <li>STDIO 模式没有"会话"概念，全程一个 transport，进程退出即结束。</li>
+</ul>
+
+<h2>部署形态一览</h2>
+
+<p>同一套 <code>createServer()</code> 内核，外面套不同壳就成了不同部署方式：本地 STDIO（<code>src/index.ts</code>）、远程 HTTP（<code>src/http.ts</code>）、Vercel serverless（<code>api/vercelApp.ts</code> 导出 Express app）。Dockerfile 把整个仓库 COPY 进镜像，构建出 <code>dist/</code> 后用 <code>node dist/http.js</code> 启动，<code>CLAUDE_CODE_SRC_ROOT=/app/src</code> 指向镜像内的源码副本。Railway 用同一 Dockerfile，配 healthcheckPath=/health 自动探活。</p>
+
+<ul>
+  <li>Docker 镜像里同时打包了 mcp-server/dist 和主项目 src/——这个 server 探索的"源码"在部署时就被固化进镜像，不依赖宿主文件系统。</li>
+  <li><code>src/index.ts.new</code> 是 index.ts 的同名副本（内容完全一致），疑似开发中遗留，未参与构建。</li>
+</ul>
+
+<script>
+window.__sourceMap = {
+  "client": { "file": "mcp-server/src/index.ts", "startLine": 13, "endLine": 19 },
+  "stdio-entry": { "file": "mcp-server/src/index.ts", "startLine": 13, "endLine": 19 },
+  "http-entry": { "file": "mcp-server/src/http.ts", "startLine": 138, "endLine": 167 },
+  "validate-stdio": { "file": "mcp-server/src/server.ts", "startLine": 945, "endLine": 956 },
+  "validate-http": { "file": "mcp-server/src/server.ts", "startLine": 945, "endLine": 956 },
+  "auth-mw": { "file": "mcp-server/src/http.ts", "startLine": 29, "endLine": 44 },
+  "check-bearer": { "file": "mcp-server/src/http.ts", "startLine": 38, "endLine": 42 },
+  "unauth": { "file": "mcp-server/src/http.ts", "startLine": 40, "endLine": 41 },
+  "create-server-stdio": { "file": "mcp-server/src/index.ts", "startLine": 15, "endLine": 15 },
+  "create-server-http": { "file": "mcp-server/src/server.ts", "startLine": 148, "endLine": 158 },
+  "connect-stdio": { "file": "mcp-server/src/index.ts", "startLine": 16, "endLine": 17 },
+  "route-mcp": { "file": "mcp-server/src/http.ts", "startLine": 155, "endLine": 157 },
+  "stream-http": { "file": "mcp-server/src/http.ts", "startLine": 50, "endLine": 104 },
+  "legacy-sse": { "file": "mcp-server/src/http.ts", "startLine": 110, "endLine": 132 },
+  "health": { "file": "mcp-server/src/http.ts", "startLine": 146, "endLine": 153 },
+  "delete-sess": { "file": "mcp-server/src/http.ts", "startLine": 95, "endLine": 103 },
+  "call": { "file": "mcp-server/src/server.ts", "startLine": 379, "endLine": 386 },
+  "switch": { "file": "mcp-server/src/server.ts", "startLine": 386, "endLine": 386 },
+  "t-list-tools": { "file": "mcp-server/src/server.ts", "startLine": 387, "endLine": 394 },
+  "t-list-cmds": { "file": "mcp-server/src/server.ts", "startLine": 396, "endLine": 406 },
+  "t-get-tool": { "file": "mcp-server/src/server.ts", "startLine": 408, "endLine": 411 },
+  "t-get-cmd": { "file": "mcp-server/src/server.ts", "startLine": 444, "endLine": 447 },
+  "t-read": { "file": "mcp-server/src/server.ts", "startLine": 499, "endLine": 501 },
+  "t-search": { "file": "mcp-server/src/server.ts", "startLine": 531, "endLine": 534 },
+  "t-listdir": { "file": "mcp-server/src/server.ts", "startLine": 584, "endLine": 590 },
+  "t-arch": { "file": "mcp-server/src/server.ts", "startLine": 604, "endLine": 642 },
+  "err-tool": { "file": "mcp-server/src/server.ts", "startLine": 411, "endLine": 411 },
+  "safe-tool": { "file": "mcp-server/src/server.ts", "startLine": 412, "endLine": 413 },
+  "err-tool2": { "file": "mcp-server/src/server.ts", "startLine": 414, "endLine": 414 },
+  "pick-main": { "file": "mcp-server/src/server.ts", "startLine": 419, "endLine": 428 },
+  "read-tool": { "file": "mcp-server/src/server.ts", "startLine": 433, "endLine": 433 },
+  "out-tool": { "file": "mcp-server/src/server.ts", "startLine": 434, "endLine": 441 },
+  "err-path": { "file": "mcp-server/src/server.ts", "startLine": 501, "endLine": 501 },
+  "safe-read": { "file": "mcp-server/src/server.ts", "startLine": 502, "endLine": 504 },
+  "err-read": { "file": "mcp-server/src/server.ts", "startLine": 504, "endLine": 504 },
+  "slice-read": { "file": "mcp-server/src/server.ts", "startLine": 505, "endLine": 515 },
+  "out-read": { "file": "mcp-server/src/server.ts", "startLine": 516, "endLine": 528 },
+  "err-pat": { "file": "mcp-server/src/server.ts", "startLine": 534, "endLine": 534 },
+  "compile-regex": { "file": "mcp-server/src/server.ts", "startLine": 540, "endLine": 542 },
+  "err-regex": { "file": "mcp-server/src/server.ts", "startLine": 544, "endLine": 544 },
+  "walk-all": { "file": "mcp-server/src/server.ts", "startLine": 547, "endLine": 547 },
+  "filter-ext": { "file": "mcp-server/src/server.ts", "startLine": 548, "endLine": 550 },
+  "scan-lines": { "file": "mcp-server/src/server.ts", "startLine": 553, "endLine": 568 },
+  "cap-max": { "file": "mcp-server/src/server.ts", "startLine": 554, "endLine": 554 },
+  "stop-scan": { "file": "mcp-server/src/server.ts", "startLine": 554, "endLine": 554 },
+  "out-search": { "file": "mcp-server/src/server.ts", "startLine": 571, "endLine": 581 },
+  "readres": { "file": "mcp-server/src/server.ts", "startLine": 201, "endLine": 203 },
+  "arch": { "file": "mcp-server/src/server.ts", "startLine": 206, "endLine": 206 },
+  "read-readme": { "file": "mcp-server/src/server.ts", "startLine": 207, "endLine": 210 },
+  "out-arch": { "file": "mcp-server/src/server.ts", "startLine": 214, "endLine": 214 },
+  "tools": { "file": "mcp-server/src/server.ts", "startLine": 217, "endLine": 217 },
+  "call-gettools": { "file": "mcp-server/src/server.ts", "startLine": 218, "endLine": 218 },
+  "out-tools": { "file": "mcp-server/src/server.ts", "startLine": 219, "endLine": 227 },
+  "cmds": { "file": "mcp-server/src/server.ts", "startLine": 230, "endLine": 230 },
+  "call-getcmds": { "file": "mcp-server/src/server.ts", "startLine": 231, "endLine": 231 },
+  "out-cmds": { "file": "mcp-server/src/server.ts", "startLine": 232, "endLine": 240 },
+  "src": { "file": "mcp-server/src/server.ts", "startLine": 243, "endLine": 243 },
+  "safe-res": { "file": "mcp-server/src/server.ts", "startLine": 245, "endLine": 246 },
+  "err-res": { "file": "mcp-server/src/server.ts", "startLine": 246, "endLine": 246 },
+  "read-res": { "file": "mcp-server/src/server.ts", "startLine": 247, "endLine": 247 },
+  "out-res": { "file": "mcp-server/src/server.ts", "startLine": 248, "endLine": 248 },
+  "err-unknown": { "file": "mcp-server/src/server.ts", "startLine": 251, "endLine": 251 },
+  "getprompt": { "file": "mcp-server/src/server.ts", "startLine": 707, "endLine": 712 },
+  "pswitch": { "file": "mcp-server/src/server.ts", "startLine": 714, "endLine": 714 },
+  "p-tool": { "file": "mcp-server/src/server.ts", "startLine": 715, "endLine": 729 },
+  "p-cmd": { "file": "mcp-server/src/server.ts", "startLine": 744, "endLine": 785 },
+  "p-arch": { "file": "mcp-server/src/server.ts", "startLine": 800, "endLine": 810 },
+  "p-how": { "file": "mcp-server/src/server.ts", "startLine": 825, "endLine": 827 },
+  "p-cmp": { "file": "mcp-server/src/server.ts", "startLine": 895, "endLine": 921 },
+  "p-tool-read": { "file": "mcp-server/src/server.ts", "startLine": 727, "endLine": 729 },
+  "p-tool-out": { "file": "mcp-server/src/server.ts", "startLine": 730, "endLine": 741 },
+  "p-cmd-find": { "file": "mcp-server/src/server.ts", "startLine": 748, "endLine": 767 },
+  "p-cmd-out": { "file": "mcp-server/src/server.ts", "startLine": 786, "endLine": 797 },
+  "p-arch-out": { "file": "mcp-server/src/server.ts", "startLine": 811, "endLine": 822 },
+  "p-how-map": { "file": "mcp-server/src/server.ts", "startLine": 862, "endLine": 862 },
+  "p-how-read": { "file": "mcp-server/src/server.ts", "startLine": 864, "endLine": 880 },
+  "p-how-empty": { "file": "mcp-server/src/server.ts", "startLine": 888, "endLine": 888 },
+  "p-how-out": { "file": "mcp-server/src/server.ts", "startLine": 881, "endLine": 892 },
+  "p-cmp-read": { "file": "mcp-server/src/server.ts", "startLine": 901, "endLine": 920 },
+  "p-cmp-out": { "file": "mcp-server/src/server.ts", "startLine": 922, "endLine": 933 },
+  "req": { "file": "mcp-server/src/http.ts", "startLine": 29, "endLine": 44 },
+  "http-layer": { "file": "mcp-server/src/http.ts", "startLine": 34, "endLine": 34 },
+  "bearer": { "file": "mcp-server/src/http.ts", "startLine": 38, "endLine": 39 },
+  "deny-401": { "file": "mcp-server/src/http.ts", "startLine": 40, "endLine": 41 },
+  "pass-http": { "file": "mcp-server/src/http.ts", "startLine": 43, "endLine": 43 },
+  "tool-call": { "file": "mcp-server/src/server.ts", "startLine": 379, "endLine": 386 },
+  "path-arg": { "file": "mcp-server/src/server.ts", "startLine": 386, "endLine": 386 },
+  "safepath": { "file": "mcp-server/src/server.ts", "startLine": 84, "endLine": 88 },
+  "deny-null": { "file": "mcp-server/src/server.ts", "startLine": 86, "endLine": 86 },
+  "allow-read": { "file": "mcp-server/src/server.ts", "startLine": 18, "endLine": 20 },
+  "new-req": { "file": "mcp-server/src/http.ts", "startLine": 54, "endLine": 60 },
+  "create-sess": { "file": "mcp-server/src/http.ts", "startLine": 61, "endLine": 65 },
+  "gen-id": { "file": "mcp-server/src/http.ts", "startLine": 63, "endLine": 63 },
+  "store-map": { "file": "mcp-server/src/http.ts", "startLine": 78, "endLine": 80 },
+  "state-active": { "file": "mcp-server/src/http.ts", "startLine": 75, "endLine": 75 },
+  "reuse-req": { "file": "mcp-server/src/http.ts", "startLine": 55, "endLine": 57 },
+  "lookup": { "file": "mcp-server/src/http.ts", "startLine": 57, "endLine": 57 },
+  "reuse-sess": { "file": "mcp-server/src/http.ts", "startLine": 75, "endLine": 75 },
+  "reject-400": { "file": "mcp-server/src/http.ts", "startLine": 87, "endLine": 88 },
+  "close-sess": { "file": "mcp-server/src/http.ts", "startLine": 99, "endLine": 99 },
+  "del-map": { "file": "mcp-server/src/http.ts", "startLine": 100, "endLine": 100 },
+  "state-gone": { "file": "mcp-server/src/http.ts", "startLine": 100, "endLine": 100 },
+  "skip-auth": { "file": "mcp-server/src/http.ts", "startLine": 43, "endLine": 44 },
+  "direct": { "file": "mcp-server/src/server.ts", "startLine": 387, "endLine": 388 }
+};
+</script>
+
+<aside id="source-panel"><div id="source-header"></div><div id="monaco-container"></div></aside>
+<script src="../assets/codeindex-runtime.js"></script>
+<script src="../assets/codeindex.js"></script>
+</body>
+</html>

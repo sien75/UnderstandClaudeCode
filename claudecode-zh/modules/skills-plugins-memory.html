@@ -1,0 +1,318 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>技能、插件与记忆系统</title>
+<link rel="stylesheet" href="../assets/codeindex.css">
+</head>
+<body>
+<nav class="topnav"><a href="../index.html">← 返回总览</a></nav>
+<h1>技能、插件与记忆系统</h1>
+
+<p>这个模块讲 Claude Code 里三件"扩展能力"的事：① 用户或 Claude 调用一个 skill——预置好的、打包了提示词和工具配置的可复用工作流；② 安装一个 plugin 来扩展能力——plugin 怎么被发现、安装、加载，又如何贡献工具和命令；③ Claude 怎么"记住"东西——基于 CLAUDE.md 的持久记忆，分项目级、用户级、自动抽取、团队同步四条线。三套机制各自独立，但都围绕同一个主题：让 Claude 在本次会话之外仍能复用经验、能力和上下文。</p>
+
+<h2 id="skills-load">一、Skill 加载与调用</h2>
+
+<p>用户视角：在会话里输入 <code>/skills</code> 会列出当前所有可用技能；Claude 自己也可以通过 SkillTool 主动调用某个技能。一个 skill 本质上是一个目录，里面放了一份 SKILL.md（带 YAML frontmatter 描述元信息：名字、描述、允许用的工具、参数等，正文是给 Claude 看的提示词）。系统启动时会从四个来源扫描这些目录：策略级（managed）、用户级（<code>~/.claude/skills</code>）、项目级（项目目录向上一直走到家目录的 <code>.claude/skills</code>）、以及额外的 <code>--add-dir</code> 目录。此外还有内置 skill（随 CLI 编译进去）和 MCP 服务器贡献的 skill。</p>
+
+<dl>
+  <dt>输入</dt>
+  <dd>启动时的 cwd + 各级 .claude/skills 目录；运行时用户/Claude 选择的 skill 名 + 可选参数</dd>
+  <dt>输出</dt>
+  <dd>一份展开好的提示词（替换了 $ARGUMENTS、${CLAUDE_SKILL_DIR} 等），注入回对话；同时按需调整本次调用的工具白名单、模型、effort</dd>
+</dl>
+
+<pre class="mermaid">
+graph TD
+  start["启动 getSkillDirCommands"] --> parallel["并行扫描四类来源"]
+  parallel --> scan-managed["策略级 managed 目录"]
+  parallel --> scan-user["用户级 ~/.claude/skills"]
+  parallel --> scan-project["项目级 .claude/skills（向上遍历到家目录）"]
+  parallel --> scan-add["--add-dir 额外目录"]
+  parallel --> scan-legacy["legacy /commands 目录（兼容旧格式）"]
+  scan-managed --> read-skill["读 skill-name/SKILL.md"]
+  scan-user --> read-skill
+  scan-project --> read-skill
+  scan-add --> read-skill
+  scan-legacy --> transform["SKILL.md 优先于普通 .md，按目录命名"]
+  transform --> read-skill
+  read-skill --> parse-fm["解析 frontmatter：name/desc/工具/hooks/paths 等"]
+  parse-fm --> create-cmd["构建 Command 对象（懒加载正文，只在调用时展开）"]
+  create-cmd --> dedup["按 realpath 去重（同一文件多路径只保留首个）"]
+  dedup --> split{"带 paths 前缀？"}
+  split -->|是| cond-store["暂存到 conditionalSkills，等匹配文件再激活"]
+  split -->|否| active["加入无条件 skill 列表，立即可用"]
+  cond-store --> activate["运行中 Read/Edit 命中路径 → 激活进 dynamicSkills"]
+  active --> register-bundled["内置 skill 单独 registerBundledSkill 注册"]
+  register-bundled --> ready["所有 skill 进 commands 注册表"]
+  ready --> invoke["Claude 调 SkillTool(skill, args)"]
+  invoke --> find-cmd{"找到且可调用？"}
+  find-cmd -->|未找到/禁用| err-skill["返回 Unknown skill / 被禁用"]
+  find-cmd -->|可调用| perm{"权限检查"}
+  perm -->|deny 规则| blocked["技能被拒绝"]
+  perm -->|allow/安全属性| fork{"context=fork？"}
+  perm -->|其他| ask["弹出确认对话框"]
+  fork -->|是| exec-fork["在隔离子 agent 中跑，独立 token 预算"]
+  fork -->|否| exec-inline["展开提示词：替换参数 + 执行内嵌 !命令 + 注入 CLAUDE_SKILL_DIR"]
+  exec-fork --> result["返回结果文本"]
+  exec-inline --> inject["把展开后的提示词作为新消息注入对话，同时改写工具白名单/模型/effort"]
+</pre>
+
+<ul>
+  <li>去重用 realpath 解析符号链接，避免同一文件被不同路径加载两次（顺序敏感：策略级 > 用户级 > 项目级）</li>
+  <li>带 <code>paths</code> frontmatter 的 skill 是"条件技能"，平时不加载，等用户操作命中路径模式（gitignore 风格匹配）才激活，省 token</li>
+  <li>动态发现：运行中读/写到 cwd 下子目录的文件时，会向上找 <code>.claude/skills</code> 并加载；gitignored 目录会被跳过</li>
+  <li>MCP skill 来自远程服务器，不可信——其正文里的 <code>!`...`</code> 内嵌 shell 命令永远不会被执行（安全边界）</li>
+  <li>内置 skill 可携带参考文件，首次调用时懒提取到带 nonce 的私有目录（O_NOFOLLOW + 0o600 防符号链接攻击）</li>
+  <li>fork 模式：技能在独立子 agent 里跑，有自己的 token 预算，结果文本回传；inline 模式：直接把展开后的提示词塞回主对话</li>
+  <li>权限：只含"安全属性"的 skill 自动放行；含 hooks、allowed-tools 等敏感字段的 skill 要问用户；用户也可配置 Skill(name) allow/deny 规则</li>
+</ul>
+
+<h2 id="plugins-lifecycle">二、Plugin 生命周期</h2>
+
+<p>用户视角：插件是比 skill 更大粒度的扩展包——一个 plugin 可以同时贡献 skill、命令、hook、MCP 服务器、LSP 服务器、agent 定义等多种能力。用户通过 <code>/plugin</code> 打开管理界面浏览/安装/启停，或在命令行用 <code>claude plugin install foo@marketplace</code>。插件来源有三种：① marketplace（插件市场，本身是一个 git 仓库，列着若干插件条目）；② 内置插件（随 CLI 编译，用户可开关）；③ <code>--plugin-dir</code> 临时会话插件（指向本地目录，仅本次有效）。安装作用域分 user/project/local/managed 四级，managed 由企业管理员通过策略锁死。</p>
+
+<dl>
+  <dt>输入</dt>
+  <dd>用户选择的插件标识（name@marketplace）+ 作用域；或配置文件里声明的 marketplace 仓库</dd>
+  <dt>输出</dt>
+  <dd>一个已加载到内存的 LoadedPlugin——它的 skill/命令/hook/MCP/LSP/agent 都被注册进相应子系统，下次 Claude 能用上</dd>
+</dl>
+
+<pre class="mermaid">
+graph TD
+  startup["启动 performBackgroundPluginInstallations"] --> diff["对比已声明 marketplace 与已落地配置，算出待安装"]
+  diff --> pending{"有待安装？"}
+  pending -->|否| skip["直接走缓存加载"]
+  pending -->|是| reconcile["后台 clone/更新 marketplace 仓库"]
+  reconcile --> installed-new{"新装了 marketplace？"}
+  installed-new -->|是| auto-refresh["自动 refreshActivePlugins，修复首次缓存空"]
+  installed-new -->|仅更新| notify["设 needsRefresh，提示用户 /reload-plugins"]
+  auto-refresh --> load-all["loadAllPlugins：合并三类来源"]
+  skip --> load-all
+  load-all --> merge["mergePluginSources：session &gt; marketplace &gt; builtin"]
+  merge --> policy{"被 managed 策略锁？"}
+  policy -->|是| block-session["--plugin-dir 副本被忽略，报错"]
+  policy -->|否| assemble["逐个解析 manifest，createPluginFromPath"]
+  assemble --> deps{"依赖检查（reverseDependents / 策略屏蔽）"}
+  deps -->|依赖被策略屏蔽| demote["降级或剔除"]
+  deps -->|通过| split-en{"按 enabledPlugins 设置分 enabled/disabled"}
+  split-en --> refresh["refreshActivePlugins：清缓存→重载→注册各子系统"]
+  refresh --> reg-cmd["getPluginCommands：插件贡献的 slash 命令/skill"]
+  refresh --> reg-mcp["loadPluginMcpServers：插件贡献的 MCP 服务器"]
+  refresh --> reg-lsp["loadPluginLspServers：插件贡献的 LSP 服务器"]
+  refresh --> reg-hook["loadPluginHooks：插件贡献的 hook"]
+  refresh --> reg-agent["getAgentDefinitionsWithOverrides：插件贡献的 agent"]
+  refresh --> reconnect["pluginReconnectKey++，触发 MCP 重连"]
+  install-cmd["用户 /plugin install 或 CLI installPluginOp"] --> find-mkt["在 marketplace 配置里找插件条目"]
+  find-mkt --> found{"找到？"}
+  found -->|否| not-found["返回 Plugin not found"]
+  found -->|是| resolve["installResolvedPlugin：下源码→算版本→拷版本缓存→写 installed_plugins.json→写 settings"]
+  resolve --> policy2{"被策略屏蔽？"}
+  policy2 -->|是| blocked["Blocked by policy"]
+  policy2 -->|否| done-install["安装成功，待下次加载生效"]
+  uninstall["uninstallPluginOp"] --> rm-settings["从 settings 删 enabledPlugins 键"]
+  rm-settings --> rm-v2["从 installed_plugins_v2.json 删本 scope 记录"]
+  rm-v2 --> last-scope{"最后一个 scope？"}
+  last-scope -->|是| orphan["标记版本缓存为孤儿 + 删插件选项 + 删 data 目录"]
+  last-scope -->|否| keep["保留缓存，仅去本 scope 启用"]
+  orphan --> warn-dep["警告反向依赖者（不阻断）"]
+</pre>
+
+<ul>
+  <li>加载优先级：<code>--plugin-dir</code> 会话插件 > marketplace 安装的插件 > 内置插件；但 managed 策略会盖过 <code>--plugin-dir</code>（管理员意图优先于本地开发便利）</li>
+  <li>启动时有两条加载路径：loadAllPlugins（会联网 clone 缺失的 marketplace）和 loadAllPluginsCacheOnly（只读缓存，不联网），后者用于不阻塞启动的消费者；前者用于 <code>/plugins</code>、<code>/reload-plugins</code> 等显式刷新</li>
+  <li>安装是非原地更新：下到临时目录→算版本（git commit SHA 或 manifest version）→拷到版本化缓存目录→更新 installed_plugins.json；内存里的旧版本要等重启才换</li>
+  <li>卸载时若仍有其他 enabled 插件依赖它，只警告不阻断（避免 delisted 插件卡住整个依赖图）</li>
+  <li>project scope 的卸载会引导用户用 local scope 禁用，因为 .claude/settings.json 是团队共享的</li>
+  <li>插件可贡献 MCP/LSP 服务器，refreshActivePlugins 会 bump pluginReconnectKey 触发 MCP 重连，并 reinitialize LSP manager</li>
+</ul>
+
+<h2 id="memory-rw-sync">三、记忆的读写与同步</h2>
+
+<p>用户视角：Claude 能"记住"东西，靠的是基于 CLAUDE.md 的持久记忆系统。记忆分四条线：① <strong>项目级 CLAUDE.md</strong>——项目根目录的 .claude/CLAUDE.md，团队共享，进项目就加载；② <strong>用户级 CLAUDE.md</strong>——~/.claude/CLAUDE.md，跨项目生效；③ <strong>自动记忆（auto memory）</strong>——Claude 在对话中自己判断哪些值得记，写到 <code>~/.claude/projects/&lt;slug&gt;/memory/</code>，下次自动注入；④ <strong>团队记忆同步（team memory）</strong>——把本地记忆 push 到远端服务器，队友 pull 下来，实现记忆共享。用户用 <code>/memory</code> 命令可以打开编辑器手动编辑记忆文件。</p>
+
+<dl>
+  <dt>输入</dt>
+  <dd>对话过程中的用户消息、纠正、偏好、项目背景；或用户在编辑器里手写的记忆内容</dd>
+  <dt>输出</dt>
+  <dd>落到 memory 目录的 .md 文件（带 frontmatter：type/description）+ MEMORY.md 索引；团队场景下还会同步到远端</dd>
+</dl>
+
+<pre class="mermaid">
+graph TD
+  start["会话启动 loadMemoryPrompt"] --> check-enabled{"auto memory 开启？"}
+  check-enabled -->|否| disabled["返回 null，不注入记忆提示"]
+  check-enabled -->|是| kairos{"KAIROS 长会话模式？"}
+  kairos -->|是| daily-log["用追加式日志提示：写到 logs/YYYY/MM/DD.md"]
+  kairos -->|否| team{"team memory 开启？"}
+  team -->|是| combined["合并提示：auto + team 两个目录"]
+  team -->|否| single["单一 auto memory 提示"]
+  combined --> ensure-dir["ensureMemoryDirExists：保证目录在"]
+  single --> ensure-dir
+  ensure-dir --> inject-prompt["把行为指令 + MEMORY.md 索引注入系统提示"]
+  inject-prompt --> conv["进入对话：Claude 看到记忆指引"]
+  conv --> user-says["用户说话 / Claude 做事"]
+  user-says --> recall{"需要回忆？"}
+  recall -->|是| scan["scanMemoryFiles：扫目录读 frontmatter，按 mtime 排序，上限 200"]
+  scan --> select["sideQuery 调 Sonnet：根据 query 从清单里选最多 5 条相关记忆"]
+  select --> inject-mem["把选中的记忆文件内容注入本轮对话"]
+  recall -->|否| skip-recall["直接继续"]
+  user-says --> save{"值得记？"}
+  save -->|Claude 直接写| write-direct["Write 工具写到 memory 目录 + 更新 MEMORY.md 索引"]
+  save -->|后台抽取| extract["extractMemories：每轮结束跑 forked agent 扫描对话，挑值得记的写"]
+  extract --> throttle{"达到抽取频率阈值？"}
+  throttle -->|否| skip-extract["跳过本轮，计数+1"]
+  throttle -->|是| mutual{"主 agent 已写过记忆？"}
+  mutual -->|是| skip-extract2["跳过，避免重复，推进游标"]
+  mutual -->|否| run-fork["runForkedAgent：fork 主对话缓存，让 Sonnet 抽取并写文件"]
+  write-direct --> team-write["team memory 目录有写？"]
+  run-fork --> team-write
+  team-write --> notify["notifyTeamMemoryWrite：通知 watcher"]
+  notify --> debounce["防抖 2s，合并连续写"]
+  debounce --> push["pushTeamMemory：算 delta（只传哈希不同的条目）"]
+  push --> secret{"secretScanner 检测到密钥？"}
+  secret -->|是| skip-secret["跳过该文件，不传，警告"]
+  secret -->|否| upload["PUT 到远端，按 repoSlug 隔离"]
+  upload --> conflict{"412 冲突？"}
+  conflict -->|是| pull-refresh["pull 刷新 serverChecksums，重算 delta，重试（最多 N 次）"]
+  conflict -->|否| done-push["更新本地 serverChecksums，完成"]
+  pull-flow["启动/手动触发 pullTeamMemory"] --> etag{"ETag 命中？"}
+  etag -->|是| not-modified["服务器未变，跳过"]
+  etag -->|否| fetch["GET 远端条目"]
+  fetch --> write-local["writeRemoteEntriesToLocal：写回本地 team 目录"]
+</pre>
+
+<ul>
+  <li>记忆分四类（user/feedback/project/reference），可从当前项目状态推导出的内容（代码模式、架构、git 历史）明确排除——这些不该记</li>
+  <li>MEMORY.md 是索引不是记忆本身：每条一行 <code>- [标题](file.md) — 一句话钩子</code>；超过 200 行或 25KB 会被截断并附警告</li>
+  <li>回忆机制：扫目录读 frontmatter 生成清单 → 用 Sonnet 做相关性选择（独立 sideQuery，不污染主对话）→ 选中文件注入；已注入过的会过滤掉避免重复</li>
+  <li>自动抽取（extractMemories）在每轮对话结束（模型产出无工具调用的最终回复）时触发，用 forked agent 共享主对话缓存；与主 agent 直接写互斥——主 agent 写过记忆就跳过本轮抽取</li>
+  <li>有抽取频率节流（tengu_bramble_lintel，默认每轮都抽）和游标（lastMemoryMessageUuid）保证只看新增消息</li>
+  <li>team memory 同步：watcher 监听 team 目录写入 → 防抖 2s → push；push 用 content hash 算 delta，只传变化的条目；冲突（HTTP 412）时 pull 刷新 serverChecksums 后重试</li>
+  <li>密钥安全：push 前用 gitleaks 规则扫描，命中密钥的文件被排除不上传，只记 rule id 不记值</li>
+  <li>session memory 是另一条线：用于 compaction 时压缩上下文，只在 auto-compact 开启时激活，写入专用 session memory 文件</li>
+  <li>KAIROS 模式：长会话改用追加式日志（按天一个文件），由夜间 /dream 技能蒸馏成 MEMORY.md + 主题文件</li>
+  <li><code>/memory</code> 命令：弹出选择器让用户选要编辑哪个记忆文件，用 $EDITOR/$VISUAL 打开</li>
+</ul>
+
+<script>
+window.__sourceMap = {
+  "start": { "file": "src/skills/loadSkillsDir.ts", "startLine": 638, "endLine": 642 },
+  "parallel": { "file": "src/skills/loadSkillsDir.ts", "startLine": 679, "endLine": 714 },
+  "scan-managed": { "file": "src/skills/loadSkillsDir.ts", "startLine": 686, "endLine": 688 },
+  "scan-user": { "file": "src/skills/loadSkillsDir.ts", "startLine": 689, "endLine": 691 },
+  "scan-project": { "file": "src/skills/loadSkillsDir.ts", "startLine": 692, "endLine": 698 },
+  "scan-add": { "file": "src/skills/loadSkillsDir.ts", "startLine": 699, "endLine": 708 },
+  "scan-legacy": { "file": "src/skills/loadSkillsDir.ts", "startLine": 713, "endLine": 714 },
+  "read-skill": { "file": "src/skills/loadSkillsDir.ts", "startLine": 407, "endLine": 480 },
+  "transform": { "file": "src/skills/loadSkillsDir.ts", "startLine": 493, "endLine": 521 },
+  "parse-fm": { "file": "src/skills/loadSkillsDir.ts", "startLine": 185, "endLine": 265 },
+  "create-cmd": { "file": "src/skills/loadSkillsDir.ts", "startLine": 270, "endLine": 401 },
+  "dedup": { "file": "src/skills/loadSkillsDir.ts", "startLine": 725, "endLine": 769 },
+  "split": { "file": "src/skills/loadSkillsDir.ts", "startLine": 774, "endLine": 785 },
+  "cond-store": { "file": "src/skills/loadSkillsDir.ts", "startLine": 788, "endLine": 796 },
+  "activate": { "file": "src/skills/loadSkillsDir.ts", "startLine": 997, "endLine": 1058 },
+  "active": { "file": "src/skills/loadSkillsDir.ts", "startLine": 786, "endLine": 803 },
+  "register-bundled": { "file": "src/skills/bundledSkills.ts", "startLine": 53, "endLine": 100 },
+  "ready": { "file": "src/tools/SkillTool/SkillTool.ts", "startLine": 81, "endLine": 94 },
+  "invoke": { "file": "src/tools/SkillTool/SkillTool.ts", "startLine": 580, "endLine": 632 },
+  "find-cmd": { "file": "src/tools/SkillTool/SkillTool.ts", "startLine": 354, "endLine": 430 },
+  "err-skill": { "file": "src/tools/SkillTool/SkillTool.ts", "startLine": 403, "endLine": 409 },
+  "perm": { "file": "src/tools/SkillTool/SkillTool.ts", "startLine": 432, "endLine": 578 },
+  "blocked": { "file": "src/tools/SkillTool/SkillTool.ts", "startLine": 475, "endLine": 486 },
+  "fork": { "file": "src/tools/SkillTool/SkillTool.ts", "startLine": 622, "endLine": 632 },
+  "ask": { "file": "src/tools/SkillTool/SkillTool.ts", "startLine": 569, "endLine": 577 },
+  "exec-fork": { "file": "src/tools/SkillTool/SkillTool.ts", "startLine": 122, "endLine": 289 },
+  "exec-inline": { "file": "src/tools/SkillTool/SkillTool.ts", "startLine": 634, "endLine": 756 },
+  "result": { "file": "src/tools/SkillTool/SkillTool.ts", "startLine": 843, "endLine": 862 },
+  "inject": { "file": "src/tools/SkillTool/SkillTool.ts", "startLine": 767, "endLine": 841 },
+
+  "startup": { "file": "src/services/plugins/PluginInstallationManager.ts", "startLine": 60, "endLine": 95 },
+  "diff": { "file": "src/services/plugins/PluginInstallationManager.ts", "startLine": 67, "endLine": 75 },
+  "pending": { "file": "src/services/plugins/PluginInstallationManager.ts", "startLine": 93, "endLine": 95 },
+  "reconcile": { "file": "src/services/plugins/PluginInstallationManager.ts", "startLine": 101, "endLine": 120 },
+  "installed-new": { "file": "src/services/plugins/PluginInstallationManager.ts", "startLine": 135, "endLine": 137 },
+  "auto-refresh": { "file": "src/services/plugins/PluginInstallationManager.ts", "startLine": 141, "endLine": 165 },
+  "notify": { "file": "src/services/plugins/PluginInstallationManager.ts", "startLine": 166, "endLine": 180 },
+  "load-all": { "file": "src/utils/plugins/pluginLoader.ts", "startLine": 3096, "endLine": 3108 },
+  "merge": { "file": "src/utils/plugins/pluginLoader.ts", "startLine": 3009, "endLine": 3064 },
+  "policy": { "file": "src/utils/plugins/pluginLoader.ts", "startLine": 3030, "endLine": 3045 },
+  "block-session": { "file": "src/utils/plugins/pluginLoader.ts", "startLine": 3036, "endLine": 3042 },
+  "assemble": { "file": "src/utils/plugins/pluginLoader.ts", "startLine": 3149, "endLine": 3180 },
+  "deps": { "file": "src/services/plugins/pluginOperations.ts", "startLine": 543, "endLine": 548 },
+  "demote": { "file": "src/services/plugins/pluginOperations.ts", "startLine": 546, "endLine": 548 },
+  "split-en": { "file": "src/utils/plugins/pluginLoader.ts", "startLine": 3177, "endLine": 3180 },
+  "refresh": { "file": "src/utils/plugins/refresh.ts", "startLine": 72, "endLine": 145 },
+  "reg-cmd": { "file": "src/utils/plugins/refresh.ts", "startLine": 89, "endLine": 92 },
+  "reg-mcp": { "file": "src/utils/plugins/refresh.ts", "startLine": 102, "endLine": 110 },
+  "reg-lsp": { "file": "src/utils/plugins/refresh.ts", "startLine": 111, "endLine": 119 },
+  "reg-hook": { "file": "src/utils/plugins/refresh.ts", "startLine": 152, "endLine": 161 },
+  "reg-agent": { "file": "src/utils/plugins/refresh.ts", "startLine": 89, "endLine": 92 },
+  "reconnect": { "file": "src/utils/plugins/refresh.ts", "startLine": 133, "endLine": 138 },
+  "install-cmd": { "file": "src/services/plugins/pluginOperations.ts", "startLine": 321, "endLine": 418 },
+  "find-mkt": { "file": "src/services/plugins/pluginOperations.ts", "startLine": 330, "endLine": 359 },
+  "found": { "file": "src/services/plugins/pluginOperations.ts", "startLine": 361, "endLine": 369 },
+  "not-found": { "file": "src/services/plugins/pluginOperations.ts", "startLine": 365, "endLine": 368 },
+  "resolve": { "file": "src/services/plugins/pluginOperations.ts", "startLine": 374, "endLine": 379 },
+  "policy2": { "file": "src/services/plugins/pluginOperations.ts", "startLine": 398, "endLine": 407 },
+  "blocked": { "file": "src/services/plugins/pluginOperations.ts", "startLine": 399, "endLine": 402 },
+  "done-install": { "file": "src/services/plugins/pluginOperations.ts", "startLine": 411, "endLine": 417 },
+  "uninstall": { "file": "src/services/plugins/pluginOperations.ts", "startLine": 427, "endLine": 558 },
+  "rm-settings": { "file": "src/services/plugins/pluginOperations.ts", "startLine": 506, "endLine": 514 },
+  "rm-v2": { "file": "src/services/plugins/pluginOperations.ts", "startLine": 516, "endLine": 525 },
+  "last-scope": { "file": "src/services/plugins/pluginOperations.ts", "startLine": 523, "endLine": 525 },
+  "orphan": { "file": "src/services/plugins/pluginOperations.ts", "startLine": 526, "endLine": 541 },
+  "keep": { "file": "src/services/plugins/pluginOperations.ts", "startLine": 523, "endLine": 525 },
+  "warn-dep": { "file": "src/services/plugins/pluginOperations.ts", "startLine": 546, "endLine": 548 },
+
+  "start": { "file": "src/memdir/memdir.ts", "startLine": 419, "endLine": 421 },
+  "check-enabled": { "file": "src/memdir/memdir.ts", "startLine": 420, "endLine": 420 },
+  "disabled": { "file": "src/memdir/memdir.ts", "startLine": 492, "endLine": 506 },
+  "kairos": { "file": "src/memdir/memdir.ts", "startLine": 432, "endLine": 438 },
+  "daily-log": { "file": "src/memdir/memdir.ts", "startLine": 327, "endLine": 370 },
+  "team": { "file": "src/memdir/memdir.ts", "startLine": 448, "endLine": 473 },
+  "combined": { "file": "src/memdir/memdir.ts", "startLine": 468, "endLine": 472 },
+  "single": { "file": "src/memdir/memdir.ts", "startLine": 475, "endLine": 490 },
+  "ensure-dir": { "file": "src/memdir/memdir.ts", "startLine": 129, "endLine": 147 },
+  "inject-prompt": { "file": "src/memdir/memdir.ts", "startLine": 199, "endLine": 266 },
+  "conv": { "file": "src/memdir/memdir.ts", "startLine": 241, "endLine": 243 },
+  "user-says": { "file": "src/memdir/memdir.ts", "startLine": 243, "endLine": 243 },
+  "recall": { "file": "src/memdir/findRelevantMemories.ts", "startLine": 39, "endLine": 75 },
+  "scan": { "file": "src/memdir/memoryScan.ts", "startLine": 35, "endLine": 77 },
+  "select": { "file": "src/memdir/findRelevantMemories.ts", "startLine": 77, "endLine": 141 },
+  "inject-mem": { "file": "src/memdir/findRelevantMemories.ts", "startLine": 59, "endLine": 75 },
+  "skip-recall": { "file": "src/memdir/findRelevantMemories.ts", "startLine": 49, "endLine": 51 },
+  "save": { "file": "src/memdir/memdir.ts", "startLine": 243, "endLine": 243 },
+  "write-direct": { "file": "src/memdir/memdir.ts", "startLine": 219, "endLine": 234 },
+  "extract": { "file": "src/services/extractMemories/extractMemories.ts", "startLine": 329, "endLine": 420 },
+  "throttle": { "file": "src/services/extractMemories/extractMemories.ts", "startLine": 377, "endLine": 386 },
+  "skip-extract": { "file": "src/services/extractMemories/extractMemories.ts", "startLine": 378, "endLine": 384 },
+  "mutual": { "file": "src/services/extractMemories/extractMemories.ts", "startLine": 348, "endLine": 360 },
+  "skip-extract2": { "file": "src/services/extractMemories/extractMemories.ts", "startLine": 350, "endLine": 359 },
+  "run-fork": { "file": "src/services/extractMemories/extractMemories.ts", "startLine": 415, "endLine": 420 },
+  "team-write": { "file": "src/services/teamMemorySync/watcher.ts", "startLine": 314, "endLine": 319 },
+  "notify": { "file": "src/services/teamMemorySync/watcher.ts", "startLine": 314, "endLine": 319 },
+  "debounce": { "file": "src/services/teamMemorySync/watcher.ts", "startLine": 314, "endLine": 319 },
+  "push": { "file": "src/services/teamMemorySync/index.ts", "startLine": 889, "endLine": 960 },
+  "secret": { "file": "src/services/teamMemorySync/index.ts", "startLine": 921, "endLine": 945 },
+  "skip-secret": { "file": "src/services/teamMemorySync/index.ts", "startLine": 924, "endLine": 945 },
+  "upload": { "file": "src/services/teamMemorySync/index.ts", "startLine": 956, "endLine": 960 },
+  "conflict": { "file": "src/services/teamMemorySync/index.ts", "startLine": 956, "endLine": 960 },
+  "pull-refresh": { "file": "src/services/teamMemorySync/index.ts", "startLine": 770, "endLine": 851 },
+  "done-push": { "file": "src/services/teamMemorySync/index.ts", "startLine": 956, "endLine": 960 },
+  "pull-flow": { "file": "src/services/teamMemorySync/index.ts", "startLine": 770, "endLine": 830 },
+  "etag": { "file": "src/services/teamMemorySync/index.ts", "startLine": 805, "endLine": 806 },
+  "not-modified": { "file": "src/services/teamMemorySync/index.ts", "startLine": 820, "endLine": 823 },
+  "fetch": { "file": "src/services/teamMemorySync/index.ts", "startLine": 806, "endLine": 807 },
+  "write-local": { "file": "src/services/teamMemorySync/index.ts", "startLine": 851, "endLine": 851 },
+  "skip": { "file": "src/services/plugins/PluginInstallationManager.ts", "startLine": 96, "endLine": 97 }
+};
+</script>
+
+<aside id="source-panel"><div id="source-header"></div><div id="monaco-container"></div></aside>
+<script src="../assets/codeindex-runtime.js"></script>
+<script src="../assets/codeindex.js"></script>
+</body>
+</html>

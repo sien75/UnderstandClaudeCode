@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>核心工具函数与服务层补充</title>
+<link rel="stylesheet" href="../assets/codeindex.css">
+</head>
+<body>
+<nav class="topnav"><a href="../index.html">← 返回总览</a></nav>
+<h1>核心工具函数与服务层补充</h1>
+
+<p>前面十个模块把主线（启动、查询引擎、工具系统、权限、MCP、技能/插件、终端 UI、IDE、Agent 协调、Slash 命令）都走了一遍，但底座还有一大批"工具函数"和"后台服务"没被细读。这一模块把这些散落的大文件补上：它们本身不构成一条独立业务链，但几乎所有主线都要经过它们——消息怎么拼、会话怎么落盘、bash 命令怎么解析、附件怎么收集、插件从哪加载、OAuth 怎么登录、埋点怎么上报、LSP 怎么接、策略限制和远程托管设置怎么同步，等等。视角以"数据流"为主：每一段看的是"数据从哪来、被谁加工、送到哪去"。</p>
+
+<dl>
+  <dt>输入</dt>
+  <dd>用户输入文本 / LLM 流式响应 / 外部回调（OAuth、LSP、远程策略）等原始信号</dd>
+  <dt>输出</dt>
+  <dd>结构化的消息列表、持久化的会话记录、解析后的命令树、收集好的附件、加载完成的插件、已认证的 token、已同步的设置</dd>
+</dl>
+
+<pre class="mermaid">
+graph TD
+  user-input["用户输入文本"] --> get-attachments["收集附件 getAttachments"]
+  get-attachments --> create-user-msg["组装用户消息 createUserMessage"]
+  llm-stream["LLM 流式响应"] --> handle-stream-msg["流式消息处理 handleMessageFromStream"]
+  handle-stream-msg --> session-storage["会话落盘 Project.recordTranscript"]
+  bash-cmd["Bash 工具命令"] --> bash-parse["bash 解析 bashParser"]
+  bash-parse --> ast-security["AST 安全审计 parseForSecurity"]
+  plugin-enable["settings.enabledPlugins"] --> load-plugins["加载插件 loadPluginsFromMarketplaces"]
+  load-plugins --> marketplace["拉取市场缓存 marketplaceManager"]
+  oauth-login["登录请求"] --> oauth-flow["OAuth PKCE 流程 OAuthService.startOAuthFlow"]
+  lsp-diag["LSP 诊断通知"] --> lsp-reg["诊断登记 LSPDiagnosticRegistry"]
+  policy-fetch["远程策略拉取"] --> policy-limit["策略限制 isPolicyAllowed"]
+</pre>
+
+<h2>一、消息处理：messages.ts</h2>
+
+<p>这是整个消息层的"中央厨房"。一次对话里产生的所有消息——用户说的、助手回的、工具结果、系统提示、压缩边界、思考块——都在这里被构造、规范化、合并、整形，最后送给 API 或落进会话文件。文件大约 5500 行，但职责可以分成三块：消息工厂（造各类消息）、消息规范化与合并（给 API 送之前整形）、流式消息处理（把 LLM 流式增量变成完整消息）。</p>
+
+<ul>
+  <li><strong>消息工厂</strong>：createUserMessage / createAssistantMessage / createToolResultMessage / createSystemMessage 等一系列 create* 函数，把原始内容封装成带 UUID、时间戳、来源标记的 Message 对象。每个工厂函数都对应一种业务语义，比如 createPermissionRetryMessage 是权限被拒后重试时用的，createCompactBoundaryMessage 是上下文压缩后划"分界线"的。</li>
+  <li><strong>规范化与合并</strong>：normalizeMessagesForAPI 是送给 LLM 前的最后一道整形——剥离工具引用块、重排附件顺序、合并相邻同类消息、把系统提醒包进 system reminder。mergeUserMessagesAndToolResults 处理"用户消息 + 工具结果"在压缩后的合并缝合。reorderMessagesInUI 处理 UI 展示顺序（和 API 顺序不一定一致）。</li>
+  <li><strong>流式处理</strong>：handleMessageFromStream 是流式响应的入口。它接收 SDK 抛过来的 stream_event（content_block_start/delta/stop、message_start/stop），分别更新文本增量、thinking 块、工具使用块；遇到 tombstone（删消息信号）就调 onTombstone 摘除目标消息；遇到完整 assistant 消息就交给 onMessage 入库。这块是"实时显示"和"最终入库"的衔接点。</li>
+</ul>
+
+<pre class="mermaid">
+graph TD
+  stream-event["流式事件 stream_event"] --> stream-dispatch{"事件类型?"}
+  stream-dispatch -->|message_start| set-request-mode["切到 requesting 模式"]
+  stream-dispatch -->|content_block_start| block-type{"块类型?"}
+  block-type -->|text| stream-text["更新文本增量 onStreamingText"]
+  block-type -->|thinking| stream-think["更新思考块 onStreamingThinking"]
+  block-type -->|tool_use| stream-tool["累积工具输入 onStreamingToolUses"]
+  stream-dispatch -->|message_stop| clear-tool["清空流式工具块 切 tool-use 模式"]
+  stream-dispatch -->|tombstone| remove-msg["摘除目标消息 onTombstone"]
+  stream-dispatch -->|完整 assistant| append-msg["入库 onMessage"]
+  append-msg --> clear-stream-text["清空流式文本 避免重复"]
+</pre>
+
+<h2>二、会话存储：sessionStorage.ts</h2>
+
+<p>这个文件是"会话文件的管家"。每一段对话（用户消息、助手回复、工具结果、文件历史快照、归因快照、上下文折叠提交）都要追加写到本地的 transcript 文件（.jsonl 格式）。核心是 Project 类——一个进程内单例，管理当前会话的文件句柄、写队列、刷新定时器、远程 ingress 通道。</p>
+
+<p>数据流上：query 引擎每产生一条消息就调 recordTranscript，Project 把它包成 Entry 排进按文件分组的写队列（writeQueues），每 100ms 批量刷盘一次（scheduleDrain）。flushSessionStorage 会等所有待写都落盘才返回，保证 --resume 时不会丢消息。会话恢复时 buildConversationChain 从文件里读回所有 TranscriptMessage，按 parent UUID 串成链，再处理并行工具结果的孤儿修复、片段保留段的重新链接。</p>
+
+<ul>
+  <li>会话文件路径按"项目目录 + 会话 ID"组织，Agent 子会话有独立子目录（getAgentTranscriptPath）。</li>
+  <li>远程 ingress：当 remoteIngressUrl 设置时，每条 Entry 也会通过 internalEventWriter 发到远端，10ms 间隔批量发送。</li>
+  <li>resum 时会做一致性检查（checkResumeConsistency）：发现 parent 链断裂会尝试修复并行工具结果的错位。</li>
+</ul>
+
+<h2>三、Bash 解析：bashParser.ts 与 ast.ts</h2>
+
+<p>Bash 工具要把用户给的 shell 命令"理解"清楚——不是真去执行，而是解析成 AST，再做安全审计。bashParser.ts 是手写的词法 + 语法分析器（lexer + parser），把一段 shell 文本解析成 tree-sitter 风格的节点树（TsNode）。ast.ts 则在这棵树上做安全语义分析：识别命令、参数、重定向、heredoc、命令替换、变量赋值、算术展开，判断哪些是"已知安全"的、哪些"太复杂无法判断"、哪些有危险特征。</p>
+
+<p>数据流：Bash 工具收到命令字符串 → parseForSecurity 调 parseSource 得到 AST 根 → walkProgram 遍历整棵树 → collectCommands 把命令节点收敛成 SimpleCommand 列表 → checkSemantics 做整体语义校验。审计结果（ParseForSecurityResult）含命令列表、是否安全、被标记的原因，供权限系统决定放行还是拦截。</p>
+
+<ul>
+  <li>解析器有超时预算（checkBudget），复杂到一定程度就放弃并返回"太复杂"。</li>
+  <li>变量作用域有限支持：applyVarToScope 能把已知的变量值代入到简单的 $var 展开，让 audit 更准。</li>
+  <li>heredoc 的 cat 安全提取（extractSafeCatHeredoc）是少数允许"内容已知"的危险场景的特殊处理。</li>
+</ul>
+
+<h2>四、附件收集：attachments.ts</h2>
+
+<p>用户输入一句话，背后要"附带"很多东西送给 LLM：@提及的文件、IDE 选中的代码、计划模式提醒、记忆文件、MCP 资源、Agent 提及、技能发现结果、日期变化提醒等。attachments.ts 就是这些"附带物"的总收集器。getAttachments 是入口，它并行跑若干个 maybe（带超时的子任务），每个返回一组 Attachment，最后合并成一个数组。</p>
+
+<p>这里有个 1 秒硬超时（abortController）——附件收集不能卡住用户提交。超时后已拿到的部分照常送，没拿到的就丢。计划模式、自动模式、记忆文件这类需要"按轮次节流"的附件，有各自的 turn 计数器（getPlanModeAttachmentTurnCount 等）控制多久插一次。附件最终在 messages.ts 的 normalizeAttachmentForAPI 里被整形成 API 能接受的内容块。</p>
+
+<h2>五、插件加载：pluginLoader.ts 与 marketplaceManager.ts</h2>
+
+<p>插件系统的"物流层"。marketplaceManager 负责"市场"——从 git 仓库或 HTTP URL 拉取市场清单（marketplace.json），缓存到本地，支持 sparse checkout 只拉需要的子目录。pluginLoader 负责"插件"——从已注册的市场里按 plugin@marketplace 标识加载具体插件，读 manifest、加载 hooks、合并设置、处理企业策略（allowlist/blocklist fail-closed）。</p>
+
+<p>数据流：启动时 loadAllPlugins（memoize 单例）→ 读 settings.enabledPlugins → loadPluginsFromMarketplaces 按市场分组预加载清单 → 对每个插件做企业策略校验 → loadPluginFromMarketplaceEntry 读 manifest + hooks → assemblePluginLoadResult 汇总。企业策略这里是 fail-closed：如果策略已配置但市场源解析不出来（配置文件损坏），直接拦，不会"静默放行"。</p>
+
+<ul>
+  <li>插件缓存按版本分目录（getVersionedCachePath），支持多版本共存。</li>
+  <li>git clone/pull 有专门的超时和 SSH 检测（isGitHubSshLikelyConfigured）。</li>
+  <li>loadAllPluginsCacheOnly 提供一个"只读缓存"版本，给权限预检用，不会触发网络拉取。</li>
+</ul>
+
+<h2>六、OAuth 登录：oauth/</h2>
+
+<p>用户登录 Claude Code 走的是标准 OAuth 2.0 + PKCE。OAuthService.startOAuthFlow 是主流程：生成 PKCE 的 codeVerifier/challenge 和 state → 启动本地回调监听（AuthCodeListener，占一个 localhost 端口）→ 构造授权 URL（区分自动流和手动流两套）→ 等回调拿 authorization code → exchangeCodeForTokens 换 access/refresh token → fetchProfileInfo 拿订阅类型和限流 tier → 由调用方 installOAuthTokens 落库。</p>
+
+<p>client.ts 是纯协议层：buildAuthUrl、exchangeCodeForTokens、refreshOAuthToken、createAndStoreApiKey。crypto.ts 是 PKCE 工具。auth-code-listener.ts 是本地 HTTP 服务，接回调并校验 state 防 CSRF。token 过期判断（isOAuthTokenExpired）和刷新逻辑也在 client.ts。</p>
+
+<h2>七、埋点分析：analytics/</h2>
+
+<p>埋点系统的多层管道。logEvent（index.ts）是统一入口，事件经 stripProtoFields 脱敏后扇出到所有已注册 sink。两个主要 sink：Datadog（datadog.ts，initializeDatadog 单例）和第一方事件日志（firstPartyEventLogger.ts + firstPartyEventLoggingExporter.ts，OTLP 导出器）。growthbook.ts 是特性开关/AB 实验，提供 checkStatsigFeatureGate_CACHED_MAY_BE_STALE、getFeatureValue 等缓存查询（可能过期，调用方需容忍）。metadata.ts 负责把工具名、MCP 工具细节、技能名等做埋点元数据脱敏。sinkKillswitch.ts 提供运行时关 sink 的开关。</p>
+
+<ul>
+  <li>埋点采样在 firstPartyEventLogger 的 shouldSampleEvent 里决定。</li>
+  <li>growthbook 配置可被环境变量覆盖（hasGrowthBookEnvOverride），方便测试和灰度。</li>
+</ul>
+
+<h2>八、LSP 集成：lsp/</h2>
+
+<p>接语言服务器拿诊断信息（错误、警告），把 IDE 之外的"代码健康"信号也送到上下文里。manager.ts 是进程级单例管理器，initializeLspServerManager 启动、shutdownLspServerManager 关闭。LSPServerManager 管多个 LSPServerInstance（每种语言一个），每个 instance 是一个子进程 + JSON-RPC 通道。LSPClient 是发起请求的客户端封装。LSPDiagnosticRegistry 登记从 LSP 收到的诊断，checkForLSPDiagnostics 取出已就绪的，passiveFeedback.formatDiagnosticsForAttachment 把它们格式化成附件塞进下一轮消息。</p>
+
+<h2>九、策略限制与远程托管设置：policyLimits/ 与 remoteManagedSettings/</h2>
+
+<p>这两个是企业/托管场景的"配置下发"通道。policyLimits 从远端拉策略清单（allow/deny 各类能力，如能否用某类工具、能否用某 beta），isPolicyAllowed 是查询入口。remoteManagedSettings 从远端拉一份完整的 settings.json 覆盖本地设置，带校验和（computeChecksumFromSettings）防篡改，syncCacheState 提供同步缓存让查询不阻塞。两者都有 loadPromise + waitForXxxToLoad 的异步加载模式，以及后台轮询刷新（startBackgroundPolling）。securityCheck.tsx 做托管设置变更时的安全确认 UI。</p>
+
+<h2>十、其余服务（按职责简述）</h2>
+
+<ul>
+  <li><strong>tips/</strong>：tipRegistry 维护可展示的"小贴士"清单，tipScheduler 在 spinner 上选一条最久没展示过的，tipHistory 记录展示历史。</li>
+  <li><strong>AgentSummary/</strong>：startAgentSummarization 给子 Agent 的会话生成摘要，回填给协调者。</li>
+  <li><strong>PromptSuggestion/</strong>：tryGenerateSuggestion 在用户输入时异步生成"补全建议"；speculation.ts 是更激进的"投机预跑"——在用户还没提交时就预先生成可能的响应（startSpeculation/acceptSpeculation/abortSpeculation）。</li>
+  <li><strong>MagicDocs/</strong>：detectMagicDocHeader 识别"魔法文档"头，registerMagicDoc 跟踪文档变更，initMagicDocs 初始化，buildMagicDocsUpdatePrompt 构造文档更新提示。</li>
+  <li><strong>autoDream/</strong>：initAutoDream 启动"自动做梦"——空闲时对会话记忆做整合（executeAutoDream），consolidationLock 防并发，consolidationPrompt 构造整合提示。</li>
+  <li><strong>x402/</strong>：实现 x402 支付协议（createPayment、handlePaymentRequired、wrapFetchWithX402 给 fetch 加自动付费拦截器），用于访问需要付费的 MCP/资源。</li>
+  <li><strong>voice.ts / voiceStreamSTT.ts / voiceKeyterms.ts</strong>：语音输入三件套。voice.ts 管麦克风权限和录音（startRecording/stopRecording），voiceStreamSTT.ts 是流式 STT 连接（connectVoiceStream），voiceKeyterms.ts 从上下文提取关键词辅助识别。</li>
+  <li><strong>hooks.ts</strong>：Hook 系统的总执行器。getMatchingHooks 按事件类型匹配配置的 hook，executePreToolHooks/executePostToolHooks/executeStopHooks 等一系列 execute* 生成器按生命周期事件跑 hook，结果聚合后影响主流程（拦截、改写、通知）。Hook 可以是命令行、HTTP、函数三种形式，输出经 parseHookOutput 解析。</li>
+</ul>
+
+<h2>十一、垫片与原生模块：shims/、native-ts/、outputStyles/、constants/、types/</h2>
+
+<ul>
+  <li><strong>shims/</strong>：bun-bundle.ts（bundle 宏与 feature 开关的运行时垫片）、macro.ts（MACRO 全局）、preload.ts（预加载入口）。体积小，纯运行时适配。</li>
+  <li><strong>native-ts/</strong>：color-diff（颜色差异计算，给 UI 配色用）、file-index（文件索引/检索）、yoga-layout（Flexbox 布局引擎的 TS 移植，给 Ink/TUI 布局用）。这三个是计算密集的纯算法模块，不参与业务数据流。</li>
+  <li><strong>outputStyles/loadOutputStylesDir.ts</strong>：从目录加载自定义输出样式（影响 LLM 响应的展示风格）。</li>
+  <li><strong>constants/</strong>：各类常量——oauth（OAuth 端点/Scope）、outputStyles（样式定义）、prompts（系统提示词片段，916 行）、tools（工具元数据）、files（文件路径约定）等。纯数据，无逻辑。</li>
+  <li><strong>types/</strong>：类型定义集中地（bun-bundle.d.ts 等），无运行时逻辑。</li>
+</ul>
+
+<script>
+window.__sourceMap = {
+  "get-attachments": { "file": "src/utils/attachments.ts", "startLine": 743, "endLine": 812 },
+  "create-user-msg": { "file": "src/utils/messages.ts", "startLine": 460, "endLine": 524 },
+  "handle-stream-msg": { "file": "src/utils/messages.ts", "startLine": 2930, "endLine": 3020 },
+  "session-storage": { "file": "src/utils/sessionStorage.ts", "startLine": 1408, "endLine": 1471 },
+  "bash-parse": { "file": "src/utils/bash/bashParser.ts", "startLine": 610, "endLine": 632 },
+  "ast-security": { "file": "src/utils/bash/ast.ts", "startLine": 381, "endLine": 462 },
+  "load-plugins": { "file": "src/utils/plugins/pluginLoader.ts", "startLine": 1888, "endLine": 1960 },
+  "marketplace": { "file": "src/utils/plugins/marketplaceManager.ts", "startLine": 1433, "endLine": 1530 },
+  "oauth-flow": { "file": "src/services/oauth/index.ts", "startLine": 32, "endLine": 110 },
+  "lsp-reg": { "file": "src/services/lsp/LSPDiagnosticRegistry.ts", "startLine": 65, "endLine": 193 },
+  "policy-limit": { "file": "src/services/policyLimits/index.ts", "startLine": 510, "endLine": 580 },
+  "policy-fetch": { "file": "src/services/policyLimits/index.ts", "startLine": 556, "endLine": 595 },
+  "user-input": { "file": "src/utils/messages.ts", "startLine": 460, "endLine": 475 },
+  "llm-stream": { "file": "src/utils/messages.ts", "startLine": 2930, "endLine": 2949 },
+  "bash-cmd": { "file": "src/utils/bash/bashParser.ts", "startLine": 610, "endLine": 632 },
+  "plugin-enable": { "file": "src/utils/plugins/pluginLoader.ts", "startLine": 3096, "endLine": 3136 },
+  "oauth-login": { "file": "src/services/oauth/index.ts", "startLine": 32, "endLine": 50 },
+  "lsp-diag": { "file": "src/services/lsp/LSPDiagnosticRegistry.ts", "startLine": 12, "endLine": 65 },
+  "stream-event": { "file": "src/utils/messages.ts", "startLine": 2949, "endLine": 3000 },
+  "stream-dispatch": { "file": "src/utils/messages.ts", "startLine": 3000, "endLine": 3020 },
+  "set-request-mode": { "file": "src/utils/messages.ts", "startLine": 2984, "endLine": 2993 },
+  "block-type": { "file": "src/utils/messages.ts", "startLine": 3011, "endLine": 3020 },
+  "stream-text": { "file": "src/utils/messages.ts", "startLine": 3016, "endLine": 3018 },
+  "stream-think": { "file": "src/utils/messages.ts", "startLine": 3012, "endLine": 3015 },
+  "stream-tool": { "file": "src/utils/messages.ts", "startLine": 3018, "endLine": 3020 },
+  "clear-tool": { "file": "src/utils/messages.ts", "startLine": 2995, "endLine": 2999 },
+  "remove-msg": { "file": "src/utils/messages.ts", "startLine": 2954, "endLine": 2958 },
+  "append-msg": { "file": "src/utils/messages.ts", "startLine": 2964, "endLine": 2981 },
+  "clear-stream-text": { "file": "src/utils/messages.ts", "startLine": 2976, "endLine": 2980 }
+};
+</script>
+
+<aside id="source-panel"><div id="source-header"></div><div id="monaco-container"></div></aside>
+<script src="../assets/codeindex-runtime.js"></script>
+<script src="../assets/codeindex.js"></script>
+</body>
+</html>

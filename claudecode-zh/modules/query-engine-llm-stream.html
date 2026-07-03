@@ -1,0 +1,500 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>对话引擎与 LLM 流式调用</title>
+<link rel="stylesheet" href="../assets/codeindex.css">
+</head>
+<body>
+<nav class="topnav"><a href="../index.html">← 返回总览</a></nav>
+<h1>对话引擎与 LLM 流式调用</h1>
+
+<p>这是 Claude Code 里"一次提问到最终回复"的核心通道。用户在 REPL 敲一句提问（或 SDK 调一次 <code>ask</code>），引擎要做的不是简单地转发给模型——它得先把用户输入里的斜杠命令、附件、技能发现都消化掉，再带着完整上下文去调 Claude API；模型流式吐字的同时，引擎边收边解析 token、判断是否要调工具，工具结果要喂回去再调一轮，如此循环直到模型给出最终回复；中途还要处理 thinking、限流重试、模型降级、prompt-too-long/超长输出恢复、上下文压缩、预算和轮数上限。这条链路上任何一步失败都不能让对话"卡死"，必须有明确的退出和上报。</p>
+
+<dl>
+  <dt>输入</dt>
+  <dd>用户的一句提问（文本或带附件的内容块）+ 当前会话历史 + 工具/MCP/技能/权限上下文</dd>
+  <dt>输出</dt>
+  <dd>一条 <code>result</code> 消息（成功/超预算/超轮数/执行错误），附带最终文本、累计 token 用量、成本、模型用量、权限拒绝记录</dd>
+</dl>
+
+<ul>
+  <li>外层 <code>QueryEngine.submitMessage</code> 负责"会话级"事务：拼系统提示、跑用户输入预处理、把 query() 吐出的消息转成 SDK 消息、写 transcript、盯预算/轮数/结构化输出重试上限。</li>
+  <li>内层 <code>query.ts</code> 的 <code>queryLoop</code> 是真正的"模型-工具"循环：<code>while(true)</code> 每轮先压缩上下文，再调模型流式，再决定"收工"还是"跑工具后下一轮"。</li>
+  <li>最底层的 <code>claude.ts:queryModel</code> 负责把请求送进 Anthropic SDK 的流式接口，逐事件解析并攒成 assistant 消息；<code>withRetry</code> 在外层包了重试/降级/限流退避。</li>
+</ul>
+
+<h2>一、整体数据流：从用户提问到 result 消息</h2>
+
+<p>先把全链路串一遍。用户敲完回车后，消息先进 <code>QueryEngine.submitMessage</code> 做会话级准备（系统提示、用户输入处理、transcript 落盘），然后进入 <code>query()</code> 的循环。循环每一轮要么"模型没要工具→收尾返回"，要么"模型要了工具→执行工具→带着结果回到循环顶部"。循环结束后，<code>submitMessage</code> 再做一次结果校验（<code>isResultSuccessful</code>），失败给 <code>error_during_execution</code>，成功给 <code>success</code>。</p>
+
+<pre class="mermaid">
+graph TD
+  user-prompt["用户提问 / SDK ask()"] --> qe-submit["QueryEngine.submitMessage 入口"]
+  qe-submit --> qe-sysprompt["拼系统提示+用户上下文&lt;br/&gt;fetchSystemPromptParts"]
+  qe-sysprompt --> qe-process-input["处理用户输入&lt;br/&gt;processUserInput: 斜杠命令/附件/技能"]
+  qe-process-input --> should-query{"shouldQuery?"}
+  should-query -->|否, 纯本地命令| qe-local-result["yield 本地命令输出 + success result"]
+  should-query -->|是| qe-transcript["用户消息写 transcript&lt;br/&gt;(便于 kill 后 resume)"]
+  qe-transcript --> qe-enter-loop["进入 query() 主循环"]
+  qe-enter-loop --> loop-iter["queryLoop 一轮迭代"]
+  loop-iter --> loop-decision{"模型要工具?"}
+  loop-decision -->|不要, 收尾| qe-post["submitMessage 收尾: isResultSuccessful?"]
+  loop-decision -->|要| loop-tools["执行工具, 收集结果/附件"]
+  loop-tools --> loop-iter
+  qe-post --> qe-success["yield result: success"]
+  qe-post --> qe-ede["yield result: error_during_execution"]
+  qe-local-result --> qe-end["会话结束"]
+  qe-success --> qe-end
+  qe-ede --> qe-end
+</pre>
+
+<h2>二、QueryEngine.submitMessage：会话级编排</h2>
+
+<p><code>submitMessage</code> 是 SDK/REPL 调用的入口（<code>ask</code> 函数只是它的一次性包装）。它不直接调模型，而是把"调模型前的所有准备"和"调模型后的所有收尾"揽下来。关键设计：每个 <code>QueryEngine</code> 实例对应一个会话，<code>mutableMessages</code>、<code>totalUsage</code>、<code>readFileState</code> 跨轮持久；<code>submitMessage</code> 每调一次开一个新 turn。</p>
+
+<p>几个值得说的点：① <code>canUseTool</code> 在这里被包一层，用来偷偷记录权限拒绝（最后塞进 result 给 SDK 上报）。② 用户消息在进 query 循环前就写 transcript——如果用户发完消息几秒后点 Stop，进程被杀，resume 仍能从这条消息恢复，而不是"找不到会话"。③ 进入 <code>query()</code> 的 <code>for await</code> 后，每条 assistant/user/compact_boundary 消息都会 push 到 <code>mutableMessages</code> 并写 transcript；stream_event 用来攒 token 用量和 stop_reason。④ 循环每步都查预算上限和结构化输出重试上限，超了立即 yield 对应 error result 并 return。</p>
+
+<pre class="mermaid">
+graph TD
+  qe-entry["submitMessage(prompt, options)"] --> qe-wrap-can["包装 canUseTool&lt;br/&gt;记录权限拒绝"]
+  qe-wrap-can --> qe-model-pick["确定模型+thinking 配置"]
+  qe-model-pick --> qe-sys["fetchSystemPromptParts&lt;br/&gt;+memory/coordinator 注入"]
+  qe-sys --> qe-ctx["构建 processUserInputContext"]
+  qe-ctx --> qe-orphan{"有孤儿权限?"}
+  qe-orphan -->|是, 仅一次| qe-handle-orphan["handleOrphanedPermission"]
+  qe-handle-orphan --> qe-process
+  qe-orphan -->|否| qe-process["processUserInput&lt;br/&gt;解析斜杠命令/附件"]
+  qe-process --> qe-should{"shouldQuery?"}
+  qe-should -->|否| qe-local["yield 本地命令输出 + success"]
+  qe-should -->|是| qe-persist["recordTranscript 用户消息"]
+  qe-persist --> qe-skills["加载 skills/plugins (cache-only)"]
+  qe-skills --> qe-sysinit["yield system_init 消息"]
+  qe-sysinit --> qe-loop["for await msg of query(...)"]
+  qe-loop --> qe-switch{"message.type"}
+  qe-switch -->|assistant| qe-push-assist["push+yield normalizeMessage"]
+  qe-switch -->|user| qe-push-user["push+yield, turnCount++"]
+  qe-switch -->|stream_event| qe-usage["累积 usage/stop_reason"]
+  qe-switch -->|system| qe-sys-msg["compact_boundary/api_error/snip"]
+  qe-switch -->|attachment| qe-att["max_turns/structured_output/queued"]
+  qe-usage --> qe-budget{"超预算?"}
+  qe-budget -->|是| qe-budget-err["yield error_max_budget_usd, return"]
+  qe-budget -->|否| qe-structured{"结构化输出重试超限?"}
+  qe-structured -->|是| qe-struct-err["yield error_max_structured_output_retries, return"]
+  qe-structured -->|否| qe-loop
+  qe-push-assist --> qe-budget
+  qe-push-user --> qe-budget
+  qe-sys-msg --> qe-budget
+  qe-att --> qe-budget
+  qe-loop --> qe-result["循环结束: isResultSuccessful?"]
+  qe-result -->|失败| qe-ede2["yield error_during_execution&lt;br/&gt;errors 取本 turn 水印后的日志"]
+  qe-result -->|成功| qe-success2["yield success result&lt;br/&gt;含 textResult/usage/cost"]
+</pre>
+
+<h2>三、query() 主循环：模型-工具的 while(true)</h2>
+
+<p>这是引擎的心脏。<code>query()</code> 只是 <code>queryLoop</code> 的薄壳，负责在正常返回时把消费掉的命令 UUID 标记 completed。<code>queryLoop</code> 是一个 <code>while(true)</code>，每一轮干三件事：① 压缩上下文（snip→microcompact→context-collapse→autocompact，四者按序、互不排斥）；② 调模型流式拿 assistant 消息；③ 看模型有没有要工具——不要就走收尾路径（含 prompt-too-long/超长输出恢复、stop hooks、token budget 续写），要就跑工具、收集附件/内存预取/技能预取，拼成下一轮的 messages 继续。</p>
+
+<p>状态在迭代间通过 <code>state: State</code> 对象传递（messages、turnCount、压缩跟踪、恢复计数、上一轮的 transition 原因）。每个 <code>continue</code> 点都显式写一个新的 <code>State</code>，避免散落的赋值。几个恢复路径值得记：① <b>模型降级</b>：流式过程中抛 <code>FallbackTriggeredError</code>，切到 fallbackModel 重试同一请求，并清掉已生成的 assistant 消息（用 tombstone 让 UI 移除）。② <b>prompt-too-long</b>：流式时先把错误"扣留"不吐给上层，收尾时先试 context-collapse 排空，再试 reactive compact，都不行才把错误吐出来并 early return（不进 stop hooks，否则死循环）。③ <b>max_output_tokens</b>：先试把 max_tokens 从默认 8k 升到 64k 重试一次，再试"续写消息"恢复最多 3 次，都耗尽才把扣留的错误吐出来。④ <b>streaming 空响应</b>：流式结束但没拿到 message_start 或没有任何 content block，抛错走非流式 fallback。</p>
+
+<pre class="mermaid">
+graph TD
+  loop-top["while true: 取本轮 state"] --> loop-prefetch["启动 skill/memory 预取(异步)"]
+  loop-prefetch --> loop-compact["压缩链: snip→microcompact→contextCollapse→autocompact"]
+  loop-compact --> loop-block{"达到 blocking limit?&lt;br/&gt;(autoCompact 关时)"}
+  loop-block -->|是| loop-block-err["yield prompt-too-long 错误, return blocking_limit"]
+  loop-block -->|否| loop-callmodel["callModel 流式调用&lt;br/&gt;(含 fallback 重试内层循环)"]
+  loop-callmodel --> loop-stream["逐事件收 assistant 消息&lt;br/&gt;streaming 工具可并行执行"]
+  loop-stream --> loop-abort{"流式被中断?"}
+  loop-abort -->|是| loop-abort-handle["补齐工具结果/synthetic tool_result&lt;br/&gt;yield 中断消息, return aborted_streaming"]
+  loop-abort -->|否| loop-followup{"needsFollowUp?&lt;br/&gt;(出现 tool_use 块)"}
+  loop-followup -->|否, 收尾| loop-recover["错误扣留恢复检查"]
+  loop-recover --> loop-ptl{"扣留了 prompt-too-long?"}
+  loop-ptl -->|是| loop-collapse-drain["context-collapse 排空重试"]
+  loop-collapse-drain --> loop-reactive{"reactive compact?"}
+  loop-ptl -->|否| loop-maxout{"扣留了 max_output_tokens?"}
+  loop-maxout -->|是| loop-escalate["升 max_tokens 到 64k 重试"]
+  loop-escalate --> loop-resume-msg["发续写消息重试(最多3次)"]
+  loop-resume-msg --> loop-surface{"恢复耗尽?"}
+  loop-surface -->|是| loop-yield-err["yield 扣留的错误, early return"]
+  loop-surface -->|否| loop-stop
+  loop-reactive -->|成功| loop-compact-retry["用压缩后消息重试本轮"]
+  loop-reactive -->|失败| loop-yield-err
+  loop-maxout -->|否| loop-api-err{"是 API 错误?"}
+  loop-api-err -->|是| loop-fail-hooks["executeStopFailureHooks, return completed"]
+  loop-api-err -->|否| loop-stop["handleStopHooks"]
+  loop-stop --> loop-stop-block{"stop hook 阻塞?"}
+  loop-stop-block -->|是| loop-stop-retry["注入阻塞错误重试本轮"]
+  loop-stop-block -->|否| loop-budget{"token budget 续写?"}
+  loop-budget -->|是| loop-budget-cont["注入 nudge 续写重试"]
+  loop-budget -->|否| loop-done["return completed"]
+  loop-followup -->|是| loop-tools["执行剩余工具 runTools/getRemainingResults"]
+  loop-tools --> loop-abort2{"工具执行中被中断?"}
+  loop-abort2 -->|是| loop-abort-tools["yield 中断, 检查 maxTurns, return aborted_tools"]
+  loop-abort2 -->|否| loop-attach["收集附件: queued命令/memory预取/skill预取"]
+  loop-attach --> loop-maxturns{"超 maxTurns?"}
+  loop-maxturns -->|是| loop-maxturns-yield["yield max_turns_reached, return"]
+  loop-maxturns -->|否| loop-next["state = 下一轮 messages, continue"]
+  loop-next --> loop-top
+  loop-compact-retry --> loop-top
+  loop-stop-retry --> loop-top
+  loop-resume-msg --> loop-top
+  loop-budget-cont --> loop-top
+</pre>
+
+<h2>四、流式解析：claude.ts queryModel</h2>
+
+<p><code>queryModelWithStreaming</code> 经 <code>withStreamingVCR</code> 包装后调 <code>queryModel</code>。<code>queryModel</code> 干两件事：① 构造请求参数（model 解析、beta 头、tool schema、tool search 过滤、prompt caching、cached microcompact、advisor、task_budget 等），② 用 <code>withRetry</code> 拿到一个 <code>Stream</code>，然后 <code>for await</code> 逐事件解析。</p>
+
+<p>流式事件的处理是状态机式的：<code>message_start</code> 建 partialMessage 和初始 usage；<code>content_block_start</code> 按 block 类型（text/thinking/tool_use/server_tool_use/advisor_tool_result）初始化一个可变 block；<code>content_block_delta</code> 把 text/thinking/input_json/signature 增量累加进对应 block；<code>content_block_stop</code> 把 block 封装成一条 AssistantMessage yield 出去（所以一条 assistant 消息可能被拆成多条 yield，每个 content block 一条）；<code>message_delta</code> 把最终 usage 和 stop_reason 写回最后一条已 yield 的消息（直接 mutate，不替换对象，因为 transcript 写队列还持有引用），并在这里算成本、检测 max_tokens/context_window_exceeded 并 yield 对应错误；<code>message_stop</code> 收尾。</p>
+
+<p>健壮性方面有两个看门狗：① <b>stream idle watchdog</b>——若 N 毫秒（默认 90s）没收到任何 chunk，主动 abort 流并转非流式 fallback；② <b>stall 检测</b>——chunk 间隔超 30s 记录但不中断。流结束后还会校验"是否真的拿到了 message_start 且至少有一个 content block 或 stop_reason"，否则视为代理返回了空响应，抛错走非流式 fallback。</p>
+
+<pre class="mermaid">
+graph TD
+  qm-entry["queryModel(messages, ...)"] --> qm-offswitch{"off-switch 激活?&lt;br/&gt;(非订阅+Opus)"}
+  qm-offswitch -->|是| qm-off-err["yield off-switch 错误, return"]
+  qm-offswitch -->|否| qm-params["构造参数: betas/toolSchema/toolSearch/caching/advisor"]
+  qm-params --> qm-normalize["normalizeMessagesForAPI"]
+  qm-normalize --> qm-retry["withRetry 拿 Stream"]
+  qm-retry --> qm-watchdog["启动 stream idle watchdog(90s)"]
+  qm-watchdog --> qm-forawait["for await part of stream"]
+  qm-forawait --> qm-reset["resetStreamIdleTimer"]
+  qm-reset --> qm-switch{"part.type"}
+  qm-switch -->|message_start| qm-ms["partialMessage=part.message&lt;br/&gt;ttftMs/usage"]
+  qm-switch -->|content_block_start| qm-cbs["按类型初始化可变 block"]
+  qm-switch -->|content_block_delta| qm-cbd["累加 text/thinking/json/signature"]
+  qm-switch -->|content_block_stop| qm-cbstop["封 AssistantMessage yield"]
+  qm-switch -->|message_delta| qm-md["写回 usage/stop_reason&lt;br/&gt;算成本/检测 max_tokens"]
+  qm-switch -->|message_stop| qm-mstop["空操作"]
+  qm-ms --> qm-yield-evt["yield stream_event 给上层"]
+  qm-cbs --> qm-yield-evt
+  qm-cbd --> qm-yield-evt
+  qm-cbstop --> qm-yield-evt
+  qm-md --> qm-yield-evt
+  qm-mstop --> qm-yield-evt
+  qm-yield-evt --> qm-forawait
+  qm-forawait -->|流结束| qm-idle-abort{"watchdog 触发?"}
+  qm-idle-abort -->|是| qm-idle-throw["抛 idle timeout, 走非流式 fallback"]
+  qm-idle-abort -->|否| qm-empty{"空响应?"}
+  qm-empty -->|是| qm-empty-throw["抛 'no events', 走非流式 fallback"]
+  qm-empty -->|否| qm-done["流式正常结束"]
+  qm-md --> qm-maxtokens{"stop_reason=max_tokens?"}
+  qm-maxtokens -->|是| qm-maxtokens-err["yield max_output_tokens 错误消息"]
+  qm-maxtokens -->|否| qm-refusal{"refusal?"}
+  qm-refusal -->|是| qm-refusal-err["yield refusal 错误"]
+  qm-refusal -->|否| qm-yield-evt
+</pre>
+
+<h2>五、重试与降级：withRetry</h2>
+
+<p><code>withRetry</code> 是请求级别的重试外壳，包在 <code>anthropic.beta.messages.create(stream:true)</code> 外面。默认最多 10 次重试，529（容量过载）最多 3 次连续。重试决策：① 529 在非前台来源上直接放弃（避免级联放大）；② 529 连续 3 次且配了 fallbackModel，抛 <code>FallbackTriggeredError</code> 让上层切模型；③ <code>shouldRetry</code> 判断错误是否可重试（限流、网关 5xx 等）；④ max_tokens 上下文溢出错误会调 <code>parseMaxTokensContextOverflowError</code> 算出可用空间，调小下轮的 max_tokens 继续；⑤ persistent retry 模式针对 429/529 长退避（最高 5 分钟，封顶 6 小时），期间每 30s yield 一次 <code>api_retry</code> 系统消息让上层/用户知道在等。</p>
+
+<p>退避时长优先用服务端的 <code>retry-after</code> 头，否则指数退避（500ms × 2^n，封顶 32s）。每次重试前都会 yield 一条 <code>SystemAPIErrorMessage</code>，这条消息在 <code>QueryEngine.submitMessage</code> 里被转成 <code>api_retry</code> SDK 消息吐给前端。客户端实例在鉴权错误后会重新获取，stale connection（ECONNRESET/EPIPE）会关 keep-alive 重试。</p>
+
+<pre class="mermaid">
+graph TD
+  wr-entry["withRetry(getClient, operation)"] --> wr-loop["for attempt 1..maxRetries+1"]
+  wr-loop --> wr-client["getClient (鉴权错后重建)"]
+  wr-client --> wr-op["operation(anthropic, attempt)"]
+  wr-op --> wr-ok{"成功?"}
+  wr-ok -->|是| wr-return["return Stream/结果"]
+  wr-ok -->|否| wr-err["捕获 error"]
+  wr-err --> wr-529-bg{"529 且非前台?"}
+  wr-529-bg -->|是| wr-cannot["throw CannotRetryError"]
+  wr-529-bg -->|否| wr-529-count{"529 连续≥3 且有 fallback?"}
+  wr-529-count -->|是| wr-fallback["throw FallbackTriggeredError"]
+  wr-529-count -->|否| wr-retry-able{"shouldRetry?"}
+  wr-retry-able -->|否| wr-cannot
+  wr-retry-able -->|是| wr-overflow{"max_tokens 溢出错误?"}
+  wr-overflow -->|是| wr-adjust["调小 maxTokensOverride, continue"]
+  wr-overflow -->|否| wr-delay["算退避: retry-after 或指数退避"]
+  wr-delay --> wr-yield["yield SystemAPIErrorMessage&lt;br/&gt;(api_retry 系统消息)"]
+  wr-yield --> wr-sleep["sleep delayMs (可被 abort)"]
+  wr-sleep --> wr-persistent{"persistent 模式?"}
+  wr-persistent -->|是, attempt 满| wr-clamp["attempt 钳回 maxRetries, 继续"]
+  wr-persistent -->|否, attempt 满| wr-cannot-final["throw CannotRetryError"]
+  wr-clamp --> wr-loop
+  wr-adjust --> wr-loop
+  wr-sleep --> wr-loop
+</pre>
+
+<h2>六、工具执行循环</h2>
+
+<p>当模型在流式响应里产出 <code>tool_use</code> 块，<code>queryLoop</code> 标记 <code>needsFollowUp=true</code>。工具执行有两条路：① <b>StreamingToolExecutor</b>——在模型还在流式吐字时就把已确定的 tool_use 块丢进去并行跑（仅并发安全的只读工具），<code>getCompletedResults</code> 在流式循环里边收边 yield；流结束后 <code>getRemainingResults</code> 收尾。② <b>runTools</b>——流式执行器关闭时的串行/并发批量执行：<code>partitionToolCalls</code> 把工具分批，并发安全批次用 <code>runToolsConcurrently</code>，写操作批次用 <code>runToolsSerially</code>。每条工具结果作为 user 消息（含 tool_result 块）push 进 toolResults，下一轮作为 messages 喂回模型。</p>
+
+<p>权限在这里实打实落地：<code>canUseTool</code>（在 submitMessage 里被包了一层记拒绝）会被调用，决定 allow/deny/ask；deny 的工具会产生一个 tool_result 带 <code>tool_use_error</code>，模型下一轮会看到。中断处理：流式/工具执行中若 abort 信号触发，executor 会为已排队但没跑完的工具生成 synthetic tool_result（避免 tool_use 没有 tool_result 配对导致 API 400）。</p>
+
+<pre class="mermaid">
+graph TD
+  te-stream{"启用 streaming 工具执行?"}
+  te-stream -->|是| te-se["new StreamingToolExecutor"]
+  te-stream -->|否| te-runtools["runTools (串/并批)"]
+  te-se --> te-add["流式中: addTool 每个 tool_use 块"]
+  te-add --> te-completed["getCompletedResults: 边收边 yield"]
+  te-completed --> te-remaining["流结束后: getRemainingResults"]
+  te-runtools --> te-partition["partitionToolCalls 分批"]
+  te-partition --> te-batch{"批次类型?"}
+  te-batch -->|并发安全| te-concurrent["runToolsConcurrently"]
+  te-batch -->|写操作| te-serial["runToolsSerially"]
+  te-concurrent --> te-perm["canUseTool 权限检查"]
+  te-serial --> te-perm
+  te-perm --> te-allow{"allow?"}
+  te-allow -->|是| te-exec["执行工具, 产 tool_result"]
+  te-allow -->|否/deny| te-deny["产 tool_use_error 结果"]
+  te-exec --> te-push["toolResults push user 消息"]
+  te-deny --> te-push
+  te-remaining --> te-push
+  te-push --> te-abort{"abort 信号?"}
+  te-abort -->|是| te-synthetic["synthetic tool_result 补齐&lt;br/&gt;避免 tool_use 无配对"]
+  te-abort -->|否| te-next["回 queryLoop 拼下一轮"]
+  te-synthetic --> te-next
+</pre>
+
+<h2>七、上下文压缩链</h2>
+
+<p>压缩不是单一机制，而是四道工序按固定顺序在每轮循环顶部跑，互不排斥（前道释放的 token 会让后道变成 no-op）：① <b>snip</b>（HISTORY_SNIP 特性门）——移除"僵尸"消息和过期标记，SDK 长会话用来限制内存增长。② <b>microcompact</b>——按 tool_use_id 替换大块 tool_result 内容（图片/长输出）为占位符，可基于时间或缓存编辑；cached MC 会延迟 boundary 消息到 API 响应后，用真实的 <code>cache_deleted_input_tokens</code>。③ <b>context-collapse</b>——把历史段落折叠成粒度摘要（读时投影，不删原始消息），溢出时 <code>recoverFromOverflow</code> 排空已暂存的折叠。④ <b>autocompact</b>——阈值触发（上下文接近窗口上限时）跑一次完整的 forked-agent 摘要，把整段历史压成一条 summary 消息 + 附件，产出 compact_boundary。autocompact 有熔断器：连续失败 N 次后停止重试。</p>
+
+<p>除了这四个"主动"压缩，还有 <b>reactive compact</b>——在模型流式返回 prompt-too-long 或媒体过大错误时才触发（错误在流式阶段被扣留，收尾时试一次压缩后重试本轮）。所有压缩成功后都会 yield post-compact 消息（summary + 附件 + hook 结果），并把 <code>messagesForQuery</code> 替换成压缩后数组，下一轮从压缩后的上下文继续。task_budget 在压缩时会扣减压缩前的最终上下文 token 数。</p>
+
+<pre class="mermaid">
+graph TD
+  compact-entry["每轮循环顶部"] --> snip{"HISTORY_SNIP?"}
+  snip -->|是| snip-run["snipCompactIfNeeded&lt;br/&gt;移除僵尸消息/过期标记"]
+  snip -->|否| mc
+  snip-run --> mc["microcompactMessages&lt;br/&gt;替换大 tool_result 为占位"]
+  mc --> cc{"CONTEXT_COLLAPSE?"}
+  cc -->|是| cc-run["applyCollapsesIfNeeded&lt;br/&gt;折叠历史段落"]
+  cc -->|否| ac
+  cc-run --> ac["autoCompactIfNeeded&lt;br/&gt;超阈值时跑完整摘要"]
+  ac --> ac-result{"压缩成功?"}
+  ac-result -->|是| ac-yield["yield post-compact 消息&lt;br/&gt;替换 messagesForQuery"]
+  ac-result -->|否, 熔断| ac-skip["跳过, 用原消息继续"]
+  ac-result -->|否, 可重试| ac-track["记 consecutiveFailures"]
+  ac-yield --> main["进主流程调模型"]
+  ac-skip --> main
+  ac-track --> main
+  main --> reactive{"流式返回 PTL/媒体错?"}
+  reactive -->|是| reactive-try["收尾时试 reactive compact"]
+  reactive-try --> reactive-ok{"成功?"}
+  reactive-ok -->|是| reactive-retry["用压缩后消息重试本轮"]
+  reactive-ok -->|否| reactive-surface["yield 扣留错误, early return"]
+  reactive -->|否| done["正常收尾"]
+</pre>
+
+<h2>八、token / 成本计数</h2>
+
+<p>token 和成本的累积点在 <code>claude.ts:queryModel</code> 的 <code>message_delta</code> 分支：每次拿到带 usage 的 message_delta，先 <code>updateUsage</code> 攒本条消息的 usage，再 <code>calculateUSDCost</code> 算这条消息的美元成本，调 <code>addToTotalSessionCost</code> 加进会话总账。<code>QueryEngine.submitMessage</code> 在 stream_event 的 message_start/message_delta/message_stop 上分别 <code>updateUsage</code> / <code>accumulateUsage</code>，把每条消息的 usage 累加进 <code>totalUsage</code>，最终塞进 result 消息。<code>cost-tracker.ts</code> 维护按模型拆分的用量（input/output/cacheRead/cacheCreation/webSearch/costUSD），并暴露 <code>getTotalCost</code>/<code>getModelUsage</code> 给 result 和预算检查用。</p>
+
+<p>token 估算（<code>tokenEstimation.ts</code>）用于压缩阈值判断和阻塞限制检查：在不调 API 的前提下用 <code>roughTokenCountEstimationForMessages</code> 估一个粗略值（按字节/类型换算），autocompact 的 <code>shouldAutoCompact</code> 和 queryLoop 顶部的 blocking limit 检查都靠它。注意：snip 释放的 token 数要显式从估算里减掉（<code>snipTokensFreed</code>），否则 snip 已经把上下文压到阈值以下、但 stale 的 usage 还显示超阈值，会误触发阻塞。</p>
+
+<pre class="mermaid">
+graph TD
+  md["claude.ts: message_delta 事件"] --> upd-usage["updateUsage 攒本条 usage"]
+  upd-usage --> calc-cost["calculateUSDCost(model, usage)"]
+  calc-cost --> add-cost["addToTotalSessionCost&lt;br/&gt;按模型累加 cost-tracker"]
+  add-cost --> adv-usage["advisor 用量也递归计入"]
+  qe-start["QueryEngine: message_start/delta/stop"] --> qe-upd["updateUsage/accumulateUsage"]
+  qe-upd --> qe-total["totalUsage 累计"]
+  qe-total --> result["result 消息: usage + total_cost_usd + modelUsage"]
+  add-cost --> budget-check["queryLoop: 预算检查&lt;br/&gt;getTotalCost &gt;= maxBudgetUsd?"]
+  budget-check -->|超| budget-err["yield error_max_budget_usd"]
+  te-est["tokenEstimation: 粗估 messages token"] --> ac-threshold["autocompact 阈值判断"]
+  te-est --> block-check["blocking limit 检查&lt;br/&gt;(autoCompact 关时)"]
+  snip-freed["snipTokensFreed"] --> ac-threshold
+  snip-freed --> block-check
+</pre>
+
+<ul>
+  <li><b>状态机视角</b>：queryLoop 的 <code>state.transition.reason</code>（next_turn / collapse_drain_retry / reactive_compact_retry / max_output_tokens_escalate / max_output_tokens_recovery / stop_hook_blocking / token_budget_continuation）是一个隐式状态机——每个 continue 点都带一个 reason，便于测试断言"哪条恢复路径被触发了"。</li>
+  <li><b>权限视角</b>：canUseTool 在 submitMessage 被包一层记拒绝；工具执行时实调；deny 不抛错而是产 tool_use_error 让模型看到；权限上下文（allowedTools、additionalWorkingDirectories）在用户输入处理后更新到 AppState。</li>
+  <li><b>生命周期视角</b>：QueryEngine 一会话一实例，state 跨 turn 持久；submitMessage 一 turn 一次；queryLoop 一轮一次 state；withRetry 一请求多次 attempt；流式一请求一 stream。中断信号（abortController）贯穿全层，每层都有自己的 abort 处理（流式补 synthetic 结果、工具补 synthetic 结果、stop hooks 跳过）。</li>
+  <li><b>转录持久化</b>：用户消息进 query 前就写 transcript（防 kill 后 resume 失败）；assistant 消息 fire-and-forget 写（避免阻塞 message_delta）；compact_boundary 前先 flush 保留段尾部；result yield 前在 cowork/eager 模式下强制 flush。</li>
+  <li><b>非流式 fallback</b>：流式空响应、idle 超时、代理返回非 SSE 体等都会触发 <code>executeNonStreamingRequest</code>——用 <code>messages.create(stream:false)</code> 重试，超时默认 300s（remote 120s），结果再走相同的 usage/cost 累积路径。</li>
+</ul>
+
+<script>
+window.__sourceMap = {
+  "user-prompt": { "file": "src/QueryEngine.ts", "startLine": 1186, "endLine": 1295 },
+  "qe-submit": { "file": "src/QueryEngine.ts", "startLine": 209, "endLine": 236 },
+  "qe-sysprompt": { "file": "src/QueryEngine.ts", "startLine": 284, "endLine": 325 },
+  "qe-process-input": { "file": "src/QueryEngine.ts", "startLine": 410, "endLine": 428 },
+  "should-query": { "file": "src/QueryEngine.ts", "startLine": 556, "endLine": 639 },
+  "qe-local-result": { "file": "src/QueryEngine.ts", "startLine": 618, "endLine": 638 },
+  "qe-transcript": { "file": "src/QueryEngine.ts", "startLine": 450, "endLine": 463 },
+  "qe-enter-loop": { "file": "src/QueryEngine.ts", "startLine": 675, "endLine": 686 },
+  "qe-post": { "file": "src/QueryEngine.ts", "startLine": 1058, "endLine": 1082 },
+  "qe-success": { "file": "src/QueryEngine.ts", "startLine": 1135, "endLine": 1155 },
+  "qe-ede": { "file": "src/QueryEngine.ts", "startLine": 1083, "endLine": 1117 },
+  "qe-end": { "file": "src/QueryEngine.ts", "startLine": 1156, "endLine": 1156 },
+  "loop-iter": { "file": "src/query.ts", "startLine": 307, "endLine": 321 },
+  "loop-decision": { "file": "src/query.ts", "startLine": 1062, "endLine": 1062 },
+  "loop-tools": { "file": "src/query.ts", "startLine": 1360, "endLine": 1408 },
+  "qe-wrap-can": { "file": "src/QueryEngine.ts", "startLine": 244, "endLine": 271 },
+  "qe-model-pick": { "file": "src/QueryEngine.ts", "startLine": 274, "endLine": 282 },
+  "qe-sys": { "file": "src/QueryEngine.ts", "startLine": 284, "endLine": 325 },
+  "qe-ctx": { "file": "src/QueryEngine.ts", "startLine": 335, "endLine": 395 },
+  "qe-orphan": { "file": "src/QueryEngine.ts", "startLine": 397, "endLine": 408 },
+  "qe-handle-orphan": { "file": "src/QueryEngine.ts", "startLine": 400, "endLine": 407 },
+  "qe-process": { "file": "src/QueryEngine.ts", "startLine": 410, "endLine": 428 },
+  "qe-should": { "file": "src/QueryEngine.ts", "startLine": 556, "endLine": 639 },
+  "qe-local": { "file": "src/QueryEngine.ts", "startLine": 560, "endLine": 638 },
+  "qe-persist": { "file": "src/QueryEngine.ts", "startLine": 450, "endLine": 463 },
+  "qe-skills": { "file": "src/QueryEngine.ts", "startLine": 534, "endLine": 538 },
+  "qe-sysinit": { "file": "src/QueryEngine.ts", "startLine": 540, "endLine": 551 },
+  "qe-loop": { "file": "src/QueryEngine.ts", "startLine": 675, "endLine": 1049 },
+  "qe-switch": { "file": "src/QueryEngine.ts", "startLine": 757, "endLine": 969 },
+  "qe-push-assist": { "file": "src/QueryEngine.ts", "startLine": 761, "endLine": 770 },
+  "qe-push-user": { "file": "src/QueryEngine.ts", "startLine": 784, "endLine": 787 },
+  "qe-usage": { "file": "src/QueryEngine.ts", "startLine": 788, "endLine": 828 },
+  "qe-sys-msg": { "file": "src/QueryEngine.ts", "startLine": 897, "endLine": 958 },
+  "qe-att": { "file": "src/QueryEngine.ts", "startLine": 829, "endLine": 893 },
+  "qe-budget": { "file": "src/QueryEngine.ts", "startLine": 972, "endLine": 1002 },
+  "qe-budget-err": { "file": "src/QueryEngine.ts", "startLine": 981, "endLine": 1001 },
+  "qe-structured": { "file": "src/QueryEngine.ts", "startLine": 1004, "endLine": 1048 },
+  "qe-struct-err": { "file": "src/QueryEngine.ts", "startLine": 1024, "endLine": 1046 },
+  "qe-result": { "file": "src/QueryEngine.ts", "startLine": 1058, "endLine": 1082 },
+  "qe-ede2": { "file": "src/QueryEngine.ts", "startLine": 1083, "endLine": 1117 },
+  "qe-success2": { "file": "src/QueryEngine.ts", "startLine": 1135, "endLine": 1155 },
+  "loop-top": { "file": "src/query.ts", "startLine": 307, "endLine": 321 },
+  "loop-prefetch": { "file": "src/query.ts", "startLine": 331, "endLine": 335 },
+  "loop-compact": { "file": "src/query.ts", "startLine": 396, "endLine": 543 },
+  "loop-block": { "file": "src/query.ts", "startLine": 628, "endLine": 648 },
+  "loop-block-err": { "file": "src/query.ts", "startLine": 642, "endLine": 647 },
+  "loop-callmodel": { "file": "src/query.ts", "startLine": 654, "endLine": 708 },
+  "loop-stream": { "file": "src/query.ts", "startLine": 712, "endLine": 863 },
+  "loop-abort": { "file": "src/query.ts", "startLine": 1015, "endLine": 1052 },
+  "loop-abort-handle": { "file": "src/query.ts", "startLine": 1015, "endLine": 1052 },
+  "loop-followup": { "file": "src/query.ts", "startLine": 1062, "endLine": 1062 },
+  "loop-recover": { "file": "src/query.ts", "startLine": 1062, "endLine": 1256 },
+  "loop-ptl": { "file": "src/query.ts", "startLine": 1085, "endLine": 1118 },
+  "loop-collapse-drain": { "file": "src/query.ts", "startLine": 1089, "endLine": 1117 },
+  "loop-reactive": { "file": "src/query.ts", "startLine": 1119, "endLine": 1183 },
+  "loop-maxout": { "file": "src/query.ts", "startLine": 1188, "endLine": 1256 },
+  "loop-escalate": { "file": "src/query.ts", "startLine": 1199, "endLine": 1221 },
+  "loop-resume-msg": { "file": "src/query.ts", "startLine": 1223, "endLine": 1252 },
+  "loop-surface": { "file": "src/query.ts", "startLine": 1254, "endLine": 1256 },
+  "loop-yield-err": { "file": "src/query.ts", "startLine": 1173, "endLine": 1175 },
+  "loop-compact-retry": { "file": "src/query.ts", "startLine": 1152, "endLine": 1165 },
+  "loop-stop": { "file": "src/query.ts", "startLine": 1267, "endLine": 1276 },
+  "loop-stop-block": { "file": "src/query.ts", "startLine": 1278, "endLine": 1306 },
+  "loop-stop-retry": { "file": "src/query.ts", "startLine": 1283, "endLine": 1305 },
+  "loop-budget": { "file": "src/query.ts", "startLine": 1308, "endLine": 1355 },
+  "loop-budget-cont": { "file": "src/query.ts", "startLine": 1321, "endLine": 1340 },
+  "loop-done": { "file": "src/query.ts", "startLine": 1357, "endLine": 1357 },
+  "loop-tools": { "file": "src/query.ts", "startLine": 1360, "endLine": 1408 },
+  "loop-abort2": { "file": "src/query.ts", "startLine": 1485, "endLine": 1516 },
+  "loop-abort-tools": { "file": "src/query.ts", "startLine": 1501, "endLine": 1515 },
+  "loop-attach": { "file": "src/query.ts", "startLine": 1580, "endLine": 1628 },
+  "loop-maxturns": { "file": "src/query.ts", "startLine": 1704, "endLine": 1712 },
+  "loop-maxturns-yield": { "file": "src/query.ts", "startLine": 1706, "endLine": 1711 },
+  "loop-next": { "file": "src/query.ts", "startLine": 1715, "endLine": 1727 },
+  "qm-entry": { "file": "src/services/api/claude.ts", "startLine": 1017, "endLine": 1027 },
+  "qm-offswitch": { "file": "src/services/api/claude.ts", "startLine": 1031, "endLine": 1048 },
+  "qm-off-err": { "file": "src/services/api/claude.ts", "startLine": 1044, "endLine": 1048 },
+  "qm-params": { "file": "src/services/api/claude.ts", "startLine": 1064, "endLine": 1296 },
+  "qm-normalize": { "file": "src/services/api/claude.ts", "startLine": 1265, "endLine": 1267 },
+  "qm-retry": { "file": "src/services/api/claude.ts", "startLine": 1778, "endLine": 1846 },
+  "qm-watchdog": { "file": "src/services/api/claude.ts", "startLine": 1874, "endLine": 1929 },
+  "qm-forawait": { "file": "src/services/api/claude.ts", "startLine": 1940, "endLine": 1940 },
+  "qm-reset": { "file": "src/services/api/claude.ts", "startLine": 1941, "endLine": 1941 },
+  "qm-switch": { "file": "src/services/api/claude.ts", "startLine": 1979, "endLine": 2297 },
+  "qm-ms": { "file": "src/services/api/claude.ts", "startLine": 1980, "endLine": 1993 },
+  "qm-cbs": { "file": "src/services/api/claude.ts", "startLine": 1995, "endLine": 2052 },
+  "qm-cbd": { "file": "src/services/api/claude.ts", "startLine": 2053, "endLine": 2170 },
+  "qm-cbstop": { "file": "src/services/api/claude.ts", "startLine": 2171, "endLine": 2212 },
+  "qm-md": { "file": "src/services/api/claude.ts", "startLine": 2213, "endLine": 2294 },
+  "qm-mstop": { "file": "src/services/api/claude.ts", "startLine": 2295, "endLine": 2296 },
+  "qm-yield-evt": { "file": "src/services/api/claude.ts", "startLine": 2299, "endLine": 2304 },
+  "qm-idle-abort": { "file": "src/services/api/claude.ts", "startLine": 2310, "endLine": 2335 },
+  "qm-idle-throw": { "file": "src/services/api/claude.ts", "startLine": 2334, "endLine": 2334 },
+  "qm-empty": { "file": "src/services/api/claude.ts", "startLine": 2350, "endLine": 2364 },
+  "qm-empty-throw": { "file": "src/services/api/claude.ts", "startLine": 2363, "endLine": 2363 },
+  "qm-done": { "file": "src/services/api/claude.ts", "startLine": 2377, "endLine": 2400 },
+  "qm-maxtokens": { "file": "src/services/api/claude.ts", "startLine": 2266, "endLine": 2292 },
+  "qm-maxtokens-err": { "file": "src/services/api/claude.ts", "startLine": 2270, "endLine": 2291 },
+  "qm-refusal": { "file": "src/services/api/claude.ts", "startLine": 2258, "endLine": 2264 },
+  "qm-refusal-err": { "file": "src/services/api/claude.ts", "startLine": 2263, "endLine": 2263 },
+  "wr-entry": { "file": "src/services/api/withRetry.ts", "startLine": 170, "endLine": 189 },
+  "wr-loop": { "file": "src/services/api/withRetry.ts", "startLine": 189, "endLine": 253 },
+  "wr-client": { "file": "src/services/api/withRetry.ts", "startLine": 212, "endLine": 252 },
+  "wr-op": { "file": "src/services/api/withRetry.ts", "startLine": 253, "endLine": 253 },
+  "wr-ok": { "file": "src/services/api/withRetry.ts", "startLine": 253, "endLine": 253 },
+  "wr-return": { "file": "src/services/api/withRetry.ts", "startLine": 253, "endLine": 256 },
+  "wr-err": { "file": "src/services/api/withRetry.ts", "startLine": 254, "endLine": 256 },
+  "wr-529-bg": { "file": "src/services/api/withRetry.ts", "startLine": 318, "endLine": 324 },
+  "wr-cannot": { "file": "src/services/api/withRetry.ts", "startLine": 323, "endLine": 323 },
+  "wr-529-count": { "file": "src/services/api/withRetry.ts", "startLine": 327, "endLine": 365 },
+  "wr-fallback": { "file": "src/services/api/withRetry.ts", "startLine": 347, "endLine": 350 },
+  "wr-retry-able": { "file": "src/services/api/withRetry.ts", "startLine": 367, "endLine": 382 },
+  "wr-overflow": { "file": "src/services/api/withRetry.ts", "startLine": 388, "endLine": 427 },
+  "wr-adjust": { "file": "src/services/api/withRetry.ts", "startLine": 416, "endLine": 425 },
+  "wr-delay": { "file": "src/services/api/withRetry.ts", "startLine": 431, "endLine": 463 },
+  "wr-yield": { "file": "src/services/api/withRetry.ts", "startLine": 493, "endLine": 512 },
+  "wr-sleep": { "file": "src/services/api/withRetry.ts", "startLine": 501, "endLine": 511 },
+  "wr-persistent": { "file": "src/services/api/withRetry.ts", "startLine": 477, "endLine": 513 },
+  "wr-clamp": { "file": "src/services/api/withRetry.ts", "startLine": 504, "endLine": 506 },
+  "wr-cannot-final": { "file": "src/services/api/withRetry.ts", "startLine": 370, "endLine": 371 },
+  "te-stream": { "file": "src/query.ts", "startLine": 561, "endLine": 568 },
+  "te-se": { "file": "src/query.ts", "startLine": 563, "endLine": 568 },
+  "te-runtools": { "file": "src/services/tools/toolOrchestration.ts", "startLine": 19, "endLine": 82 },
+  "te-add": { "file": "src/query.ts", "startLine": 841, "endLine": 843 },
+  "te-completed": { "file": "src/query.ts", "startLine": 851, "endLine": 862 },
+  "te-remaining": { "file": "src/query.ts", "startLine": 1380, "endLine": 1381 },
+  "te-partition": { "file": "src/services/tools/toolOrchestration.ts", "startLine": 26, "endLine": 26 },
+  "te-batch": { "file": "src/services/tools/toolOrchestration.ts", "startLine": 30, "endLine": 30 },
+  "te-concurrent": { "file": "src/services/tools/toolOrchestration.ts", "startLine": 36, "endLine": 53 },
+  "te-serial": { "file": "src/services/tools/toolOrchestration.ts", "startLine": 66, "endLine": 79 },
+  "te-perm": { "file": "src/QueryEngine.ts", "startLine": 244, "endLine": 271 },
+  "te-allow": { "file": "src/QueryEngine.ts", "startLine": 262, "endLine": 262 },
+  "te-exec": { "file": "src/services/tools/toolOrchestration.ts", "startLine": 36, "endLine": 79 },
+  "te-deny": { "file": "src/QueryEngine.ts", "startLine": 263, "endLine": 267 },
+  "te-push": { "file": "src/query.ts", "startLine": 1395, "endLine": 1400 },
+  "te-abort": { "file": "src/query.ts", "startLine": 1485, "endLine": 1485 },
+  "te-synthetic": { "file": "src/query.ts", "startLine": 1019, "endLine": 1023 },
+  "te-next": { "file": "src/query.ts", "startLine": 1715, "endLine": 1727 },
+  "compact-entry": { "file": "src/query.ts", "startLine": 396, "endLine": 543 },
+  "snip": { "file": "src/query.ts", "startLine": 401, "endLine": 410 },
+  "snip-run": { "file": "src/query.ts", "startLine": 403, "endLine": 405 },
+  "mc": { "file": "src/query.ts", "startLine": 414, "endLine": 426 },
+  "cc": { "file": "src/query.ts", "startLine": 440, "endLine": 447 },
+  "cc-run": { "file": "src/query.ts", "startLine": 441, "endLine": 446 },
+  "ac": { "file": "src/query.ts", "startLine": 454, "endLine": 468 },
+  "ac-result": { "file": "src/query.ts", "startLine": 470, "endLine": 543 },
+  "ac-yield": { "file": "src/query.ts", "startLine": 528, "endLine": 535 },
+  "ac-skip": { "file": "src/query.ts", "startLine": 536, "endLine": 543 },
+  "ac-track": { "file": "src/services/compact/autoCompact.ts", "startLine": 334, "endLine": 345 },
+  "main": { "file": "src/query.ts", "startLine": 654, "endLine": 708 },
+  "reactive": { "file": "src/query.ts", "startLine": 1085, "endLine": 1183 },
+  "reactive-try": { "file": "src/query.ts", "startLine": 1119, "endLine": 1132 },
+  "reactive-ok": { "file": "src/query.ts", "startLine": 1134, "endLine": 1166 },
+  "reactive-retry": { "file": "src/query.ts", "startLine": 1148, "endLine": 1165 },
+  "reactive-surface": { "file": "src/query.ts", "startLine": 1173, "endLine": 1175 },
+  "done": { "file": "src/query.ts", "startLine": 1357, "endLine": 1357 },
+  "md": { "file": "src/services/api/claude.ts", "startLine": 2213, "endLine": 2294 },
+  "upd-usage": { "file": "src/services/api/claude.ts", "startLine": 2214, "endLine": 2214 },
+  "calc-cost": { "file": "src/services/api/claude.ts", "startLine": 2251, "endLine": 2251 },
+  "add-cost": { "file": "src/services/api/claude.ts", "startLine": 2252, "endLine": 2256 },
+  "adv-usage": { "file": "src/cost-tracker.ts", "startLine": 316, "endLine": 333 },
+  "qe-start": { "file": "src/QueryEngine.ts", "startLine": 788, "endLine": 816 },
+  "qe-upd": { "file": "src/QueryEngine.ts", "startLine": 789, "endLine": 815 },
+  "qe-total": { "file": "src/QueryEngine.ts", "startLine": 812, "endLine": 815 },
+  "result": { "file": "src/QueryEngine.ts", "startLine": 1135, "endLine": 1155 },
+  "budget-check": { "file": "src/query.ts", "startLine": 972, "endLine": 1002 },
+  "budget-err": { "file": "src/QueryEngine.ts", "startLine": 981, "endLine": 1001 },
+  "te-est": { "file": "src/services/tokenEstimation.ts", "startLine": 327, "endLine": 340 },
+  "ac-threshold": { "file": "src/services/compact/autoCompact.ts", "startLine": 160, "endLine": 240 },
+  "block-check": { "file": "src/query.ts", "startLine": 637, "endLine": 647 },
+  "snip-freed": { "file": "src/query.ts", "startLine": 400, "endLine": 405 },
+  "qe-entry": { "file": "src/QueryEngine.ts", "startLine": 230, "endLine": 243 },
+  "loop-api-err": { "file": "src/query.ts", "startLine": 1257, "endLine": 1258 },
+  "loop-fail-hooks": { "file": "src/query.ts", "startLine": 1259, "endLine": 1266 }
+};
+</script>
+
+<aside id="source-panel"><div id="source-header"></div><div id="monaco-container"></div></aside>
+<script src="../assets/codeindex-runtime.js"></script>
+<script src="../assets/codeindex.js"></script>
+</body>
+</html>

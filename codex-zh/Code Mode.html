@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>代码模式(code-mode)</title>
+<link rel="stylesheet" href="assets/codeindex.css">
+</head>
+<body>
+<p><a href="index.html">← Back to overview</a></p>
+<h1>代码模式(code-mode)</h1>
+
+<p>代码模式是 codex 给模型提供的一个"会写代码的子大脑"。普通聊天里,模型只能一次调一个工具(shell、读文件、MCP…),拿到结果再想下一步。代码模式下,模型改调一个叫 <code>exec</code> 的工具,把一段 JavaScript 源码丢进去;这段 JS 在一个独立的 V8 沙箱里跑,沙箱里全局挂着 <code>tools</code> 对象——里面就是模型本来能用的那些工具。于是模型可以在 JS 里循环、判断、拼装、并行调多个工具、存中间变量,像写脚本一样把活儿干完,再把累积的文本/图片输出吐回给模型。</p>
+
+<p>从用户视角看:用户在 IDE/编辑器里用 codex 时,代码模式并不需要用户额外点按钮。它对用户透明——是给模型的一种"增强工具调用"能力。当模型判断"这事儿得组合好几个工具、有逻辑分支"时,它就调 <code>exec</code> 写段 JS;脚本可能很快跑完(一次性返回结果),也可能跑得久——这时 <code>exec</code> 会先"让出(yield)"一段中间输出,模型接着调 <code>wait</code> 工具继续拉取后续输出,直到脚本结束。用户看到的就是模型在干活、在汇报,只是背后是 JS 在编排。</p>
+
+<p>这套能力由三个 crate 协作实现(本模块只讲这三个 crate 内部的数据流):</p>
+<ul>
+<li><strong>code-mode-protocol</strong>(协议层):定义跨边界的数据类型和 trait——<code>ExecuteRequest</code>/<code>WaitRequest</code>、<code>RuntimeResponse</code>、<code>CodeModeSession</code>/<code>CodeModeSessionProvider</code>/<code>CodeModeSessionDelegate</code> trait,以及工具描述生成(<code>build_exec_tool_description</code> 把 enabled_tools 渲染成给模型看的 JS 声明)。纯数据/契约,无运行时逻辑。</li>
+<li><strong>code-mode</strong>(核心实现):<code>CodeModeService</code> 实现 <code>CodeModeSession</code>,管 cell(一次 exec 调用 = 一个 cell)生命周期;内部 <code>CellActor</code> 是个 tokio 异步 actor,负责"V8 线程"和"宿主回调"之间的编排;<code>runtime</code> 子模块在独立 OS 线程上跑 V8 isolate,安装全局函数、执行 JS 模块、把 JS 里的工具调用通过 channel 传回 actor。</li>
+<li><strong>code-mode-host</strong>(宿主二进制):目前只有一个空 <code>main.rs</code>(<code>fn main(){}</code>)。是为未来"远程宿主进程"预留的占位——协议里 <code>CodeModeSessionProvider</code> 的注释说实现可以跨进程共享一个远程 host。当前实际使用的 provider 是 <code>InProcessCodeModeSessionProvider</code>(在 code-mode crate 里),即 cell 就在 codex 本进程内跑。</li>
+</ul>
+
+<p>边界说明(这些文件不在本模块 scope,但数据流要经过):codex 主进程(<code>core</code> crate)的 <code>tools/code_mode/execute_handler.rs</code> 是 <code>exec</code> 工具的入口,它调 <code>parse_exec_source</code> 解析源码、构造 <code>ExecuteRequest</code>、调 <code>CodeModeSession::execute</code>;<code>tools/code_mode/wait_handler.rs</code> 处理 <code>wait</code> 工具;<code>tools/code_mode/delegate.rs</code> 里的 <code>CodeModeDispatchBroker</code> 实现 <code>CodeModeSessionDelegate</code>,把 code-mode 运行时发来的嵌套工具调用(<code>invoke_tool</code>)派发给真实的 codex 工具(shell、MCP、读文件等)执行。也就是说:JS 沙箱里的 <code>tools.foo()</code> → 运行时 <code>RuntimeEvent::ToolCall</code> → cell actor → <code>ServiceCellHost::invoke_tool</code> → <code>delegate.invoke_tool</code> → core 的真实工具 → 结果原路返回 → <code>resolve_tool_response</code> 把结果塞回 JS 的 Promise。这就是代码模式最核心的通信边界。</p>
+
+<h2>数据流:一次 exec 调用从进入到结束</h2>
+
+<p>下面这张图把 JS 源码进入沙箱、沙箱里调工具回宿主、输出让出与最终结束、以及终止/错误路径都画了出来。节点标签用大白话,源码位置见文末 sourceMap。</p>
+
+<pre class="mermaid">
+graph TD
+    A["模型调 exec 工具,丢进 JS 源码"] --> B{"parse_exec_source 解析首行 pragma"}
+    B -->|"pragma 非法/空"| B1["返回错误给模型,流程结束"]
+    B -->|"成功或无 pragma"| C["组装 ExecuteRequest(源码+工具表+yield_time)"]
+    C --> D["CodeModeService::execute 分配 cell_id"]
+    D --> E["start_cell: 建 CellActor 并登记到 cells 表"]
+    E -->|"已在 shutting_down 或 cell_id 重复"| E1["返回错误给模型"]
+    E -->|"正常"| F["CellActor::prepare: 建 channel + spawn V8 线程"]
+    F --> G["spawn_runtime: 初始化 V8 平台 + 建 isolate"]
+    G -->|"ICU/V8 初始化失败"| G1["send_result 发错误结果,运行时结束"]
+    G -->|"成功"| H["install_globals: 装 tools/text/image/store/load/notify/setTimeout/exit/yield_control"]
+    H --> I["evaluate_main_module: 编译并执行 JS 模块"]
+    I -->|"编译/实例化抛异常"| G1
+    I -->|"JS 同步跑完或 exit()"| X["RuntimeResponse::Result 返回最终结果"]
+    I -->|"JS 返回 Promise(异步)"| J{"JS 运行中:在调啥?"}
+    J -->|"调 tools.xxx"| K["tool_callback: 建 PromiseResolver,发 ToolCall 事件"]
+    K --> L["CellActor 收 ToolCall → spawn_tool"]
+    L --> M["ServiceCellHost::invoke_tool → delegate.invoke_tool 回 core 跑真工具"]
+    M --> N["工具结果回传 RuntimeCommand::ToolResponse/ToolError"]
+    N --> O["resolve_tool_response: resolve/reject JS Promise"]
+    O --> J
+    J -->|"调 text/image/notify"| P["发 ContentItem/Notify 事件,actor 累积输出"]
+    J -->|"调 yield_control 或 yield 超时"| Q["CellEvent::Yielded:把累积输出让给模型"]
+    P --> Q
+    Q --> R["RuntimeResponse::Yielded 作为 exec 本次返回"]
+    R --> S{"脚本还在跑?"}
+    S -->|"是,模型再调 wait(cell_id)"| T["CodeModeService::wait → CellHandle::observe"]
+    T --> Q
+    S -->|"否,脚本自然结束"| V["RuntimeEvent::Result:提交 stored_value_writes + error_text"]
+    V --> W["CellEvent::Completed"]
+    W --> X
+    X --> Y["host.closed: 从 cells 表移除 + delegate.cell_closed 通知宿主清理"]
+    S -->|"模型要求终止 wait(terminate)/shutdown"| Z["begin_termination: cancel token + isolate.terminate_execution"]
+    Z --> AA["V8 强制中断,收尾未完成回调"]
+    AA --> BB["CellEvent::Terminated"]
+    BB --> CC["RuntimeResponse::Terminated 返回"]
+    CC --> Y
+    S -->|"wait 时 cell 不存在"| DD["WaitOutcome::MissingCell:返回 not found 结果"]
+    S -->|"运行时线程意外退出"| V2["Completed 带错误文本 'runtime ended unexpectedly'"]
+    V2 --> Y
+    DD --> Y
+</pre>
+
+<h2>模块拆解(一句话)</h2>
+
+<dl>
+<dt>code-mode-protocol / description.rs</dt>
+<dd>把"模型能用的工具表"变成"给模型看的 exec 工具描述 + TS 声明"。输入:enabled_tools 工具定义;输出:拼好的工具描述字符串(含 <code>declare const tools: {...}</code>)。还负责 <code>parse_exec_source</code> 解析首行 <code>// @exec: {...}</code> pragma,以及把 JSON Schema 渲染成 TypeScript 类型供模型理解工具入参/出参。</dd>
+<dt>code-mode-protocol / session.rs + runtime.rs + response.rs</dt>
+<dd>定义跨边界的契约类型。输入/输出都是业务语义:<code>ExecuteRequest</code>=一次"跑这段JS"的请求;<code>RuntimeResponse::Yielded/Terminated/Result</code>=运行时让出/被终止/最终结果;<code>CodeModeSession</code> trait=会话能 execute/wait/terminate/shutdown;<code>CodeModeSessionDelegate</code> trait=宿主必须提供 invoke_tool/notify/cell_closed 三个回调。</dd>
+<dt>code-mode / service.rs(CodeModeService)</dt>
+<dd>把外部请求变成 cell 生命周期管理。输入:ExecuteRequest/WaitRequest;输出:StartedCell/WaitOutcome。维护 stored_values(跨 cell 共享的键值存储,JS 里 store/load)、cells 表(cell_id → CellHandle)、shutting_down 标志。ServiceCellHost 是 CellHost trait 实现,把 cell actor 的回调桥接到 CodeModeSessionDelegate。</dd>
+<dt>code-mode / cell_actor(CellActor + run_cell)</dt>
+<dd>一次 exec 的"导演"。输入:CellRequest + host;输出:CellHandle + CellEvent 流。它是个 tokio select 循环,同时盯着四路:命令通道(observe/terminate)、yield 超时、运行时事件(Started/Pending/ContentItem/YieldRequested/ToolCall/Notify/Result)、后台任务(notification/tool JoinSet)。按 ObserveMode 决定何时把累积输出吐给观察者:YieldAfter=超时就吐,PendingFrontier=运行时暂停在 pending 边界时吐。这是整条链的状态机核心。</dd>
+<dt>code-mode / runtime(mod.rs + globals + callbacks + module_loader + timers + value)</dt>
+<dd>在独立 OS 线程里跑 V8 isolate 执行 JS。输入:JS 源码 + 工具表 + stored_values;输出:RuntimeEvent 流。globals 装全局函数(删掉 console/Atomics/WebAssembly 等危险全局);callbacks 是每个全局函数的 V8 回调(tool/text/image/store/load/notify/setTimeout/yield_control/exit);module_loader 编译 ES 模块、检查 Promise 完成状态、resolve 工具 Promise;timers 用独立线程实现 setTimeout;value 做 V8↔JSON 序列化和图片输出归一化(禁止 http(s) 远程图,只收 data: URI)。</dd>
+<dt>code-mode-host / main.rs</dt>
+<dd>占位空 main,为未来远程宿主进程预留。</dd>
+</dl>
+
+<h2>关键状态机与边界标注</h2>
+
+<ul>
+<li><strong>cell 生命周期状态机</strong>(cell_actor/mod.rs 的 run_cell):一个 cell 依次经历:Running(有 observer 在等)→ 要么 Yielded(让出后等下次 wait)→ ... → Completed/Terminated。observer 同一时刻只能有一个(第二个 observe 直接 Busy);terminate 优先级最高,会 cancel token + terminate_execution 强拆 V8。completed_event 会被 buffer,如果当下没 observer 就存着,等下一个 observe 直接发。</li>
+<li><strong>运行时暂停模式</strong>(runtime/mod.rs next_runtime_command):PauseUntilResumed 模式下,JS 跑到 pending(没结果也没工具调用挂起)时会发 RuntimeEvent::Pending 并阻塞等控制命令——Continue=放行到下一条 RuntimeCommand,Resume=继续转圈看有没有新事件,Terminate=强退。这是给"模型想看 JS 跑到哪了"的 PendingFrontier 观察模式用的。</li>
+<li><strong>通信边界 1:V8 线程 ↔ cell actor</strong>(runtime/mod.rs):用 std::mpsc(RuntimeCommand/RuntimeControlCommand 进,V8 线程收)和 tokio mpsc(RuntimeEvent 出,actor 收)。V8 线程是同步阻塞线程,actor 是 tokio task,两边靠 channel 解耦。</li>
+<li><strong>通信边界 2:cell actor ↔ CodeModeService</strong>(cell_actor/types.rs CellHandle):CellHandle 持 mpsc::UnboundedSender&lt;CellCommand&gt;,observe/terminate/shutdown 都是通过发命令给 actor,actor 处理后通过 oneshot 回送 CellEvent。</li>
+<li><strong>通信边界 3:code-mode ↔ core 宿主</strong>(service.rs ServiceCellHost + protocol CodeModeSessionDelegate):JS 里每调一次 tools.foo,链路最终走到 delegate.invoke_tool,delegate 在 core 里实现(CodeModeDispatchBroker),把调用派发给真实工具执行器,结果原路返回。这是"沙箱内 JS"和"真实系统能力"之间唯一的桥。</li>
+<li><strong>安全边界</strong>(runtime/globals.rs + value.rs):删掉 console/Atomics/SharedArrayBuffer/WebAssembly 全局;禁止远程图片 URL(只收 data: URI);动态 import 直接抛 "Unsupported import";store 只接受可 JSON 序列化的值。沙箱无 Node、无 fs、无网络。</li>
+</ul>
+
+<script>
+window.__sourceMap = {
+  "A": {"file":"codex-rs/code-mode-protocol/src/lib.rs","startLine":44,"endLine":46},
+  "B": {"file":"codex-rs/code-mode-protocol/src/description.rs","startLine":163,"endLine":245},
+  "B1": {"file":"codex-rs/code-mode-protocol/src/description.rs","startLine":163,"endLine":168},
+  "C": {"file":"codex-rs/code-mode-protocol/src/runtime.rs","startLine":16,"endLine":22},
+  "D": {"file":"codex-rs/code-mode/src/service.rs","startLine":130,"endLine":151},
+  "E": {"file":"codex-rs/code-mode/src/service.rs","startLine":166,"endLine":194},
+  "E1": {"file":"codex-rs/code-mode/src/service.rs","startLine":178,"endLine":183},
+  "F": {"file":"codex-rs/code-mode/src/cell_actor/mod.rs","startLine":46,"endLine":88},
+  "G": {"file":"codex-rs/code-mode/src/runtime/mod.rs","startLine":68,"endLine":115},
+  "G1": {"file":"codex-rs/code-mode/src/runtime/mod.rs","startLine":147,"endLine":161},
+  "H": {"file":"codex-rs/code-mode/src/runtime/globals.rs","startLine":14,"endLine":47},
+  "I": {"file":"codex-rs/code-mode/src/runtime/module_loader.rs","startLine":9,"endLine":52},
+  "J": {"file":"codex-rs/code-mode/src/runtime/mod.rs","startLine":224,"endLine":272},
+  "K": {"file":"codex-rs/code-mode/src/runtime/callbacks.rs","startLine":13,"endLine":72},
+  "L": {"file":"codex-rs/code-mode/src/cell_actor/callbacks.rs","startLine":31,"endLine":46},
+  "M": {"file":"codex-rs/code-mode/src/service.rs","startLine":318,"endLine":342},
+  "N": {"file":"codex-rs/code-mode/src/runtime/mod.rs","startLine":229,"endLine":244},
+  "O": {"file":"codex-rs/code-mode/src/runtime/module_loader.rs","startLine":66,"endLine":101},
+  "P": {"file":"codex-rs/code-mode/src/runtime/callbacks.rs","startLine":74,"endLine":97},
+  "Q": {"file":"codex-rs/code-mode/src/cell_actor/mod.rs","startLine":220,"endLine":227},
+  "R": {"file":"codex-rs/code-mode/src/service.rs","startLine":422,"endLine":444},
+  "S": {"file":"codex-rs/code-mode-protocol/src/runtime.rs","startLine":65,"endLine":80},
+  "T": {"file":"codex-rs/code-mode-protocol/src/runtime.rs","startLine":25,"endLine":28},
+  "U": {"file":"codex-rs/code-mode/src/service.rs","startLine":196,"endLine":218},
+  "V": {"file":"codex-rs/code-mode/src/runtime/mod.rs","startLine":342,"endLine":379},
+  "W": {"file":"codex-rs/code-mode/src/cell_actor/mod.rs","startLine":361,"endLine":378},
+  "X": {"file":"codex-rs/code-mode/src/service.rs","startLine":428,"endLine":435},
+  "Y": {"file":"codex-rs/code-mode/src/service.rs","startLine":364,"endLine":367},
+  "Z": {"file":"codex-rs/code-mode/src/service.rs","startLine":220,"endLine":226},
+  "AA": {"file":"codex-rs/code-mode/src/cell_actor/mod.rs","startLine":462,"endLine":472},
+  "BB": {"file":"codex-rs/code-mode/src/cell_actor/mod.rs","startLine":352,"endLine":359},
+  "CC": {"file":"codex-rs/code-mode/src/service.rs","startLine":436,"endLine":439},
+  "DD": {"file":"codex-rs/code-mode/src/service.rs","startLine":477,"endLine":479},
+  "V2": {"file":"codex-rs/code-mode/src/cell_actor/mod.rs","startLine":253,"endLine":272}
+}
+</script>
+
+<aside id="source-panel"><div id="source-header"></div><div id="monaco-container"></div></aside>
+<script src="assets/codeindex-runtime.js"></script>
+<script src="assets/codeindex.js"></script>
+</body>
+</html>

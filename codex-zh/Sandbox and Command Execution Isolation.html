@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>沙箱与命令执行隔离</title>
+<link rel="stylesheet" href="assets/codeindex.css">
+</head>
+<body>
+<p><a href="index.html">← Back to overview</a></p>
+<h1>沙箱与命令执行隔离</h1>
+
+<p>Codex 要在用户机器上跑模型生成的命令、改文件。这套代码负责三件事:<strong>把命令包进沙箱</strong>(限制它能读/写哪些目录、能不能联网)、<strong>判断命令该不该自动放行</strong>(策略引擎 + 危险命令启发式)、<strong>用一个独立的服务器实际执行命令和文件操作</strong>(exec-server,本地或远程均可)。整体目标:模型说"跑 <code>rm -rf /</code>"时,系统能挡住;模型说"跑 <code>npm test</code>"时,系统能在受限环境里安全跑起来。</p>
+
+<p>触发时机:模型在 turn 中产出一个 shell 命令或文件编辑动作 → codex-core 先用 execpolicy / shell-command 做策略裁决(allow / prompt / forbidden)→ 用户批准后 → SandboxManager 把命令 + 权限配置转成平台原生的沙箱启动参数 → exec-server 接收 SandboxExecRequest,在沙箱内 spawn 进程或读写文件 → 输出流回传给 codex-core。</p>
+
+<h2>核心数据流:从模型命令到沙箱执行</h2>
+
+<p>下面这张图是一条完整的命令执行链路,从 codex-core 拿到模型命令开始,到 exec-server 在沙箱里 spawn 进程、回传输出为止。跨平台分支(macOS seatbelt / Linux bwrap+seccomp / Windows restricted token)用菱形决策展开。</p>
+
+<pre class="mermaid">
+graph TD
+    cmd-in["codex-core 收到模型生成的命令"] --> parse-cmd
+    parse-cmd["shell-command: 解析 shell 脚本/PowerShell 为 token 列表"] --> safety-check
+    safety-check{"command_safety: 是已知安全命令?还是危险命令?"}
+    safety-check -->|"已知安全"| policy-check
+    safety-check -->|"疑似危险"| deny-or-prompt
+    safety-check -->|"无法判定"| policy-check
+    deny-or-prompt["标记为 forbidden/prompt,交给审批流"] --> flow-end-deny
+    flow-end-deny[("流程结束:被拒绝或等审批")]
+    policy-check{"execpolicy: Starlark 规则匹配命令前缀"}
+    policy-check -->|"Allow"| sandbox-prep
+    policy-check -->|"Prompt"| ask-user
+    policy-check -->|"Forbidden"| flow-end-deny
+    ask-user["向用户请求批准"] --> sandbox-prep
+    sandbox-prep["SandboxManager.transform: 命令 + PermissionProfile 转成 SandboxExecRequest"] --> plat-decide
+    plat-decide{"当前平台?"}
+    plat-decide -->|"macOS"| seatbelt-gen
+    plat-decide -->|"Linux"| linux-sandbox-gen
+    plat-decide -->|"Windows"| win-sandbox-gen
+    plat-decide -->|"无需沙箱"| exec-req
+    seatbelt-gen["seatbelt.rs: 生成 .sbpl 策略 + sandbox-exec 包装"] --> exec-req
+    linux-sandbox-gen["landlock.rs: 生成 codex-linux-sandbox 参数"] --> bwrap-or-legacy
+    bwrap-or-legacy{"linux_run_main: 用 bubblewrap 还是 legacy landlock?"}
+    bwrap-or-legacy -->|"默认 bwrap"| bwrap-stage
+    bwrap-stage["bwrap 建独立 mount namespace 再重新进入 helper 加 seccomp"] --> linux-exec-inner
+    bwrap-or-legacy -->|"legacy landlock"| landlock-direct
+    landlock-direct["apply_permission_profile: no_new_privs + seccomp + landlock FS"] --> linux-exec-inner
+    linux-exec-inner["execvp 真正的用户命令"] --> exec-req
+    win-sandbox-gen["Windows restricted token: 降权 token + ACL + WFP 网络过滤"] --> exec-req
+    exec-req["SandboxExecRequest 发到 exec-server"] --> exec-server-spawn
+    exec-server-spawn["local_process.rs: spawn 进程,启动输出流转发"] --> output-stream
+    output-stream["stdout/stderr/exit 流 通过 JSON-RPC 通知回客户端"] --> flow-end-done
+    flow-end-done[("流程结束:输出回传 codex-core")]
+</pre>
+
+<h2>文件系统沙箱执行流(exec-server 内部)</h2>
+
+<p>exec-server 不只跑命令,还代行文件读写。文件操作也要走沙箱,但机制不同:它把 codex 自身当 helper 二进制,用 <code>codex-fs-helper</code> 模式重新启动自己,套上沙箱后通过 stdin/stdout 收发 JSON 请求。下面是文件系统沙箱的数据流。</p>
+
+<pre class="mermaid">
+graph TD
+    fs-req["客户端发 fs/readFile / fs/writeFile 等 JSON-RPC"] --> fs-handler
+    fs-handler{"server/file_system_handler: 需要平台沙箱?"}
+    fs-handler -->|"是"| sandboxed-fs
+    fs-handler -->|"否,本地直读"| local-fs
+    local-fs["local_file_system.rs: 直接 std::fs 操作"] --> fs-resp
+    sandboxed-fs["sandboxed_file_system.rs: 包装请求为 FsHelperRequest"] --> fs-sandbox-runner
+    fs-sandbox-runner["fs_sandbox.rs: 取 PermissionProfile + cwd 调 SandboxManager.transform"] --> fs-spawn-helper
+    fs-spawn-helper["spawn codex 自身 当 helper,套 seatbelt/bwrap/win-token"] --> fs-stdin
+    fs-stdin["把 FsHelperRequest JSON 写进 helper stdin"] --> fs-helper-main
+    fs-helper-main["fs_helper_main.rs: helper 进程入口,读 stdin 执行文件操作 写回 JSON"] --> fs-resp
+    fs-resp["FsHelperPayload 结果回传客户端"] --> flow-fs-end
+    flow-fs-end[("文件操作完成")]
+</pre>
+
+<h2>命令策略裁决状态机(execpolicy)</h2>
+
+<p>execpolicy 是一个 Starlark DSL 引擎,用户写 <code>prefix_rule(pattern=["git","commit"], decision="allow")</code> 这样的规则。Policy.check() 把命令 token 列表喂给规则,匹配到的前缀规则产出 Decision(Allow / Prompt / Forbidden)。多条规则命中时取最严格(Forbidden 大于 Prompt 大于 Allow)。没匹配到规则就走启发式 fallback(由 shell-command 的安全检测提供)。</p>
+
+<pre class="mermaid">
+graph TD
+    cmd-tokens["命令 token 列表,如 git commit -m"] --> exact-match
+    exact-match{"按首 token 查 rules_by_program"}
+    exact-match -->|"命中"| prefix-match
+    exact-match -->|"未命中"| host-exe-match
+    host-exe-match{"首 token 是绝对路径?查 host_executables"}
+    host-exe-match -->|"命中 basename 规则"| prefix-match
+    host-exe-match -->|"未命中"| heuristic
+    prefix-match{"PrefixPattern.matches_prefix: 逐 token 匹配"}
+    prefix-match -->|"匹配"| collect-decision
+    prefix-match -->|"不匹配"| heuristic
+    heuristic["shell-command: is_known_safe / command_might_be_dangerous"] --> collect-decision
+    collect-decision["取所有命中规则的 Decision 最大值"] --> eval-out
+    eval-out[("Evaluation: decision + matchedRules")]
+</pre>
+
+<h2>模块清单</h2>
+
+<dl>
+<dt>sandboxing(跨平台沙箱管理器)</dt>
+<dd>把"模型要跑的命令 + 权限配置"变成"平台原生的沙箱启动参数"。输入 SandboxCommand + PermissionProfile,输出 SandboxExecRequest。macOS 走 seatbelt(sandbox-exec + .sbpl 策略),Linux 走 codex-linux-sandbox(bwrap + seccomp),Windows 走 restricted token。还负责合并 additional permissions、MITM CA 可读根、proxy 网络策略等细节。</dd>
+<dt>linux-sandbox(Linux 沙箱 helper)</dt>
+<dd>codex-linux-sandbox 二进制的实现。run_main 解析 CLI 参数(--permission-profile JSON、--sandbox-policy-cwd 等),默认走 bubblewrap 建 mount namespace + 文件系统视图,再重新进入自身加 seccomp + no_new_privs,最后 execvp 用户命令。legacy landlock 是备选路径。还含 proxy_routing(在 netns 里搭代理桥)和 bwrap 参数构造(bwrap.rs 2708 行)。</dd>
+<dt>windows-sandbox-rs(Windows 沙箱)</dt>
+<dd>Windows 平台的受限 token 沙箱。用降权 token + ACL(allow/deny read/write)+ WFP 网络过滤 + ConPTY + 桌面隔离实现。含 setup(创建沙箱用户、防火墙)、spawn_prep(命令准备)、unified_exec(统一执行后端:elevated / legacy)。规模约 17k 行,跨平台差异最大。</dd>
+<dt>execpolicy(命令策略引擎)</dt>
+<dd>Starlark DSL 解析器 + 前缀规则匹配器。用户用 prefix_rule / network_rule / host_executable 定义策略;Policy.check() 对命令做前缀匹配,产出 Allow/Prompt/Forbidden。amend 模块支持运行时追加规则(带文件锁,去重)。parser.rs 用 starlark 库执行 DSL。</dd>
+<dt>execpolicy-legacy(旧版命令策略)</dt>
+<dd>execpolicy 的前身,基于自定义策略文件 + execv_checker 做命令校验。保留用于兼容旧配置。</dd>
+<dt>shell-command(命令解析与安全检测)</dt>
+<dd>把 shell 脚本(bash -lc)/PowerShell 命令解析成 token 列表(ParsedCommand)。command_safety 模块用启发式判断命令是否"已知安全"(is_known_safe_command,白名单)或"疑似危险"(command_might_be_dangerous,黑名单 + rm -rf 检测)。作为 execpolicy 未命中规则时的 fallback。</dd>
+<dt>shell-escalation(Unix exec 拦截)</dt>
+<dd>通过 patched shell(execve_wrapper)拦截子进程的 exec() 调用,把 EscalateRequest(file/argv/env)发给 escalate_server。服务器根据策略决定 Run(直接跑)/Escalate(提升权限或换沙箱配置重跑)/Deny。用于在沙箱内跑的命令尝试调用外部程序时做二次审批。</dd>
+<dt>exec-server(命令/文件执行服务器)</dt>
+<dd>独立 JSON-RPC 服务器,负责实际的进程启动和文件操作。protocol.rs 定义全部方法(process/start、process/read、fs/readFile 等)。server 模块(processor → handler → registry)路由请求;local_process.rs 用 pty/pipe spawn 进程并流式回传输出;fs_sandbox.rs 把文件操作套上沙箱(重启 codex 自身当 helper);client.rs 是客户端实现。支持本地(stdio)和远程(WebSocket + Noise 加密中继)两种模式。</dd>
+<dt>bwrap(bundled bubblewrap)</dt>
+<dd>打包的 bubblewrap 二进制入口,Linux 上当系统没有 bwrap 时用这个。</dd>
+<dt>process-hardening(进程加固)</dt>
+<dd>pre-main 阶段(ctor)执行的加固:禁 core dump(setrlimit RLIMIT_CORE=0)、禁 ptrace attach(Linux prctl PR_SET_DUMPABLE=0 / macOS PT_DENY_ATTACH)、清 LD_PRELOAD / DYLD_* 等危险环境变量。防止进程被调试或库注入劫持。</dd>
+</dl>
+
+<h2>关键边界与通信</h2>
+
+<ul>
+<li><strong>codex-core 与 exec-server</strong>:JSON-RPC over stdio(本地)或 WebSocket + Noise(远程)。先 initialize 握手,再 initialized 通知,最后用 process/* 和 fs/* 方法。进程输出通过 process/output 通知流式回传,进程结束发 process/exited + process/closed。</li>
+<li><strong>SandboxManager 与平台沙箱</strong>:transform() 是纯函数,把权限配置转成 argv。macOS 在 argv 前插 /usr/bin/sandbox-exec -p policy;Linux 在 argv 前插 codex-linux-sandbox --permission-profile json;Windows 不改 argv,靠 spawn 时设 token/ACL。</li>
+<li><strong>exec-server 与沙箱 helper</strong>:fs_sandbox 把 codex 自身当 helper,spawn 后通过 stdin 写 FsHelperRequest JSON,helper 执行完写 FsHelperResponse JSON 到 stdout。环境变量用白名单(PATH/TMPDIR),防止密钥泄露进沙箱。</li>
+<li><strong>shell-escalation client 与 server</strong>:Unix socket(通过 CODEX_ESCALATE_SOCKET 环境变量传 FD)。client 发 EscalateRequest,server 回 EscalateAction(Run/Escalate/Deny)。patched shell 的 execve_wrapper 拦截 exec() 触发此通信。</li>
+</ul>
+
+<h2>跨平台差异要点</h2>
+
+<ul>
+<li><strong>macOS</strong>:靠 sandbox-exec(seatbelt)执行 .sbpl 策略文件。seatbelt.rs 把 PermissionProfile 翻译成可读写根(subpath 规则)+ 网络(localhost 端口/unix socket)+ glob deny。只信任 /usr/bin/sandbox-exec,防 PATH 注入。</li>
+<li><strong>Linux</strong>:默认 bubblewrap(建 namespace)+ seccomp(限系统调用)。landlock 是 legacy 备选(只支持全盘可读 + 限制写入,不支持只读限制)。WSL1 不支持 bwrap(无 user namespace),会报错。proxy 模式在 netns 里搭桥,允许只连代理端口。</li>
+<li><strong>Windows</strong>:用降权 token + ACL(精确到路径的 read/write allow/deny)+ WFP(Windows Filtering Platform)做网络过滤。需要预先 setup 创建沙箱用户和防火墙规则。支持 ConPTY 和桌面隔离。</li>
+</ul>
+
+<script>window.__sourceMap = {
+  "cmd-in": {"file": "codex-rs/sandboxing/src/manager.rs", "startLine": 226, "endLine": 229},
+  "parse-cmd": {"file": "codex-rs/shell-command/src/parse_command.rs", "startLine": 30, "endLine": 30},
+  "safety-check": {"file": "codex-rs/shell-command/src/command_safety/is_dangerous_command.rs", "startLine": 7, "endLine": 29},
+  "deny-or-prompt": {"file": "codex-rs/shell-command/src/command_safety/is_safe_command.rs", "startLine": 12, "endLine": 54},
+  "flow-end-deny": {"file": "codex-rs/execpolicy/src/decision.rs", "startLine": 9, "endLine": 16},
+  "policy-check": {"file": "codex-rs/execpolicy/src/policy.rs", "startLine": 188, "endLine": 198},
+  "ask-user": {"file": "codex-rs/execpolicy/src/policy.rs", "startLine": 188, "endLine": 198},
+  "sandbox-prep": {"file": "codex-rs/sandboxing/src/manager.rs", "startLine": 226, "endLine": 339},
+  "plat-decide": {"file": "codex-rs/sandboxing/src/manager.rs", "startLine": 270, "endLine": 322},
+  "seatbelt-gen": {"file": "codex-rs/sandboxing/src/seatbelt.rs", "startLine": 602, "endLine": 741},
+  "linux-sandbox-gen": {"file": "codex-rs/sandboxing/src/landlock.rs", "startLine": 23, "endLine": 60},
+  "bwrap-or-legacy": {"file": "codex-rs/linux-sandbox/src/linux_run_main.rs", "startLine": 147, "endLine": 230},
+  "bwrap-stage": {"file": "codex-rs/linux-sandbox/src/linux_run_main.rs", "startLine": 213, "endLine": 230},
+  "landlock-direct": {"file": "codex-rs/linux-sandbox/src/landlock.rs", "startLine": 42, "endLine": 88},
+  "linux-exec-inner": {"file": "codex-rs/linux-sandbox/src/linux_run_main.rs", "startLine": 178, "endLine": 198},
+  "win-sandbox-gen": {"file": "codex-rs/sandboxing/src/manager.rs", "startLine": 318, "endLine": 321},
+  "exec-req": {"file": "codex-rs/sandboxing/src/manager.rs", "startLine": 100, "endLine": 114},
+  "exec-server-spawn": {"file": "codex-rs/exec-server/src/local_process.rs", "startLine": 150, "endLine": 274},
+  "output-stream": {"file": "codex-rs/exec-server/src/local_process.rs", "startLine": 282, "endLine": 358},
+  "flow-end-done": {"file": "codex-rs/exec-server/src/protocol.rs", "startLine": 446, "endLine": 468},
+  "fs-req": {"file": "codex-rs/exec-server/src/protocol.rs", "startLine": 203, "endLine": 215},
+  "fs-handler": {"file": "codex-rs/exec-server/src/server/file_system_handler.rs", "startLine": 1, "endLine": 50},
+  "local-fs": {"file": "codex-rs/exec-server/src/local_file_system.rs", "startLine": 1, "endLine": 50},
+  "sandboxed-fs": {"file": "codex-rs/exec-server/src/sandboxed_file_system.rs", "startLine": 42, "endLine": 52},
+  "fs-sandbox-runner": {"file": "codex-rs/exec-server/src/fs_sandbox.rs", "startLine": 63, "endLine": 94},
+  "fs-spawn-helper": {"file": "codex-rs/exec-server/src/fs_sandbox.rs", "startLine": 96, "endLine": 133},
+  "fs-stdin": {"file": "codex-rs/exec-server/src/fs_sandbox.rs", "startLine": 273, "endLine": 299},
+  "fs-helper-main": {"file": "codex-rs/exec-server/src/fs_helper_main.rs", "startLine": 1, "endLine": 46},
+  "fs-resp": {"file": "codex-rs/exec-server/src/fs_sandbox.rs", "startLine": 294, "endLine": 299},
+  "flow-fs-end": {"file": "codex-rs/exec-server/src/protocol.rs", "startLine": 210, "endLine": 215},
+  "cmd-tokens": {"file": "codex-rs/execpolicy/src/policy.rs", "startLine": 188, "endLine": 198},
+  "exact-match": {"file": "codex-rs/execpolicy/src/policy.rs", "startLine": 297, "endLine": 305},
+  "host-exe-match": {"file": "codex-rs/execpolicy/src/policy.rs", "startLine": 307, "endLine": 334},
+  "prefix-match": {"file": "codex-rs/execpolicy/src/rule.rs", "startLine": 46, "endLine": 60},
+  "heuristic": {"file": "codex-rs/shell-command/src/command_safety/is_dangerous_command.rs", "startLine": 7, "endLine": 29},
+  "collect-decision": {"file": "codex-rs/execpolicy/src/policy.rs", "startLine": 365, "endLine": 374},
+  "eval-out": {"file": "codex-rs/execpolicy/src/policy.rs", "startLine": 349, "endLine": 356}
+}</script>
+
+<aside id="source-panel"><div id="source-header"></div><div id="monaco-container"></div></aside>
+<script src="assets/codeindex-runtime.js"></script>
+<script src="assets/codeindex.js"></script>
+</body>
+</html>

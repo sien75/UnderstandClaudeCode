@@ -1,0 +1,241 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MCP 子系统</title>
+<link rel="stylesheet" href="../assets/codeindex.css">
+</head>
+<body>
+<nav class="topnav"><a href="../index.html">← 返回总览</a></nav>
+<h1>MCP 子系统</h1>
+
+<p>MCP（Model Context Protocol）是 Claude Code 接入外部能力的核心通道。这个子系统有<strong>两个对称的方向</strong>：① Claude Code 作为客户端，连接用户配置的各种 MCP server（本地 stdio 进程、远程 SSE/HTTP/WebSocket、claude.ai 代理连接器、IDE 内嵌服务），发现它们暴露的工具/资源/提示词，并在对话中转发调用；② Claude Code 自己也作为一个 MCP server，通过 stdio 把自己的内置工具暴露给别的 AI 客户端调用（<code>claude mcp serve</code>）。整个链路围绕"连接 → 发现 → 调用 → 处理结果 → 失败恢复"这条数据流展开，并叠加重连、会话过期、OAuth 授权、URL 引导授权（elicitation）等状态机分支。</p>
+
+<dl>
+  <dt>输入</dt>
+  <dd>用户配置的 MCP server 列表（<code>.mcp.json</code> / 配置文件 / claude.ai 连接器 / IDE 锁文件 / SDK 动态注入），加上对话中模型决定调用的某个 MCP 工具名与参数；server 模式下则是外部 MCP 客户端发来的 list_tools / call_tool JSON-RPC 请求。</dd>
+  <dt>输出</dt>
+  <dd>客户端模式：把外部 MCP server 的工具/资源/提示词接入 Claude 的工具集，模型调用后返回的内容（文本/图片/音频/二进制）被规范化成消息块送回模型；server 模式：把 Claude Code 内置工具以 MCP 协议形式暴露给外部客户端并返回调用结果。</dd>
+</dl>
+
+<h2>方向一：Claude Code 作为 MCP 客户端</h2>
+
+<p>启动时（或配置变更时），<code>useManageMCPConnections</code> 收集所有生效的 server 配置，调用 <code>getMcpToolsCommandsAndResources</code> 批量建立连接并发现能力。每个 server 通过 <code>connectToServer</code>（按配置序列化的 key 做 memoize 缓存）建立一条长连接：根据 <code>type</code> 选择 StdioClientTransport / SSEClientTransport / StreamableHTTPClientTransport / WebSocketTransport / SdkControlClientTransport / 进程内 InProcessTransport（Chrome、Computer Use 等重型 server 直接在主进程内跑，避免拉起 ~325MB 子进程）。连接带 30 秒超时（<code>MCP_TIMEOUT</code>），超时即关闭 transport 并抛出超时错误。</p>
+
+<p>对远程 server（SSE/HTTP/claude.ai-proxy），连接前会查"needs-auth 缓存"（15 分钟 TTL）和"探测过但没有 token"标记——命中则跳过连接、直接给该 server 挂一个 <code>McpAuthTool</code> 伪工具，避免每 15 分钟对一批注定 401 的 server 反复探测。远程 server 的 fetch 经过三层包装：最内层 <code>wrapFetchWithStepUpDetection</code>（捕获 403 提权请求）、中层 <code>wrapFetchWithTimeout</code>（每个 POST 60 秒新鲜超时 + 强制带 Streamable HTTP 的 Accept 头）、外层是 claude.ai 代理专用的 <code>createClaudeAiProxyFetch</code>（带 OAuth bearer、401 时强制刷新一次并重试）。</p>
+
+<p>连接成功后，<code>fetchToolsForClient</code> / <code>fetchResourcesForClient</code> / <code>fetchCommandsForClient</code>（均按 server 名 LRU 缓存）分别请求 <code>tools/list</code>、<code>resources/list</code>、<code>prompts/list</code>。发现的 MCP 工具被包装成内部 <code>Tool</code> 接口（名字形如 <code>mcp__&lt;server&gt;__&lt;tool&gt;</code>），其 <code>call</code> 方法真正执行时再走 <code>callMCPToolWithUrlElicitationRetry → callMCPTool</code>。若 server 声明支持 resources 且当前还没有资源工具，就补挂 <code>ListMcpResourcesTool</code> 和 <code>ReadMcpResourceTool</code>。任何 server 只要进入 needs-auth 状态，就额外挂一个 <code>McpAuthTool</code> 让模型可以触发 OAuth 流。</p>
+
+<p>调用一个 MCP 工具时，<code>callMCPTool</code> 用 <code>client.callTool</code> 发起 JSON-RPC 调用，自带超时（默认 <code>MCP_TOOL_TIMEOUT</code>，约 27.8 小时——事实上无限，因为很多 MCP 工具是长任务）和 30 秒一次的进度日志。返回结果先经 <code>processMCPResult</code> 规范化：文本直接保留，图片压缩到 API 尺寸限制，二进制 blob 写盘后只回路径（避免 base64 灌进上下文），超大输出走 <code>persistToolResult</code> 落盘并返回读取指引。若 server 返回 <code>isError: true</code>，抛出 <code>McpToolCallError</code>（携带 <code>_meta</code> 以便 SDK 消费者仍能拿到元数据）。若返回 401/UnauthorizedError，抛 <code>McpAuthError</code> 让上层把 server 状态翻成 needs-auth；若返回 404 + JSON-RPC -32001（会话过期）或派生的 -32000 Connection closed，则清掉连接缓存并抛 <code>McpSessionExpiredError</code>，<code>fetchToolsForClient</code> 内的调用循环会自动重试一次（拿新 client 重连）。</p>
+
+<p>连接掉线靠 <code>client.onerror</code> / <code>client.onclose</code> 检测。onclose 会清掉 connectToServer / fetch* 的 memoize 缓存，使下一次调用自动重连。onerror 区分终端错误（ECONNRESET/ETIMEDOUT/EPIPE/…）和瞬态错误：终端错误连续累计到 3 次就主动 close transport 让挂起的 callTool 失败并触发重连；HTTP 类还会识别"SSE 重连耗尽"和"会话过期"两种 server 主动放弃的信号。stdio server 的 cleanup 走 SIGINT → 100ms → SIGTERM → 400ms → SIGKILL 的逐级升级，保证 Docker 容器等需要显式信号的 server 也能优雅退出。</p>
+
+<pre class="mermaid">
+graph TD
+  start["启动/配置变更：useManageMCPConnections 收集 server 配置"] --> partition["按 local/remote 分组，分别限并发批处理"]
+  partition --> skip{"远程 server 命中 needs-auth 缓存或无 token?"}
+  skip -->|是| needsauth1["挂 McpAuthTool 伪工具，跳过连接"]
+  skip -->|否| connect["connectToServer（按 key memoize）"]
+  connect --> choose{"按 type 选 transport"}
+  choose -->|stdio/无| stdio["StdioClientTransport 拉子进程"]
+  choose -->|sse/http/ws| remote["SSE/StreamableHTTP/WebSocket + ClaudeAuthProvider + 三层 fetch 包装"]
+  choose -->|claudeai-proxy| proxy["StreamableHTTP + claude.ai OAuth bearer + 401 重试"]
+  choose -->|chrome/computeruse| inproc["InProcessTransport 进程内 server"]
+  choose -->|sdk| sdk["setupSdkMcpClients 走控制通道"]
+  choose -->|sse-ide/ws-ide| ide["IDE 传输（无鉴权）"]
+  stdio --> race["client.connect 与 30s 超时赛跑"]
+  remote --> race
+  proxy --> race
+  inproc --> race
+  ide --> race
+  sdk --> race2["client.connect（控制通道）"]
+  race --> timeout{"超时?"}
+  timeout -->|是| failtimeout["关 transport，抛超时错误 → failed"]
+  timeout -->|否| authok{"401/Unauthorized?"}
+  authok -->|是| handleauth["handleRemoteAuthFailure：写 needs-auth 缓存，返回 needs-auth"]
+  authok -->|否| connected["返回 connected（含 capabilities/instructions/cleanup）"]
+  race2 --> connected
+  connected --> discover["并发 fetchTools/Resources/Commands（LRU 缓存）"]
+  discover --> addtools["包装成 mcp__ 工具 + 按需补挂资源工具/McpAuthTool"]
+  addtools --> onattempt["onConnectionAttempt 回调写入 appState.mcp"]
+  needsauth1 --> onattempt
+  handleauth --> onattempt
+  failtimeout --> onattempt
+</pre>
+
+<p>上图覆盖了"连接建立"这一段的数据流。连接进入 connected 之后，工具被注册进 <code>appState.mcp.tools</code>，模型即可在对话中按 <code>mcp__server__tool</code> 的名字调用。下面这张图是工具被实际调用时的数据流，含所有失败分支。</p>
+
+<pre class="mermaid">
+graph TD
+  modelcall["模型决定调用 mcp__server__tool(args)"] --> toolcall["MCPTool.call（fetchToolsForClient 内包装的闭包）"]
+  toolcall --> ensure["ensureConnectedClient：命中 memoize 即返回，否则重连"]
+  ensure --> retry1["callMCPToolWithUrlElicitationRetry"]
+  retry1 --> callmcp["callMCPTool：client.callTool + 自带超时 + 30s 进度日志"]
+  callmcp --> result{"返回结果"}
+  result -->|isError=true| toolerr["抛 McpToolCallError（带 _meta）"]
+  result -->|401/Unauthorized| autherr["抛 McpAuthError → 上层翻 needs-auth"]
+  result -->|404/-32001 或 -32000 Connection closed| session["清连接缓存，抛 McpSessionExpiredError"]
+  result -->|正常返回| process["processMCPResult：规范化内容"]
+  session --> sesretry{"attempt &lt; 1?"}
+  sesretry -->|是| ensure
+  sesretry -->|否| propagate["向上抛出"]
+  process --> large{"内容过大?"}
+  large -->|是，含图片| truncate["走截断"]
+  large -->|是，纯文本/结构化| persist["persistToolResult 落盘，返回读取指引"]
+  large -->|否| returncontent["返回 content + _meta + structuredContent"]
+  retry1 -->|UrlElicitation -32042| elic["展示 URL elicitation（hook 或 UI 队列）"]
+  elic --> user{"用户/hook 结果"}
+  user -->|accept| retry1
+  user -->|decline/cancel| elicdecline["返回'用户拒绝'文本"]
+  toolerr --> propagate
+  autherr --> propagate
+</pre>
+
+<ul>
+  <li><strong>缓存策略</strong>：connectToServer 按 <code>${name}-${JSON(config)}</code> 做 memoize；fetchTools/Resources/Commands 按 server 名做 LRU（容量 20）。onclose / clearServerCache / reconnectMcpServerImpl 都会同时清这三类缓存，保证重连后不返回旧数据。</li>
+  <li><strong>needs-auth 缓存</strong>：远程 server 一次 401 就写入 <code>mcp-needs-auth-cache.json</code>，15 分钟内不再尝试连接；<code>McpAuthTool</code> 完成 OAuth 或 <code>/mcp</code> 手动认证后会 <code>clearMcpAuthCache</code>。</li>
+  <li><strong>会话过期自愈</strong>：Streamable HTTP 协议下 server 返回 404 + -32001 表示 session 失效，客户端清缓存后下一次调用自动重连拿新 session，对调用方最多重试一次。</li>
+  <li><strong>URL elicitation</strong>：MCP 工具可返回 -32042 要求用户打开一个 URL（OAuth 授权、外部确认等）。系统先跑 elicitation hook，hook 不处理则在 REPL 排队等用户操作、在 print/SDK 模式走 structuredIO 回调；最多重试 3 次。</li>
+  <li><strong>结果规范化</strong>：图片走压缩+下采样，二进制 blob 写盘后只回路径，超大输出落盘并返回读取指引——目的是把上下文体积压到最小。</li>
+  <li><strong>连接健康监测</strong>：<code>useMcpConnectivityStatus</code> 钩子在 mcpClients 变化时检查 failed/needs-auth 计数，分别给本地 server、claude.ai 连接器各发一条通知（"/mcp"），让用户知道有 server 掉线或需要授权。</li>
+  <li><strong>项目级 server 审批</strong>：<code>handleMcpjsonServerApprovals</code> 在启动时检查 <code>.mcp.json</code> 里 status=pending 的项目 server，单个走单选对话框、多个走多选对话框，用户批准后才会进入连接流程——防止项目仓库偷偷拉起不受信的 server。</li>
+</ul>
+
+<h2>方向二：Claude Code 作为 MCP server</h2>
+
+<p>当外部 AI 客户端想把 Claude Code 的能力当 MCP 工具用时，运行 <code>claude mcp serve</code>（<code>src/cli/handlers/mcp.tsx</code> 动态导入 <code>src/entrypoints/mcp.ts</code> 的 <code>startMCPServer</code>）。这条链路很直：创建一个 stdio MCP server，声明 tools 能力，注册 <code>ListToolsRequest</code> 和 <code>CallToolRequest</code> 两个 handler。</p>
+
+<p>ListTools 把 <code>getTools</code> 返回的内置工具逐个转成 MCP 协议的 Tool 描述：调 <code>tool.prompt()</code> 取描述、<code>zodToJsonSchema</code> 转换 inputSchema、outputSchema（仅当根节点是 <code>type: object</code> 时才带，避免 anyOf/oneOf 在 SDK 端被拒）。CallTool 收到 <code>{name, arguments}</code> 后：找到对应工具 → 检查 <code>isEnabled</code> → 调 <code>validateInput</code> → 用 <code>hasPermissionsToUseTool</code> 做权限校验 → 调 <code>tool.call</code>。成功把结果序列化成 text content 返回；任何阶段抛错都走 <code>getErrorParts</code> 拆出错误文本，返回 <code>isError: true</code> 的结构化错误（不让异常打断 stdio 会话）。</p>
+
+<p>server 模式构造的 ToolUseContext 是一个"无状态壳"：<code>mcpClients: []</code>、<code>messages: []</code>、<code>isNonInteractiveSession: true</code>、<code>thinkingConfig: disabled</code>——MCP 客户端不读消息历史，参数即一切。文件读取状态用 100 文件/25MB 上限的 LRU 缓存，防止 server 长时间运行内存无限增长。注释里有两个 TODO："Also re-expose any MCP tools"——目前 server 模式只暴露 Claude Code 自身内置工具，不会把客户端模式连的 MCP 工具再转发出去（避免循环依赖）。</p>
+
+<pre class="mermaid">
+graph TD
+  serve["外部客户端运行 claude mcp serve"] --> start["startMCPServer(cwd, debug, verbose)"]
+  start --> newserver["new Server(name=claude/tengu, capabilities.tools)"]
+  newserver --> setcwd["setCwd + 建 readFileState LRU 缓存"]
+  setcwd --> listhandler["注册 ListToolsRequest handler"]
+  listhandler --> gettools["getTools(toolPermissionContext) 取内置工具"]
+  gettools --> maptools["逐个：prompt 取描述、zodToJsonSchema 转 schema、outputSchema 仅 object 根带"]
+  maptools --> returnlist["返回 ListToolsResult"]
+  setcwd --> callhandler["注册 CallToolRequest handler"]
+  callhandler --> findtool["收到 {name, args} → findToolByName"]
+  findtool --> found{"找到?"}
+  found -->|否| notfound["抛 'Tool not found'"]
+  found -->|是| enabled{"isEnabled?"}
+  enabled -->|否| notenabled["抛 'Tool not enabled'"]
+  enabled -->|是| validate["validateInput"]
+  validate --> valid{"通过?"}
+  valid -->|否| invalid["抛输入无效错误"]
+  valid -->|是| docall["tool.call(args, context, hasPermissionsToUseTool)"]
+  docall --> callresult{"调用结果"}
+  callresult -->|string| strtext["直接当 text 返回"]
+  callresult -->|object| jsontext["jsonStringify(data) 当 text 返回"]
+  strtext --> okreturn["返回 {content:[{text}]}"]
+  jsontext --> okreturn
+  notfound --> errreturn["catch: getErrorParts → 返回 {isError:true, content:[{text}]}"]
+  notenabled --> errreturn
+  invalid --> errreturn
+  docall -. 抛错 .-&gt; errreturn
+  listhandler --> run["runServer: StdioServerTransport + server.connect"]
+  callhandler --> run
+  run --> serve2["stdio 上对外提供 MCP 工具"]
+</pre>
+
+<ul>
+  <li><strong>stdio 传输</strong>：server 模式只用 StdioServerTransport，stdin/stdout 跑 JSON-RPC，stderr 留给日志——这是 MCP server 最通用的接入方式，任何 MCP 客户端都能直接 <code>claude mcp serve</code> 拉起。</li>
+  <li><strong>无状态上下文</strong>：ToolUseContext 里 mcpClients/messages 全是空，setAppState 是空函数——server 模式不维护会话状态，每次 call_tool 都是独立调用。</li>
+  <li><strong>权限校验</strong>：调用前过 <code>hasPermissionsToUseTool</code>，沿用客户端模式同一套权限规则；外部客户端的请求受同一套审批/规则约束。</li>
+  <li><strong>错误不杀会话</strong>：CallTool 的 try/catch 把任何异常转成 <code>isError: true</code> 的结构化返回，避免一次工具失败就让 stdio 会话崩掉。</li>
+  <li><strong>暂不转发 MCP 工具</strong>：代码注释明确标注 TODO，未来可能把客户端连的 MCP 工具也透传出去，但目前为避免循环/性能问题只暴露内置工具。</li>
+</ul>
+
+<h2>OAuth 授权流（客户端模式鉴权）</h2>
+
+<p>远程 server 首次连接或 token 过期时走 <code>performMCPOAuthFlow</code>。如果配置了 <code>oauth.xaa</code>（跨应用授权），走 <code>performMCPXaaAuth</code>——只要 IdP 的 id_token 还在缓存里，整条链是零交互的：用 id_token 换取 MCP server 的 access/refresh token，存进同一个 keychain 槽位，后续 <code>ClaudeAuthProvider.tokens()</code> 完全无感。</p>
+
+<p>标准 OAuth 流程：找一个可用端口建 localhost 回调 server → 用 PKCE 生成 authorization URL（state + code_verifier + code_challenge）→ 打开浏览器让用户在 AS 上授权 → 回调收到 code → 换 token → 存 keychain。<code>ClaudeAuthProvider</code> 实现了 MCP SDK 的 <code>OAuthClientProvider</code> 接口：<code>tokens()</code> 读 keychain，过期则用 refresh_token 刷新（带进程内去重，并发请求复用同一个 refresh promise）；<code>saveTokens</code> 写 keychain 并清掉 step-up 标记；<code>invalidateCredentials('tokens')</code> 在 refresh 失败时清 token 但保留 discovery 信息，下次连接重新走授权。遇到 403 insufficient_scope 时，fetch 包装层会调 <code>markStepUpPending(scope)</code>，让 <code>tokens()</code> 故意省略 refresh_token——RFC 6749 §6 禁止用 refresh 提权，必须重新走授权拿到更大 scope 的 token。</p>
+
+<ul>
+  <li><strong>XAA 静默授权</strong>：组织级 IdP 一次登录后所有 XAA server 共享凭证，避免每个 server 弹一次浏览器。</li>
+  <li><strong>跨进程 token 一致</strong>：keychain 读取有缓存 TTL，<code>reconnectMcpServerImpl</code> 会先 <code>clearKeychainCache</code>，确保 VS Code 扩展等别的进程改了 token 后本进程能看到。</li>
+  <li><strong>State/nonce 防护</strong>：日志里对 state/nonce/code_verifier/code 等 OAuth 敏感参数做 redact，防 CSRF/会话固定。</li>
+</ul>
+
+<script>
+window.__sourceMap = {
+  "start": { "file": "src/services/mcp/useManageMCPConnections.ts", "startLine": 894, "endLine": 960 },
+  "partition": { "file": "src/services/mcp/client.ts", "startLine": 2264, "endLine": 2281 },
+  "skip": { "file": "src/services/mcp/client.ts", "startLine": 2307, "endLine": 2322 },
+  "needsauth1": { "file": "src/services/mcp/client.ts", "startLine": 2316, "endLine": 2321 },
+  "connect": { "file": "src/services/mcp/client.ts", "startLine": 595, "endLine": 607 },
+  "choose": { "file": "src/services/mcp/client.ts", "startLine": 619, "endLine": 961 },
+  "stdio": { "file": "src/services/mcp/client.ts", "startLine": 944, "endLine": 958 },
+  "remote": { "file": "src/services/mcp/client.ts", "startLine": 619, "endLine": 676 },
+  "proxy": { "file": "src/services/mcp/client.ts", "startLine": 868, "endLine": 904 },
+  "inproc": { "file": "src/services/mcp/client.ts", "startLine": 905, "endLine": 943 },
+  "sdk": { "file": "src/services/mcp/client.ts", "startLine": 3262, "endLine": 3348 },
+  "ide": { "file": "src/services/mcp/client.ts", "startLine": 678, "endLine": 734 },
+  "race": { "file": "src/services/mcp/client.ts", "startLine": 1048, "endLine": 1080 },
+  "race2": { "file": "src/services/mcp/client.ts", "startLine": 3293, "endLine": 3295 },
+  "timeout": { "file": "src/services/mcp/client.ts", "startLine": 1090, "endLine": 1155 },
+  "failtimeout": { "file": "src/services/mcp/client.ts", "startLine": 1049, "endLine": 1066 },
+  "authok": { "file": "src/services/mcp/client.ts", "startLine": 1093, "endLine": 1138 },
+  "handleauth": { "file": "src/services/mcp/client.ts", "startLine": 340, "endLine": 361 },
+  "connected": { "file": "src/services/mcp/client.ts", "startLine": 1157, "endLine": 1604 },
+  "discover": { "file": "src/services/mcp/client.ts", "startLine": 2344, "endLine": 2356 },
+  "addtools": { "file": "src/services/mcp/client.ts", "startLine": 2358, "endLine": 2371 },
+  "onattempt": { "file": "src/services/mcp/useManageMCPConnections.ts", "startLine": 310, "endLine": 400 },
+  "modelcall": { "file": "src/services/mcp/client.ts", "startLine": 1833, "endLine": 1839 },
+  "toolcall": { "file": "src/services/mcp/client.ts", "startLine": 1860, "endLine": 1881 },
+  "ensure": { "file": "src/services/mcp/client.ts", "startLine": 1688, "endLine": 1704 },
+  "retry1": { "file": "src/services/mcp/client.ts", "startLine": 2813, "endLine": 2860 },
+  "callmcp": { "file": "src/services/mcp/client.ts", "startLine": 3029, "endLine": 3122 },
+  "result": { "file": "src/services/mcp/client.ts", "startLine": 3124, "endLine": 3178 },
+  "toolerr": { "file": "src/services/mcp/client.ts", "startLine": 3124, "endLine": 3148 },
+  "autherr": { "file": "src/services/mcp/client.ts", "startLine": 3194, "endLine": 3208 },
+  "session": { "file": "src/services/mcp/client.ts", "startLine": 3210, "endLine": 3231 },
+  "process": { "file": "src/services/mcp/client.ts", "startLine": 2720, "endLine": 2799 },
+  "sesretry": { "file": "src/services/mcp/client.ts", "startLine": 1913, "endLine": 1922 },
+  "propagate": { "file": "src/services/mcp/client.ts", "startLine": 1968, "endLine": 1968 },
+  "large": { "file": "src/services/mcp/client.ts", "startLine": 2733, "endLine": 2766 },
+  "truncate": { "file": "src/services/mcp/client.ts", "startLine": 2741, "endLine": 2748 },
+  "persist": { "file": "src/services/mcp/client.ts", "startLine": 2767, "endLine": 2798 },
+  "returncontent": { "file": "src/services/mcp/client.ts", "startLine": 3171, "endLine": 3178 },
+  "elic": { "file": "src/services/mcp/client.ts", "startLine": 2862, "endLine": 3022 },
+  "user": { "file": "src/services/mcp/client.ts", "startLine": 3000, "endLine": 3016 },
+  "elicdecline": { "file": "src/services/mcp/client.ts", "startLine": 3008, "endLine": 3015 },
+  "serve": { "file": "src/cli/handlers/mcp.tsx", "startLine": 64, "endLine": 67 },
+  "start": { "file": "src/entrypoints/mcp.ts", "startLine": 35, "endLine": 57 },
+  "newserver": { "file": "src/entrypoints/mcp.ts", "startLine": 47, "endLine": 57 },
+  "setcwd": { "file": "src/entrypoints/mcp.ts", "startLine": 40, "endLine": 46 },
+  "listhandler": { "file": "src/entrypoints/mcp.ts", "startLine": 59, "endLine": 97 },
+  "gettools": { "file": "src/entrypoints/mcp.ts", "startLine": 63, "endLine": 65 },
+  "maptools": { "file": "src/entrypoints/mcp.ts", "startLine": 66, "endLine": 94 },
+  "returnlist": { "file": "src/entrypoints/mcp.ts", "startLine": 65, "endLine": 96 },
+  "callhandler": { "file": "src/entrypoints/mcp.ts", "startLine": 99, "endLine": 188 },
+  "findtool": { "file": "src/entrypoints/mcp.ts", "startLine": 101, "endLine": 108 },
+  "found": { "file": "src/entrypoints/mcp.ts", "startLine": 106, "endLine": 108 },
+  "notfound": { "file": "src/entrypoints/mcp.ts", "startLine": 107, "endLine": 107 },
+  "enabled": { "file": "src/entrypoints/mcp.ts", "startLine": 138, "endLine": 139 },
+  "notenabled": { "file": "src/entrypoints/mcp.ts", "startLine": 139, "endLine": 139 },
+  "validate": { "file": "src/entrypoints/mcp.ts", "startLine": 141, "endLine": 149 },
+  "valid": { "file": "src/entrypoints/mcp.ts", "startLine": 145, "endLine": 149 },
+  "invalid": { "file": "src/entrypoints/mcp.ts", "startLine": 146, "endLine": 148 },
+  "docall": { "file": "src/entrypoints/mcp.ts", "startLine": 150, "endLine": 157 },
+  "callresult": { "file": "src/entrypoints/mcp.ts", "startLine": 159, "endLine": 168 },
+  "strtext": { "file": "src/entrypoints/mcp.ts", "startLine": 163, "endLine": 164 },
+  "jsontext": { "file": "src/entrypoints/mcp.ts", "startLine": 165, "endLine": 166 },
+  "okreturn": { "file": "src/entrypoints/mcp.ts", "startLine": 159, "endLine": 169 },
+  "errreturn": { "file": "src/entrypoints/mcp.ts", "startLine": 170, "endLine": 186 },
+  "run": { "file": "src/entrypoints/mcp.ts", "startLine": 190, "endLine": 195 },
+  "serve2": { "file": "src/entrypoints/mcp.ts", "startLine": 190, "endLine": 195 }
+};
+</script>
+
+<aside id="source-panel"><div id="source-header"></div><div id="monaco-container"></div></aside>
+<script src="../assets/codeindex-runtime.js"></script>
+<script src="../assets/codeindex.js"></script>
+</body>
+</html>

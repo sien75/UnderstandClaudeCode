@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Web 端（claude.ai/code 风格的浏览器界面）</title>
+<link rel="stylesheet" href="../assets/codeindex.css">
+</head>
+<body>
+<nav class="topnav"><a href="../index.html">← 返回总览</a></nav>
+<h1>Web 端（claude.ai/code 风格的浏览器界面）</h1>
+
+<p>用户在浏览器里打开这个 Next.js 网页，得到一个类似 claude.ai/code 的聊天界面：左边是对话列表，右边是当前对话的消息流和输入框。用户在输入框敲字、回车发送，消息流式地一块块渲染出来；可以中途停止生成、切换/新建/删除对话、改主题、调字体、搜索历史、导出对话。背后它通过一个 Next.js API 路由把请求转发到真正的后端 Claude Code 会话（默认 <code>http://localhost:3001</code>），把后端返回的 SSE 流原样透传给浏览器。</p>
+
+<p>这个子项目里其实存在<strong>两套</strong>对接后端的客户端代码：一套是 <code>lib/api.ts</code> 里轻量的 <code>streamChat</code>，目前 UI 真正在用的就是它，走 Next.js 的 <code>/api/chat</code> 代理路由；另一套是 <code>lib/api/</code> 目录下更完整的客户端（<code>client.ts</code> 带重试/超时/请求去重、<code>stream.ts</code> 带断线重连和进度回调、<code>conversations.ts</code>/<code>messages.ts</code>/<code>files.ts</code> 封装各类资源操作），但当前 UI 还没接上这套，属于"备好的更完整一层"。下面的数据流以实际在用的轻量链路为主，辅以对完整层的说明。</p>
+
+<dl>
+  <dt>输入</dt>
+  <dd>用户在输入框敲的文字 + 当前对话的历史消息 + 设置里选的模型（model）、API 地址等</dd>
+  <dt>输出</dt>
+  <dd>一条条流式渲染出来的 Claude 回复（含 Markdown 渲染、代码高亮、工具调用块展示），以及持久化到 localStorage 的对话记录</dd>
+</dl>
+
+<h2>主数据流：发一条消息到回回复</h2>
+
+<p>用户在输入框敲完字按回车（或点发送按钮），前端先把这条用户消息写进本地状态仓库（zustand 的 <code>useChatStore</code>），紧接着建一条"占位的"空助手消息（状态标记为 streaming），然后发起一次带 <code>AbortController</code> 的 fetch 请求。请求打到同源的 Next.js 路由 <code>/api/chat</code>，这个路由再把请求体原样转发给真正的后端（<code>NEXT_PUBLIC_API_URL</code>，默认 <code>localhost:3001</code>），并把后端返回的 SSE 流透传回浏览器。浏览器一边读流一边把文本增量拼到那条占位助手消息上，界面就跟着一块块长出来；读到 <code>[DONE]</code> 或被用户中途打断后，把消息状态改成 complete。</p>
+
+<pre class="mermaid">
+graph TD
+  user-type["用户在输入框敲字、按回车"] --> input-guard{"输入为空或正在生成?"}
+  input-guard -->|是| no-op["什么都不做"]
+  input-guard -->|否| add-user-msg["把用户消息写进 store"]
+  add-user-msg --> add-placeholder["建一条空助手消息(status=streaming)"]
+  add-placeholder --> build-msgs["拼出要发给后端的历史消息数组"]
+  build-msgs --> fetch-stream["fetch /api/chat 发起流式请求(带 AbortController)"]
+  fetch-stream --> proxy-route["Next.js 路由 /api/chat 透传到后端"]
+  proxy-route --> backend{"后端响应正常?"}
+  backend -->|非 200| yield-error["产出 error chunk"]
+  backend -->|200| read-sse["浏览器读 SSE 流,按行解析 data:行"]
+  read-sse --> chunk-type{"chunk 类型?"}
+  chunk-type -->|text| append-text["把文本增量拼到助手消息,界面实时长出"]
+  chunk-type -->|done| finish-done["结束循环"]
+  chunk-type -->|error| mark-error["助手消息标记 error 并展示错误文案"]
+  append-text --> read-sse
+  finish-done --> mark-complete["助手消息标记 complete"]
+  mark-error --> cleanup
+  mark-complete --> cleanup["清掉 isStreaming/abortRef"]
+  yield-error --> cleanup
+</pre>
+
+<ul>
+  <li>用户点"停止生成"按钮会调用 <code>abortRef.current.abort()</code>，fetch 被取消；此时捕获到 AbortError，已经长出来的部分文本会被保留并标记成 complete（不算失败）。</li>
+  <li><code>/api/chat</code> 路由是个纯透传代理：它不解析流内容，只把后端的 <code>response.body</code> 原样作为 Next.js 响应体返回，并保留 Content-Type。后端地址由 <code>NEXT_PUBLIC_API_URL</code> 决定，可带 <code>ANTHROPIC_API_KEY</code> 做 Bearer 鉴权。</li>
+  <li>历史消息是直接从 zustand store 里当前对话的 messages 数组取出来拼成请求体的——也就是说"记忆"完全在浏览器端维护，每次请求都把完整历史重发一遍。</li>
+</ul>
+
+<h2>消息渲染：从 Markdown 到代码高亮</h2>
+
+<p>助手消息走到 <code>MessageBubble</code>：用户消息直接按纯文本（保留换行）渲染，助手消息交给 <code>MarkdownContent</code> 用 react-markdown + remark-gfm 渲染成富文本。如果消息状态还是 streaming，气泡末尾会显示一个闪烁的光标块。代码块的语法高亮走的是 <code>SyntaxHighlight</code> 组件——它在主线程上懒加载 Shiki（首次用才 import），按语言/主题生成带高亮的 HTML 直接 <code>dangerouslySetInnerHTML</code> 进去；遇到不认识的语言就退回纯文本。注意：<code>lib/workers/highlight.worker.ts</code> 里有一份"把高亮挪到 Web Worker"的并行实现，但当前 UI 没有任何地方 <code>new Worker</code> 它，所以现在高亮实际跑在主线程上。</p>
+
+<pre class="mermaid">
+graph TD
+  msg-bubble["MessageBubble 收到一条 Message"] --> is-user{"是用户消息?"}
+  is-user -->|是| render-plain["按纯文本渲染(保留换行)"]
+  is-user -->|否| is-error{"status=error?"}
+  is-error -->|是| render-error["红色错误气泡 + AlertCircle 图标"]
+  is-error -->|否| render-md["MarkdownContent: react-markdown+remark-gfm"]
+  render-md --> md-out["输出富文本 HTML"]
+  md-out --> has-code{"含代码块?"}
+  has-code -->|否| show-bubble["显示气泡"]
+  has-code -->|是| shiki-lazy["SyntaxHighlight: 懒加载 Shiki"]
+  shiki-lazy --> lang-ok{"认识语言?"}
+  lang-ok -->|是| shiki-html["codeToHtml 生成高亮 HTML"]
+  lang-ok -->|否| plain-code["退回纯文本 pre/code"]
+  shiki-html --> show-bubble
+  plain-code --> show-bubble
+  show-bubble --> streaming{"status=streaming?"}
+  streaming -->|是| cursor["末尾显示闪烁光标块"]
+  streaming -->|否| done["完成"]
+</pre>
+
+<ul>
+  <li>Shiki 的 highlighter 是单例（<code>highlighterPromise</code> 只初始化一次），预置了 github-dark/github-light 两套主题和约 20+ 种语言。</li>
+  <li><code>lib/workers/markdown.worker.ts</code> 同样是"备好但未接线"的：它做的是轻量 Markdown 预切分（按行分类成 heading/code-fence/list 等），没有 UI 消费它；当前 Markdown 直接由 react-markdown 在主线程解析。</li>
+</ul>
+
+<h2>主题切换</h2>
+
+<p>主题由 <code>ThemeProvider</code>（<code>lib/theme.tsx</code>）通过 React Context 提供，支持 dark / light / system 三档。选 system 时会监听 <code>prefers-color-scheme</code> 媒体查询，跟着系统深浅色变。实际生效方式是给 <code>&lt;html&gt;</code> 根元素加/去 <code>light</code> class（默认是 dark，layout 里 <code>&lt;html class="dark"&gt;</code>），Tailwind 的 dark: 变体据此切换。选择会存进 localStorage（key <code>ui-theme</code>），下次进来读回来。注意这套主题只管 UI 配色；代码高亮的深浅主题是 Shiki 那边独立的 <code>github-dark</code>/<code>github-light</code>。</p>
+
+<h2>搜索：在浏览器里全文本检索历史对话</h2>
+
+<p>搜索走的是 <code>client-search.ts</code>——纯前端、在主线程上跑，直接遍历 store 里的对话数组。它先把查询 tokenize（小写、按非单词字符切分），再给每条消息打分：标题命中权重 ×1.5，正文按 token 命中数 + 词边界加分 + 多次出现加分，没全部命中的还会按比例惩罚。除了关键词，还能按日期、对话、模型、角色、内容类型（text/tool_use/code/file）、标签过滤。结果按总分降序，每条对话最多保留 5 条匹配，并带高亮摘要。<code>lib/search/highlighter.ts</code> 负责摘录片段和把命中词包成高亮标记。</p>
+
+<p>同样存在一份"备好未接线"的并行实现：<code>lib/workers/search.worker.ts</code> 维护一个倒排索引（term → 消息索引集合），设计成通过 postMessage 喂数据进来索引、查询、删除，但目前没有 UI 用 <code>new Worker</code> 起它。<code>lib/search/search-api.ts</code> 则是给将来后端搜索端点预留的 stub——注释里写明"等后端搜索端点就绪就把 clientSearch 调用换成 apiSearch"。</p>
+
+<h2>导出对话</h2>
+
+<p>用户在导出面板选格式（markdown / json / html / plaintext，pdf 走客户端 <code>window.print()</code>）和勾选项（是否含工具调用、思考过程、时间戳、文件内容等），点导出后前端把整段 Conversation 对象 + 选项 POST 到 <code>/api/export</code>。这个路由按格式调对应的转换函数（<code>lib/export/markdown.ts</code> 等）生成内容，用对话标题 slug 当文件名，带 Content-Disposition: attachment 直接当下载返回。所有转换都在服务端路由里做，前端拿到就是成品文件。</p>
+
+<h2>辅助视图：消息状态机</h2>
+
+<p>每条 Message 有一个 status 字段，取值 pending / streaming / complete / error，决定了它在界面上怎么显示和怎么参与后续请求。这个状态机的转换主要发生在 <code>ChatInput.handleSubmit</code> 里：发消息时新建的助手消息从 streaming 起步，每收到一块文本就更新内容但保持 streaming，流结束（done）转 complete，遇到错误 chunk 或非 abort 的异常转 error；被用户主动中断（AbortError）时反而算 complete——已生成的内容保留。</p>
+
+<pre class="mermaid">
+graph TD
+  new-user["新建用户消息"] --> user-complete["status=complete(立即)"]
+  new-assistant["新建占位助手消息"] --> st-streaming["status=streaming"]
+  st-streaming --> on-text["收到 text chunk: 累加内容, 保持 streaming"]
+  on-text --> st-streaming
+  st-streaming --> on-done["收到 done chunk"] --> st-complete["status=complete"]
+  st-streaming --> on-err-chunk["收到 error chunk"] --> st-error["status=error, 显示错误文案"]
+  st-streaming --> on-abort["用户中断(AbortError)"] --> st-complete
+  st-streaming --> on-fail["其它异常"] --> st-error
+</pre>
+
+<h2>辅助视图：权限与生命周期</h2>
+
+<p><strong>权限</strong>：设置里有一套权限配置——按工具类型（file_read / file_write / bash / web_search）开关自动批准，再加一个受限目录列表。这套配置存在 zustand store 的 settings 里并持久化到 localStorage，但目前<strong>只停留在本地配置层面</strong>：发往后端的 chat 请求体只有 <code>{messages, model, stream}</code>，权限设置既不发给后端也不在发消息时校验，UI 上只有 <code>PermissionSettings</code> 组件读写它。相当于"先备好开关，等后端能识别再接上"。</p>
+
+<p><strong>生命周期</strong>：整个 web 子项目的数据生命周期几乎都绑在浏览器 localStorage 上。zustand store 用 <code>persist</code> 中间件把 conversations、activeConversationId、settings、pinnedIds、recentSearches、tags 持久化（key <code>claude-code-chat</code>），刷新页面后读回来；而 isSearchOpen、settingsOpen、sidebarTab、selectedConversationIds 这些纯 UI 状态在 <code>merge</code> 时被强制重置为默认值，不持久化。对话的"记忆"也完全在本地 store——每次发消息都把 store 里当前对话的完整历史重发一遍给后端，后端不替浏览器记上下文。这意味着清掉 localStorage 或换浏览器，历史和上下文就都没了。</p>
+
+<p><strong>与主项目 src/server/web 的关系</strong>：主项目 <code>src/server/web/</code> 是另一套独立的终端 web 服务（pty-server、session-manager、terminal.js 等，走 xterm 在网页里嵌一个真终端）。web/ 子项目并不复用 src/server/web 的代码——它走的是 SSE 流式对话那条链路，而不是终端 PTY 那条。两者的交集只在配置层：web/ 通过 <code>NEXT_PUBLIC_API_URL</code> 指向后端（默认 localhost:3001），至于那个后端到底是 src/server 还是别的服务，由部署决定，代码里不写死。<code>lib/terminal-compat.ts</code> 是给"把 src/components 下用 Ink 的终端组件搬到浏览器"准备的桩（stub）——给 process.stdout.columns/rows、process.exit、useInput/useApp 这些 Ink/Node API 提供浏览器版默认实现——但当前 web/ 里没有任何文件 import 它，属于"为将来移植终端组件预留的垫片"。</p>
+
+<ul>
+  <li><code>/api/share</code> 路由（生成可分享链接）和 <code>/api/files/read|write</code> 路由是另一组后端代理，模式同 /api/chat：接收前端请求、转发给真正后端。分享支持 public/unlisted/password 三种可见性和多种过期时长。</li>
+  <li>导出路由里 pdf 是个特例：服务端不做，直接返回 400 提示"由客户端 window.print() 处理"。</li>
+</ul>
+
+<script>
+window.__sourceMap = {
+  "user-type": { "file": "web/components/chat/ChatInput.tsx", "startLine": 23, "endLine": 29 },
+  "input-guard": { "file": "web/components/chat/ChatInput.tsx", "startLine": 24, "endLine": 25 },
+  "no-op": { "file": "web/components/chat/ChatInput.tsx", "startLine": 25, "endLine": 25 },
+  "add-user-msg": { "file": "web/components/chat/ChatInput.tsx", "startLine": 31, "endLine": 35 },
+  "add-placeholder": { "file": "web/components/chat/ChatInput.tsx", "startLine": 38, "endLine": 42 },
+  "build-msgs": { "file": "web/components/chat/ChatInput.tsx", "startLine": 47, "endLine": 53 },
+  "fetch-stream": { "file": "web/lib/api.ts", "startLine": 24, "endLine": 29 },
+  "proxy-route": { "file": "web/app/api/chat/route.ts", "startLine": 8, "endLine": 17 },
+  "backend": { "file": "web/lib/api.ts", "startLine": 31, "endLine": 35 },
+  "yield-error": { "file": "web/lib/api.ts", "startLine": 32, "endLine": 34 },
+  "read-sse": { "file": "web/lib/api.ts", "startLine": 47, "endLine": 69 },
+  "chunk-type": { "file": "web/lib/api.ts", "startLine": 55, "endLine": 68 },
+  "append-text": { "file": "web/components/chat/ChatInput.tsx", "startLine": 59, "endLine": 64 },
+  "finish-done": { "file": "web/lib/api.ts", "startLine": 58, "endLine": 60 },
+  "mark-error": { "file": "web/components/chat/ChatInput.tsx", "startLine": 67, "endLine": 72 },
+  "mark-complete": { "file": "web/components/chat/ChatInput.tsx", "startLine": 76, "endLine": 76 },
+  "cleanup": { "file": "web/components/chat/ChatInput.tsx", "startLine": 86, "endLine": 89 },
+  "msg-bubble": { "file": "web/components/chat/MessageBubble.tsx", "startLine": 12, "endLine": 16 },
+  "is-user": { "file": "web/components/chat/MessageBubble.tsx", "startLine": 13, "endLine": 13 },
+  "render-plain": { "file": "web/components/chat/MessageBubble.tsx", "startLine": 63, "endLine": 64 },
+  "is-error": { "file": "web/components/chat/MessageBubble.tsx", "startLine": 14, "endLine": 14 },
+  "render-error": { "file": "web/components/chat/MessageBubble.tsx", "startLine": 53, "endLine": 61 },
+  "render-md": { "file": "web/components/chat/MarkdownContent.tsx", "startLine": 12, "endLine": 31 },
+  "md-out": { "file": "web/components/chat/MarkdownContent.tsx", "startLine": 29, "endLine": 30 },
+  "has-code": { "file": "web/components/tools/SyntaxHighlight.tsx", "startLine": 138, "endLine": 144 },
+  "show-bubble": { "file": "web/components/chat/MessageBubble.tsx", "startLine": 17, "endLine": 76 },
+  "shiki-lazy": { "file": "web/components/tools/SyntaxHighlight.tsx", "startLine": 9, "endLine": 45 },
+  "lang-ok": { "file": "web/components/tools/SyntaxHighlight.tsx", "startLine": 115, "endLine": 122 },
+  "shiki-html": { "file": "web/components/tools/SyntaxHighlight.tsx", "startLine": 116, "endLine": 117 },
+  "plain-code": { "file": "web/components/tools/SyntaxHighlight.tsx", "startLine": 118, "endLine": 121 },
+  "streaming": { "file": "web/components/chat/MessageBubble.tsx", "startLine": 68, "endLine": 73 },
+  "cursor": { "file": "web/components/chat/MessageBubble.tsx", "startLine": 69, "endLine": 73 },
+  "done": { "file": "web/components/chat/MessageBubble.tsx", "startLine": 68, "endLine": 68 },
+  "new-user": { "file": "web/components/chat/ChatInput.tsx", "startLine": 31, "endLine": 35 },
+  "user-complete": { "file": "web/components/chat/ChatInput.tsx", "startLine": 34, "endLine": 34 },
+  "new-assistant": { "file": "web/components/chat/ChatInput.tsx", "startLine": 38, "endLine": 42 },
+  "st-streaming": { "file": "web/components/chat/ChatInput.tsx", "startLine": 41, "endLine": 41 },
+  "on-text": { "file": "web/components/chat/ChatInput.tsx", "startLine": 59, "endLine": 64 },
+  "on-done": { "file": "web/components/chat/ChatInput.tsx", "startLine": 65, "endLine": 66 },
+  "st-complete": { "file": "web/components/chat/ChatInput.tsx", "startLine": 76, "endLine": 76 },
+  "on-err-chunk": { "file": "web/components/chat/ChatInput.tsx", "startLine": 67, "endLine": 72 },
+  "st-error": { "file": "web/components/chat/ChatInput.tsx", "startLine": 69, "endLine": 71 },
+  "on-abort": { "file": "web/components/chat/ChatInput.tsx", "startLine": 78, "endLine": 84 },
+  "on-fail": { "file": "web/components/chat/ChatInput.tsx", "startLine": 78, "endLine": 82 }
+};
+</script>
+
+<aside id="source-panel"><div id="source-header"></div><div id="monaco-container"></div></aside>
+<script src="../assets/codeindex-runtime.js"></script>
+<script src="../assets/codeindex.js"></script>
+</body>
+</html>

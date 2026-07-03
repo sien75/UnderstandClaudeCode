@@ -1,0 +1,429 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agents, Tasks, and Multi-Agent Orchestration</title>
+<link rel="stylesheet" href="../assets/codeindex.css">
+</head>
+<body>
+<nav class="topnav"><a href="../index.html">← Back to Overview</a></nav>
+<h1>Agents, Tasks, and Multi-Agent Orchestration</h1>
+
+<p>This is Claude Code's "parallel execution brain." When the Claude in the main conversation wants to hand off some work—dispatch a subagent to search code, start a background shell to run tests, or spin up a multi-agent team to divide and conquer—all those requests converge here and are routed to the appropriate execution channel. From the moment a request enters until its result is returned to the main conversation, it passes through: selecting who does the work → what isolation environment to run in → how task state is registered and transitioned → how the main loop is notified on completion or failure → how to stop or resume midway.</p>
+
+<p>From the user/external caller's perspective, there are four categories of things you can do: (1) <b>dispatch a subagent</b> (wait synchronously for the result, or run in the background and be notified later)—via the Agent tool; (2) <b>start a background shell task</b> (bash monitoring, long-running commands)—via the Bash tool's run_in_background or the Task tool family; (3) <b>form a multi-agent team</b> (a leader with several teammates, each in independent processes/sessions, messaging each other)—via TeamCreate + Agent with the name parameter; (4) <b>check progress/fetch output/stop running tasks</b>—via TaskOutput, TaskList, and TaskStop. This module covers the source implementation of these four paths.</p>
+
+<dl>
+  <dt>Input</dt>
+  <dd>A tool call produced by the main conversation: a natural-language task description (prompt), optional subagent type/model/isolation mode/background flag; or a shell command; or a message sent to a teammate.</dd>
+  <dt>Output</dt>
+  <dd>A structured tool result returned to the main conversation: the subagent's final text reply plus token/tool-call statistics; or a background task async_launched handle (agentId + output file path); or the shell task's exit code + output; or a teammate "dispatched" confirmation. Final-state notifications are injected back into the main loop message queue as <code>&lt;task-notification&gt;</code> XML.</dd>
+</dl>
+
+<h2>1. The Agent Tool: Main Entry for Dispatching Subagents</h2>
+
+<p>From the user's point of view: "I want Claude to handle a subtask in parallel"—the main conversation's Claude calls the Agent tool, passing prompt and optional subagent_type/model/run_in_background/name. The Agent tool is the dispatch hub for all of this. It must answer several questions: Is this dispatching a normal subagent, pulling a teammate into a team, or forking a worker that shares the parent's context? Should it run synchronously or in the background? Does it need worktree isolation?</p>
+
+<pre class="mermaid">
+graph TD
+  entry["Agent.call receives call"] --> teamCheck{"has team_name + name?"}
+  teamCheck -->|"yes"| spawnTeammate["spawn teammate into team&lt;br/&gt;spawnTeammate()"]
+  teamCheck -->|"no"| resolveType["resolve subagent type&lt;br/&gt;subagent_type / fork / general-purpose"]
+  resolveType --> forkCheck{"fork path?"}
+  forkCheck -->|"yes and already inside fork child"| forkReject["reject: fork cannot nest"]
+  forkCheck -->|"yes, first level"| forkPath["select FORK_AGENT&lt;br/&gt;inherit parent system prompt and toolset"]
+  forkCheck -->|"no"| normalPath["look up subagent_type definition&lt;br/&gt;filter out permission-denied"]
+  normalPath --> agentNotFound{"not found?"}
+  agentNotFound -->|"denied by permission"| denyErr["throw denied error"]
+  agentNotFound -->|"does not exist"| notFoundErr["throw not found error"]
+  agentNotFound -->|"found"| mcpCheck
+  forkPath --> mcpCheck{"needs MCP server?"}
+  mcpCheck -->|"yes and not ready"| waitMcp["poll up to 30s&lt;br/&gt;throw on failure"]
+  mcpCheck -->|"no / ready"| remoteCheck{"isolation=remote?"}
+  remoteCheck -->|"yes"| remoteLaunch["teleportToRemote&lt;br/&gt;register RemoteAgentTask"]
+  remoteCheck -->|"no"| asyncDecide
+  remoteLaunch --> remoteReturn["return remote_launched"]
+  asyncDecide{"run in background?&lt;br/&gt;run_in_background / background:true&lt;br/&gt;coordinator / fork / kairos"}
+  asyncDecide -->|"yes"| asyncPath["registerAsyncAgent&lt;br/&gt;runAsyncAgentLifecycle drives in background"]
+  asyncDecide -->|"no"| syncPath["registerAgentForeground&lt;br/&gt;run foreground, can background midway"]
+  asyncPath --> asyncReturn["return async_launched"]
+  syncPath --> syncLoop["foreground message loop&lt;br/&gt;races against backgroundSignal"]
+  syncLoop --> bgRace{"backgrounded?"}
+  bgRace -->|"yes"| bgContinue["move to background and continue&lt;br/&gt;return async_launched"]
+  bgRace -->|"no"| syncDone["complete/fail/cancel&lt;br/&gt;return completed"]
+</pre>
+
+<ul>
+  <li>The entry point is <code>AgentTool.tsx</code>'s <code>call()</code>; the entire dispatch logic is about 1,000 lines and is the most critical section of this module.</li>
+  <li>The "should it run in background?" step is the watershed: synchronous subagents share the parent conversation's abortController (user pressing ESC cancels both), while background subagents get an independent abortController (ESC canceling the main loop does not accidentally kill the background).</li>
+  <li>The foreground path has a unique "race loop": each round Promise.races "next message" against "signal to move to background"—once a background signal is received it immediately transitions to background without blocking for the next round.</li>
+  <li>Worktree isolation: when <code>isolation: "worktree"</code> is selected, a temporary git worktree is opened for the subagent; it is auto-cleaned after completion if there are no changes, otherwise retained and the result includes worktreePath.</li>
+</ul>
+
+<h2>2. Subagent Execution Loop: runAgent</h2>
+
+<p>Once the Agent tool has decided "who to dispatch and in what isolation," actual execution is handed to <code>runAgent()</code>. It is an async generator that yields each message produced by the subagent. It is responsible for arming the subagent: resolving which tools it should use, installing the system prompt, connecting its declared MCP servers, registering its frontmatter hooks, preloading the skills it needs, and then feeding it into the main <code>query()</code> inference loop.</p>
+
+<pre class="mermaid">
+graph TD
+  start["runAgent input&lt;br/&gt;agentDefinition + promptMessages"] --> resolveModel["resolve model&lt;br/&gt;agentDef.model / parent model / explicit override"]
+  resolveModel --> filterTools["resolve toolset&lt;br/&gt;resolveAgentTools()&lt;br/&gt;strip disallowed / async-incompatible"]
+  filterTools --> sysPrompt["build system prompt&lt;br/&gt;override or getAgentSystemPrompt"]
+  sysPrompt --> hooks["execute SubagentStart hooks&lt;br/&gt;collect additional context"]
+  hooks --> registerHooks["register frontmatter hooks&lt;br/&gt;(admin-trusted only)"]
+  registerHooks --> preloadSkills["preload skills declared by agent"]
+  preloadSkills --> initMcp["initialize agent-specific MCP servers&lt;br/&gt;parent + inline merged"]
+  initMcp --> buildCtx["createSubagentContext&lt;br/&gt;sync shares setAppState/abort&lt;br/&gt;async independent"]
+  buildCtx --> recordInit["write sidechain transcript + metadata"]
+  recordInit --> queryLoop["for await query() message loop"]
+  queryLoop --> msgType{"message type?"}
+  msgType -->|"stream_event message_start"| pushMetrics["forward TTFT to parent metrics"]
+  msgType -->|"attachment max_turns"| breakLoop["break"]
+  msgType -->|"recordable message"| record["write sidechain transcript&lt;br/&gt;update lastRecordedUuid"]
+  record --> yield["yield message to caller"]
+  yield --> queryLoop
+  breakLoop --> abortCheck{"abort triggered?"}
+  abortCheck -->|"yes"| throwAbort["throw AbortError"]
+  abortCheck -->|"no"| callback["built-in agent callback"]
+  callback --> cleanup
+  throwAbort --> cleanup["finally: MCP cleanup / hooks cleanup /&lt;br/&gt;killShellTasksForAgent / perfetto unregister"]
+</pre>
+
+<ul>
+  <li>Tool resolution <code>resolveAgentTools</code> (in <code>agentToolUtils.ts</code>) filters by permission mode: async subagents may only use tools on the <code>ASYNC_AGENT_ALLOWED_TOOLS</code> allowlist; in-process teammates additionally get Agent and task-coordination tools so they can dispatch synchronous subagents.</li>
+  <li>The fork path is special: it uses <code>useExactTools=true</code>, taking the parent's tool array and system prompt directly so the API request prefix is byte-for-byte identical to hit the prompt cache—therefore a fork worker cannot fork again (recursive protection in AgentTool.call uses querySource + message scan).</li>
+  <li>Each agent's transcript is written to a sidechain JSONL (<code>recordSidechainTranscript</code>); this is the data foundation for SendMessage resume, --resume recovery, and UI panel progress viewing.</li>
+  <li>The finally cleanup is key to "leaving no tail": kill shell tasks spawned by this agent, unregister session hooks, release perfetto tracing, clear todos keys—otherwise hundreds of agents in a long session would slowly leak memory.</li>
+</ul>
+
+<h2>3. Task State Machine: LocalAgentTask</h2>
+
+<p>Every dispatched subagent has a corresponding <code>LocalAgentTaskState</code> in AppState.tasks. The <code>status</code> field comes from the <code>TaskStatus</code> union type, and transitions are strictly constrained—this is the most typical state-machine view in this module.</p>
+
+<pre class="mermaid">
+graph TD
+  pending["pending&lt;br/&gt;createTaskStateBase initial state"] -->|"set directly at spawn"| running["running&lt;br/&gt;registerAsyncAgent / registerAgentForeground"]
+  running -->|"normal completion&lt;br/&gt;completeAgentTask"| completed["completed&lt;br/&gt;with result + endTime"]
+  running -->|"throws exception&lt;br/&gt;failAsyncAgent"| failed["failed&lt;br/&gt;with error"]
+  running -->|"user/TaskStop kill&lt;br/&gt;killAsyncAgent"| killed["killed&lt;br/&gt;abort + cleanup"]
+  running -->|"foreground to background&lt;br/&gt;backgroundAgentTask"| runningBg["running (isBackgrounded=true)&lt;br/&gt;foreground loop exits, background continues"]
+  runningBg -->|"background completes"| completed
+  runningBg -->|"background fails"| failed
+  runningBg -->|"background killed"| killed
+  completed -->|"evictAfter expires&lt;br/&gt;non-retain"| evicted["removed from AppState"]
+  failed --> evicted
+  killed --> evicted
+  running -->|"SendMessage resume&lt;br/&gt;resumeAgentBackground"| running
+  killed -->|"SendMessage revive&lt;br/&gt;resumeAgentBackground"| running
+  completed -.->|"retain=true&lt;br/&gt;UI holds"| retained["kept in AppState&lt;br/&gt;no evictAfter"]
+</pre>
+
+<ul>
+  <li>The state machine is defined in <code>src/Task.ts</code>: <code>TaskStatus = pending | running | completed | failed | killed</code>; <code>isTerminalTaskStatus()</code> marks the last three as terminal—preventing messages from being injected into a dead teammate and preventing cleanup paths from re-entering.</li>
+  <li>The <b>notified flag</b> is the deduplication key: after a task reaches a terminal state, <code>enqueueAgentNotification</code> injects <code>&lt;task-notification&gt;</code> XML into the main loop. But TaskStop also marks notified to suppress redundant notifications. All terminal transition functions (complete/fail/kill) call <code>updateTaskState</code> before <code>evictTaskOutput</code>—state flips first, disk cleanup second—so TaskOutput's block wait is released immediately.</li>
+  <li>The <b>retain field</b> controls whether the UI "holds" this task: retained tasks do not set evictAfter, are not cleaned up by background metrics, and trigger disk bootstrap to merge the sidechain transcript UUID into messages for panel viewing.</li>
+  <li>The <b>pendingMessages queue</b>: when SendMessage sends a message to a running agent, the message enters <code>task.pendingMessages</code> and is drained into the agent's API input at the tool-turn boundary by <code>drainPendingMessages</code>—without interrupting the current turn.</li>
+  <li>The panel visibility predicate <code>isPanelAgentTask</code>: all pill/panel filters must share this single predicate, otherwise they will be inconsistent—agentType 'main-session' does not count as a panel agent.</li>
+</ul>
+
+<h2>4. Background Lifecycle Driver: runAsyncAgentLifecycle</h2>
+
+<p>Whether dispatched directly in the background from the Agent tool, transitioned from foreground to background, or revived after a SendMessage stop, all paths eventually converge on <code>runAsyncAgentLifecycle()</code> (in <code>agentToolUtils.ts</code>). It wraps "run agent + track progress + terminal transition + notification" into a shared driver.</p>
+
+<pre class="mermaid">
+graph TD
+  start["runAsyncAgentLifecycle&lt;br/&gt;taskId + makeStream"] --> makeTracker["create ProgressTracker&lt;br/&gt;+ ActivityDescriptionResolver"]
+  makeTracker --> onCache["onCacheSafeParams callback&lt;br/&gt;(enables summary service)"]
+  onCache --> loop["for await makeStream() messages"]
+  loop --> pushMsg["push message into agentMessages"]
+  pushMsg --> retainCheck{"task.retain?&lt;br/&gt;UI holds"}
+  retainCheck -->|"yes"| appendLive["append messages to state&lt;br/&gt;display live"]
+  retainCheck -->|"no"| progress["update progress&lt;br/&gt;emit task_progress SDK event"]
+  appendLive --> progress
+  progress --> loop
+  loop -->|"stream ends"| finalize["finalizeAgentTool&lt;br/&gt;extract last assistant text + stats"]
+  finalize --> complete["completeAsyncAgent&lt;br/&gt;status flips to completed (before notification)"]
+  complete --> handoff{"auto mode&lt;br/&gt;needs handoff classification?"}
+  handoff -->|"yes"| classify["classifyHandoffIfNeeded&lt;br/&gt;safety classifier reviews subagent output"]
+  handoff -->|"no"| worktree["clean up worktree"]
+  classify --> worktree
+  worktree --> notify["enqueueAgentNotification&lt;br/&gt;status=completed + finalMessage"]
+  notify --> doneLoop["finally: clean skills / dumpState"]
+  loop -->|"AbortError"| killBranch["killAsyncAgent + extractPartialResult&lt;br/&gt;notify status=killed + partial result"]
+  loop -->|"other exception"| failBranch["failAsyncAgent&lt;br/&gt;notify status=failed + error"]
+  killBranch --> doneLoop
+  failBranch --> worktree
+</pre>
+
+<ul>
+  <li><b>Flip state before sending notification</b> is a hard constraint (gh-20236): completeAsyncAgent/failAsyncAgent/killAsyncAgent immediately flip status to terminal so <code>TaskOutput(block=true)</code>'s <code>waitForTaskCompletion</code> unblocks immediately; classifier calls, worktree cleanup, and other potentially hanging steps happen after the state flip—they must not block state-machine progress.</li>
+  <li><b>extractPartialResult</b>: when killed, it walks backward through collected assistant messages and extracts the first one with text as finalMessage for the notification—even if canceled midway, the parent agent can see how far the subagent got.</li>
+  <li><b>classifyHandoffIfNeeded</b>: triggered only in auto permission mode when the TRANSCRIPT_CLASSIFIER feature is on; it uses an independent classifier model to review whether the subagent's actions violate safety policies—if unavailable it allows through but warns; if blocked it returns a SECURITY WARNING to the parent agent.</li>
+</ul>
+
+<h2>5. Stopping Tasks: TaskStop → stopTask</h2>
+
+<p>When the user or main conversation wants to stop a background task (shell or agent) midway, they call the TaskStop tool. It is a thin wrapper; the real logic is in <code>tasks/stopTask.ts</code>'s <code>stopTask()</code>.</p>
+
+<pre class="mermaid">
+graph TD
+  entry["TaskStop.call(task_id)"] --> lookup["find task in AppState.tasks"]
+  lookup --> found{"found?"}
+  found -->|"no"| errNotFound["StopTaskError not_found"]
+  found -->|"yes"| running{"status=running?"}
+  running -->|"no"| errNotRunning["StopTaskError not_running"]
+  running -->|"yes"| impl["getTaskByType(task.type)&lt;br/&gt;get Task implementation"]
+  impl --> implFound{"has implementation?"}
+  implFound -->|"no"| errUnsupported["StopTaskError unsupported_type"]
+  implFound -->|"yes"| kill["taskImpl.kill(taskId, setAppState)&lt;br/&gt;polymorphic dispatch to each Task"]
+  kill --> shellCheck{"is local_bash?"}
+  shellCheck -->|"yes"| suppress["mark notified=true&lt;br/&gt;suppress exit 137 noise"]
+  shellCheck -->|"no"| return["return taskId/type/command"]
+  suppress --> emitSdk["emitTaskTerminatedSdk&lt;br/&gt;SDK consumers still see termination event"]
+  emitSdk --> return
+</pre>
+
+<ul>
+  <li>Polymorphic dispatch: <code>getTaskByType</code> (in <code>tasks.ts</code>) returns concrete implementations such as LocalShellTask / LocalAgentTask / RemoteAgentTask / DreamTask based on the type field, each implementing <code>kill(taskId, setAppState)</code>. Note that the <code>Task</code> interface now only keeps kill—spawn/render are no longer polymorphic (removed in commit 22546).</li>
+  <li>When a shell task is killed it proactively marks notified to suppress the "exit code 137" noise notification, but emits an SDK task_terminated event so SDK consumers (e.g., VS Code) still see the shutdown; agent tasks are not suppressed—because the AbortError catch uses extractPartialResult to produce a meaningful payload.</li>
+</ul>
+
+<h2>6. Multi-Agent Collaboration: Teams, Teammates, and Messages</h2>
+
+<p>What we've discussed so far is the binary relationship between the main conversation and a single subagent. Multi-agent teams are a separate mechanism: a leader creates a team via TeamCreate, then dispatches teammates via Agent with the name parameter; teammates message each other via SendMessage. This is implemented collaboratively by TeamCreateTool / TeamDeleteTool / SendMessageTool / spawnMultiAgent.</p>
+
+<pre class="mermaid">
+graph TD
+  create["TeamCreate.call(team_name)"] --> exists{"team already exists?"}
+  exists -->|"yes"| errTeam["error: only one team at a time"]
+  exists -->|"no"| unique["generate unique team name"]
+  unique --> writeTeam["write TeamFile to disk&lt;br/&gt;leader as first member"]
+  writeTeam --> resetTasks["reset task list directory&lt;br/&gt;team=project=task list"]
+  resetTasks --> setState["set AppState.teamContext&lt;br/&gt;leader has no agentId (isTeammate=false)"]
+  setState --> spawnTeammate["leader calls Agent(name=xx)&lt;br/&gt;spawnTeammate()"]
+  spawnTeammate --> mode{"spawn mode?"}
+  mode -->|"in-process"| inProc["handleSpawnInProcess&lt;br/&gt;same-process AsyncLocalStorage isolation&lt;br/&gt;startInProcessTeammate starts loop"]
+  mode -->|"splitpane/separate"| pane["handleSpawnSplitPane&lt;br/&gt;tmux/iTerm2 opens new pane for independent process"]
+  mode -->|"auto, no backend"| fallback["fall back to in-process"]
+  inProc --> running["teammate running&lt;br/&gt;pendingUserMessages queue receives messages"]
+  pane --> running
+  running --> msg["SendMessage between teammates"]
+  msg --> route{"routing target?"}
+  route -->|"look up by name in agentNameRegistry&lt;br/&gt;find LocalAgentTask"| queue["queuePendingMessage&lt;br/&gt;injected at next tool turn"]
+  route -->|"task stopped"| resume["resumeAgentBackground&lt;br/&gt;revive from disk transcript"]
+  route -->|"by teammate name / email"| mailbox["writeToMailbox&lt;br/&gt;persist to mailbox file"]
+  route -->|"broadcast *"| broadcast["iterate TeamFile.members&lt;br/&gt;write mailbox to each"]
+  msg --> structured{"structured message?"}
+  structured -->|"shutdown_request"| shutReq["request shutdown&lt;br/&gt;recipient decides approve/reject"]
+  structured -->|"shutdown_response approve"| shutAppr["in-process: abort self&lt;br/&gt;tmux: gracefulShutdown"]
+  structured -->|"plan_approval"| plan["leader approves teammate's plan&lt;br/&gt;returns permissionMode"]
+  shutReq --> delete["TeamDelete.call()"]
+  delete --> activeCheck{"active members?"}
+  activeCheck -->|"yes"| refuse["refuse cleanup"]
+  activeCheck -->|"no"| cleanup["cleanupTeamDirectories&lt;br/&gt;clear AppState.teamContext + inbox"]
+</pre>
+
+<ul>
+  <li>Team information is persisted on disk in TeamFile (<code>utils/swarm/teamHelpers.ts</code>), not in AppState—so tmux-independent-process teammates can read the same roster. Session-level cleanup is registered in <code>registerTeamForSessionCleanup</code> to avoid leftover team files (gh-32730).</li>
+  <li><b>In-process teammates</b> use AsyncLocalStorage isolation, not independent processes, and their lifecycle is bound to the leader process—so they cannot dispatch background agents or spawn teammates (the team roster is flat; nesting would break). These constraints are hard-validated at the AgentTool.call entry.</li>
+  <li><b>SendMessage routing priority</b>: first check <code>appState.agentNameRegistry</code> (name→agentId mapping, registered at spawn); if it hits a LocalAgentTask, use the pendingMessages queue; if the task is stopped, resumeAgentBackground revives it from the sidechain transcript; otherwise fall back to teammate mailboxes (tmux/inter-process).</li>
+  <li><b>Structured messages</b> are used for team governance: shutdown_request/response implements graceful shutdown handshake (in-process aborts itself directly, tmux uses gracefulShutdown), plan_approval_response lets the leader approve a teammate's plan mode and return the permissionMode to inherit.</li>
+  <li><b>UDS/bridge across sessions</b>: SendMessage also supports <code>uds:&lt;socket&gt;</code> and <code>bridge:&lt;session&gt;</code> addresses; the former writes to a local Unix socket, the latter delivers across machines via Remote Control—bridge requires mandatory user confirmation (bypass-immune security check) and only allows plain text.</li>
+</ul>
+
+<h2>7. Coordinator Mode: Leader Does Not Do the Work Directly</h2>
+
+<p>In normal mode, the Claude in the main conversation uses tools itself; in Coordinator mode (<code>COORDINATOR_MODE</code> feature flag + <code>CLAUDE_CODE_COORDINATOR_MODE</code> environment variable), Claude becomes a pure dispatcher—using only Agent/SendMessage/TaskStop, dispatching all real work to worker subagents. This is configured in <code>coordinator/coordinatorMode.ts</code>.</p>
+
+<pre class="mermaid">
+graph TD
+  env["environment variable&lt;br/&gt;CLAUDE_CODE_COORDINATOR_MODE"] --> gate{"COORDINATOR_MODE flag on?"}
+  gate -->|"no"| off["isCoordinatorMode()=false&lt;br/&gt;normal mode"]
+  gate -->|"yes"| on["isCoordinatorMode()=true"]
+  on --> sysPrompt["getCoordinatorSystemPrompt()&lt;br/&gt;inject leader role prompt"]
+  on --> userCtx["getCoordinatorUserContext()&lt;br/&gt;tell workers available toolset + scratchpad"]
+  on --> forceAsync["Agent tool shouldRunAsync=true&lt;br/&gt;force all spawns to background"]
+  on --> escKill["on ESC cancel&lt;br/&gt;killAllRunningAgentTasks kills all"]
+  on --> summary["enable AgentSummary&lt;br/&gt;periodic summary of worker progress"]
+  match["matchSessionMode&lt;br/&gt;on --resume"] --> switch{"session mode != current?"}
+  switch -->|"yes"| flip["flip env var&lt;br/&gt;return prompt"]
+  switch -->|"no"| noop["no-op"]
+</pre>
+
+<ul>
+  <li>The Coordinator system prompt (coordinatorMode.ts lines 111-369) is a complete playbook: it defines the leader role, how to use Agent/SendMessage/TaskStop tools, the <code>&lt;task-notification&gt;</code> format, four phases (research → synthesize → implement → verify), concurrency strategy (read-only in parallel, writes serialized), continue vs spawn decision table, and worker prompt writing guidelines.</li>
+  <li>Key constraints: the leader does not set a model parameter (workers do the real work with the default model), does not inspect one worker inside another (workers notify automatically when done), and does not fabricate results (results arrive as separate messages).</li>
+  <li><code>matchSessionMode</code> handles mode mismatch on resume: if the old session stored coordinator mode but it is not currently enabled, it flips the env so isCoordinatorMode() returns the correct value—because isCoordinatorMode() reads env live and does not cache.</li>
+  <li>The scratchpad directory (<code>tengu_scratch</code> gate) gives workers a permission-prompt-free shared knowledge base—the leader tells workers the path in userContext, and workers read and write handoff information there.</li>
+</ul>
+
+<h2>8. Task Tool Family: Create/Get/List/Output/Update/Stop</h2>
+
+<p>Besides Agent (dispatch agents) and SendMessage (inter-agent communication), there is a set of "task list" tools that let multi-agent teams share a todo board to coordinate work. These tools operate on a task list on disk (<code>utils/tasks.ts</code>; team = project = task list), which is a separate concept from the "background execution tasks" above—this is a TODO board.</p>
+
+<ul>
+  <li><b>TaskCreate</b>: creates a pending task in the current task list (<code>getTaskListId()</code>; leader uses team name, normal session uses sessionId), triggers TaskCreated hooks; if a hook returns a blockingError it rolls back and deletes. Auto-expands the task panel.</li>
+  <li><b>TaskUpdate</b>: changes task status (pending→in_progress→completed), owner, dependencies. Used by teammates to claim work and mark completion.</li>
+  <li><b>TaskList/TaskGet</b>: list all / query one, for teammate board coordination.</li>
+  <li><b>TaskOutput</b>: reads output of a background execution task (LocalAgent/LocalShell/Remote). <code>block=true</code> uses <code>waitForTaskCompletion</code> to block until terminal state or timeout—this is the main conversation's synchronization primitive for "wait for a background agent to finish," relying on the timely state flips described in Section 3.</li>
+  <li><b>TaskStop</b>: see Section 5, polymorphic kill.</li>
+</ul>
+
+<h2>9. Remote and Dream: Two Other Task Types</h2>
+
+<p>Besides LocalAgent (local subagent) and LocalShell (local bash), the task system has two more members:</p>
+
+<ul>
+  <li><b>RemoteAgentTask</b> (<code>tasks/RemoteAgentTask/</code>): dispatches an agent to a remote CCR environment (ant-only, <code>isolation: "remote"</code> or ultraplan/review scenarios). <code>registerRemoteAgentTask</code> creates the task state, <code>remoteTaskMetadata</code> persists to sidecar for <code>--resume</code> reconnection to still-alive remote sessions; <code>restoreRemoteAgentTasks</code> fetches the latest state from CCR on startup to restore tasks. Kill is dispatched via RemoteAgentTask.kill polymorphically.</li>
+  <li><b>DreamTask</b> (<code>tasks/DreamTask/</code>): a special multi-turn iterative task (DreamPhase: starting/updating), <code>addDreamTurn</code> accumulates turns, <code>completeDreamTask/failDreamTask</code> perform terminal transitions, also implementing the Task interface to participate in polymorphic kill.</li>
+  <li>All concrete Task implementations are registered in <code>getAllTasks()</code> (<code>tasks.ts</code>): LocalShellTask, LocalAgentTask, RemoteAgentTask, and DreamTask are always present; LocalWorkflowTask/MonitorMcpTask are require'd on demand under feature flags (avoids circular deps + dead code elimination).</li>
+  <li>Task ID prefixes are assigned by type (local_bash→b, local_agent→a, remote_agent→r, in_process_teammate→t, dream→d), followed by an 8-digit base-36 random value—36^8 ≈ 2.8 trillion combinations, resistant to symlink brute-force attacks.</li>
+</ul>
+
+<h2>Key Design Takeaways</h2>
+
+<ul>
+  <li><b>Flip state before sending notification</b>: all terminal transition functions first updateTaskState, then perform potentially hanging cleanup/classification/notification, ensuring TaskOutput's blocking wait is released immediately (gh-20236).</li>
+  <li><b>notified deduplication</b>: enqueueAgentNotification uses the notified flag atomically to prevent duplicate notifications; TaskStop also marks notified to suppress shell exit noise.</li>
+  <li><b>Foreground↔background reversible</b>: a foreground agent can transition to background midway (backgroundSignal race), and a background agent can be resumed or revived by SendMessage—both driven by the same runAsyncAgentLifecycle.</li>
+  <li><b>Isolation layers</b>: synchronous subagents share the parent's abortController; background subagents have independent abortControllers (ESC does not accidentally kill); in-process teammates use AsyncLocalStorage same-process isolation; tmux teammates are independent processes; remote agents run in independent CCR environments.</li>
+  <li><b>Permissions narrow down the inheritance chain</b>: a worker's tool pool is reassembled with the worker's own permissionMode (assembleToolPool), not inheriting the parent's tool restrictions; allowedTools replaces all session-level rules when provided to prevent leakage, but preserves cliArg (SDK --allowedTools).</li>
+  <li><b>Fork cache alignment</b>: a fork worker inherits the parent's system prompt + parent's tool array + parent's thinkingConfig so the API request prefix is byte-for-byte identical to hit the prompt cache—therefore nested forks are forbidden, and recursive protection uses querySource (autocompact does not change context.options) + message scan as dual safeguards.</li>
+  <li><b>Cleanup leaves nothing behind</b>: runAgent's finally kills shell tasks spawned by the agent, unhooks hooks, clears todos keys, and releases perfetto—so hundreds of agents in a long session do not slowly leak memory.</li>
+</ul>
+
+<script>
+window.__sourceMap = {
+  "entry": { "file": "src/tools/AgentTool/AgentTool.tsx", "startLine": 239, "endLine": 316 },
+  "teamCheck": { "file": "src/tools/AgentTool/AgentTool.tsx", "startLine": 282, "endLine": 316 },
+  "spawnTeammate": { "file": "src/tools/AgentTool/AgentTool.tsx", "startLine": 290, "endLine": 316 },
+  "resolveType": { "file": "src/tools/AgentTool/AgentTool.tsx", "startLine": 318, "endLine": 356 },
+  "forkCheck": { "file": "src/tools/AgentTool/AgentTool.tsx", "startLine": 322, "endLine": 356 },
+  "forkReject": { "file": "src/tools/AgentTool/AgentTool.tsx", "startLine": 332, "endLine": 334 },
+  "forkPath": { "file": "src/tools/AgentTool/AgentTool.tsx", "startLine": 335, "endLine": 335 },
+  "normalPath": { "file": "src/tools/AgentTool/AgentTool.tsx", "startLine": 336, "endLine": 356 },
+  "agentNotFound": { "file": "src/tools/AgentTool/AgentTool.tsx", "startLine": 345, "endLine": 354 },
+  "denyErr": { "file": "src/tools/AgentTool/AgentTool.tsx", "startLine": 349, "endLine": 352 },
+  "notFoundErr": { "file": "src/tools/AgentTool/AgentTool.tsx", "startLine": 353, "endLine": 353 },
+  "mcpCheck": { "file": "src/tools/AgentTool/AgentTool.tsx", "startLine": 367, "endLine": 410 },
+  "waitMcp": { "file": "src/tools/AgentTool/AgentTool.tsx", "startLine": 377, "endLine": 392 },
+  "remoteCheck": { "file": "src/tools/AgentTool/AgentTool.tsx", "startLine": 435, "endLine": 482 },
+  "remoteLaunch": { "file": "src/tools/AgentTool/AgentTool.tsx", "startLine": 436, "endLine": 481 },
+  "remoteReturn": { "file": "src/tools/AgentTool/AgentTool.tsx", "startLine": 469, "endLine": 481 },
+  "asyncDecide": { "file": "src/tools/AgentTool/AgentTool.tsx", "startLine": 557, "endLine": 567 },
+  "asyncPath": { "file": "src/tools/AgentTool/AgentTool.tsx", "startLine": 686, "endLine": 764 },
+  "asyncReturn": { "file": "src/tools/AgentTool/AgentTool.tsx", "startLine": 754, "endLine": 764 },
+  "syncPath": { "file": "src/tools/AgentTool/AgentTool.tsx", "startLine": 765, "endLine": 806 },
+  "syncLoop": { "file": "src/tools/AgentTool/AgentTool.tsx", "startLine": 846, "endLine": 1126 },
+  "bgRace": { "file": "src/tools/AgentTool/AgentTool.tsx", "startLine": 897, "endLine": 1053 },
+  "bgContinue": { "file": "src/tools/AgentTool/AgentTool.tsx", "startLine": 911, "endLine": 1052 },
+  "syncDone": { "file": "src/tools/AgentTool/AgentTool.tsx", "startLine": 1223, "endLine": 1261 },
+  "start": { "file": "src/tools/AgentTool/runAgent.ts", "startLine": 248, "endLine": 329 },
+  "resolveModel": { "file": "src/tools/AgentTool/runAgent.ts", "startLine": 340, "endLine": 345 },
+  "filterTools": { "file": "src/tools/AgentTool/runAgent.ts", "startLine": 500, "endLine": 502 },
+  "sysPrompt": { "file": "src/tools/AgentTool/runAgent.ts", "startLine": 508, "endLine": 518 },
+  "hooks": { "file": "src/tools/AgentTool/runAgent.ts", "startLine": 530, "endLine": 555 },
+  "registerHooks": { "file": "src/tools/AgentTool/runAgent.ts", "startLine": 557, "endLine": 575 },
+  "preloadSkills": { "file": "src/tools/AgentTool/runAgent.ts", "startLine": 577, "endLine": 646 },
+  "initMcp": { "file": "src/tools/AgentTool/runAgent.ts", "startLine": 648, "endLine": 664 },
+  "buildCtx": { "file": "src/tools/AgentTool/runAgent.ts", "startLine": 700, "endLine": 730 },
+  "recordInit": { "file": "src/tools/AgentTool/runAgent.ts", "startLine": 732, "endLine": 745 },
+  "queryLoop": { "file": "src/tools/AgentTool/runAgent.ts", "startLine": 748, "endLine": 806 },
+  "msgType": { "file": "src/tools/AgentTool/runAgent.ts", "startLine": 761, "endLine": 790 },
+  "pushMetrics": { "file": "src/tools/AgentTool/runAgent.ts", "startLine": 761, "endLine": 768 },
+  "breakLoop": { "file": "src/tools/AgentTool/runAgent.ts", "startLine": 773, "endLine": 787 },
+  "record": { "file": "src/tools/AgentTool/runAgent.ts", "startLine": 792, "endLine": 805 },
+  "yield": { "file": "src/tools/AgentTool/runAgent.ts", "startLine": 804, "endLine": 805 },
+  "abortCheck": { "file": "src/tools/AgentTool/runAgent.ts", "startLine": 808, "endLine": 810 },
+  "throwAbort": { "file": "src/tools/AgentTool/runAgent.ts", "startLine": 809, "endLine": 810 },
+  "callback": { "file": "src/tools/AgentTool/runAgent.ts", "startLine": 813, "endLine": 815 },
+  "cleanup": { "file": "src/tools/AgentTool/runAgent.ts", "startLine": 816, "endLine": 859 },
+  "pending": { "file": "src/Task.ts", "startLine": 44, "endLine": 57 },
+  "running": { "file": "src/tasks/LocalAgentTask/LocalAgentTask.tsx", "startLine": 466, "endLine": 515 },
+  "runningBg": { "file": "src/tasks/LocalAgentTask/LocalAgentTask.tsx", "startLine": 620, "endLine": 652 },
+  "completed": { "file": "src/tasks/LocalAgentTask/LocalAgentTask.tsx", "startLine": 412, "endLine": 432 },
+  "failed": { "file": "src/tasks/LocalAgentTask/LocalAgentTask.tsx", "startLine": 437, "endLine": 456 },
+  "killed": { "file": "src/tasks/LocalAgentTask/LocalAgentTask.tsx", "startLine": 281, "endLine": 303 },
+  "evicted": { "file": "src/tasks/LocalAgentTask/LocalAgentTask.tsx", "startLine": 657, "endLine": 682 },
+  "retained": { "file": "src/tasks/LocalAgentTask/LocalAgentTask.tsx", "startLine": 137, "endLine": 148 },
+  "lifecycleStart": { "file": "src/tools/AgentTool/agentToolUtils.ts", "startLine": 508, "endLine": 535 },
+  "makeTracker": { "file": "src/tools/AgentTool/agentToolUtils.ts", "startLine": 536, "endLine": 553 },
+  "onCache": { "file": "src/tools/AgentTool/agentToolUtils.ts", "startLine": 543, "endLine": 553 },
+  "pushMsg": { "file": "src/tools/AgentTool/agentToolUtils.ts", "startLine": 554, "endLine": 555 },
+  "retainCheck": { "file": "src/tools/AgentTool/agentToolUtils.ts", "startLine": 559, "endLine": 570 },
+  "appendLive": { "file": "src/tools/AgentTool/agentToolUtils.ts", "startLine": 559, "endLine": 570 },
+  "progress": { "file": "src/tools/AgentTool/agentToolUtils.ts", "startLine": 571, "endLine": 593 },
+  "finalize": { "file": "src/tools/AgentTool/agentToolUtils.ts", "startLine": 597, "endLine": 597 },
+  "complete": { "file": "src/tools/AgentTool/agentToolUtils.ts", "startLine": 603, "endLine": 603 },
+  "handoff": { "file": "src/tools/AgentTool/agentToolUtils.ts", "startLine": 607, "endLine": 620 },
+  "classify": { "file": "src/tools/AgentTool/agentToolUtils.ts", "startLine": 389, "endLine": 481 },
+  "worktree": { "file": "src/tools/AgentTool/agentToolUtils.ts", "startLine": 622, "endLine": 622 },
+  "notify": { "file": "src/tasks/LocalAgentTask/LocalAgentTask.tsx", "startLine": 197, "endLine": 262 },
+  "doneLoop": { "file": "src/tools/AgentTool/agentToolUtils.ts", "startLine": 682, "endLine": 685 },
+  "killBranch": { "file": "src/tools/AgentTool/agentToolUtils.ts", "startLine": 640, "endLine": 668 },
+  "failBranch": { "file": "src/tools/AgentTool/agentToolUtils.ts", "startLine": 670, "endLine": 681 },
+  "stopEntry": { "file": "src/tools/TaskStopTool/TaskStopTool.ts", "startLine": 107, "endLine": 131 },
+  "lookup": { "file": "src/tasks/stopTask.ts", "startLine": 38, "endLine": 48 },
+  "found": { "file": "src/tasks/stopTask.ts", "startLine": 46, "endLine": 48 },
+  "running2": { "file": "src/tasks/stopTask.ts", "startLine": 50, "endLine": 55 },
+  "impl": { "file": "src/tasks/stopTask.ts", "startLine": 57, "endLine": 63 },
+  "implFound": { "file": "src/tasks/stopTask.ts", "startLine": 58, "endLine": 63 },
+  "kill": { "file": "src/tasks/stopTask.ts", "startLine": 65, "endLine": 65 },
+  "shellCheck": { "file": "src/tasks/stopTask.ts", "startLine": 70, "endLine": 97 },
+  "suppress": { "file": "src/tasks/stopTask.ts", "startLine": 71, "endLine": 86 },
+  "emitSdk": { "file": "src/tasks/stopTask.ts", "startLine": 89, "endLine": 94 },
+  "return2": { "file": "src/tasks/stopTask.ts", "startLine": 97, "endLine": 100 },
+  "errNotFound": { "file": "src/tasks/stopTask.ts", "startLine": 47, "endLine": 47 },
+  "errNotRunning": { "file": "src/tasks/stopTask.ts", "startLine": 51, "endLine": 54 },
+  "errUnsupported": { "file": "src/tasks/stopTask.ts", "startLine": 59, "endLine": 62 },
+  "create": { "file": "src/tools/TeamCreateTool/TeamCreateTool.ts", "startLine": 128, "endLine": 237 },
+  "exists": { "file": "src/tools/TeamCreateTool/TeamCreateTool.ts", "startLine": 136, "endLine": 140 },
+  "errTeam": { "file": "src/tools/TeamCreateTool/TeamCreateTool.ts", "startLine": 137, "endLine": 139 },
+  "unique": { "file": "src/tools/TeamCreateTool/TeamCreateTool.ts", "startLine": 143, "endLine": 143 },
+  "writeTeam": { "file": "src/tools/TeamCreateTool/TeamCreateTool.ts", "startLine": 157, "endLine": 181 },
+  "resetTasks": { "file": "src/tools/TeamCreateTool/TeamCreateTool.ts", "startLine": 183, "endLine": 191 },
+  "setState": { "file": "src/tools/TeamCreateTool/TeamCreateTool.ts", "startLine": 194, "endLine": 212 },
+  "spawnTeammate2": { "file": "src/tools/shared/spawnMultiAgent.ts", "startLine": 1040, "endLine": 1078 },
+  "mode": { "file": "src/tools/shared/spawnMultiAgent.ts", "startLine": 1044, "endLine": 1077 },
+  "inProc": { "file": "src/tools/shared/spawnMultiAgent.ts", "startLine": 840, "endLine": 938 },
+  "pane": { "file": "src/tools/shared/spawnMultiAgent.ts", "startLine": 305, "endLine": 544 },
+  "fallback": { "file": "src/tools/shared/spawnMultiAgent.ts", "startLine": 1057, "endLine": 1068 },
+  "msg": { "file": "src/tools/SendMessageTool/SendMessageTool.ts", "startLine": 741, "endLine": 913 },
+  "route": { "file": "src/tools/SendMessageTool/SendMessageTool.ts", "startLine": 802, "endLine": 874 },
+  "queue": { "file": "src/tools/SendMessageTool/SendMessageTool.ts", "startLine": 808, "endLine": 820 },
+  "resume": { "file": "src/tools/SendMessageTool/SendMessageTool.ts", "startLine": 823, "endLine": 844 },
+  "mailbox": { "file": "src/tools/SendMessageTool/SendMessageTool.ts", "startLine": 149, "endLine": 189 },
+  "broadcast": { "file": "src/tools/SendMessageTool/SendMessageTool.ts", "startLine": 191, "endLine": 266 },
+  "structured": { "file": "src/tools/SendMessageTool/SendMessageTool.ts", "startLine": 887, "endLine": 912 },
+  "shutReq": { "file": "src/tools/SendMessageTool/SendMessageTool.ts", "startLine": 268, "endLine": 303 },
+  "shutAppr": { "file": "src/tools/SendMessageTool/SendMessageTool.ts", "startLine": 305, "endLine": 399 },
+  "plan": { "file": "src/tools/SendMessageTool/SendMessageTool.ts", "startLine": 434, "endLine": 518 },
+  "delete": { "file": "src/tools/TeamDeleteTool/TeamDeleteTool.ts", "startLine": 71, "endLine": 135 },
+  "activeCheck": { "file": "src/tools/TeamDeleteTool/TeamDeleteTool.ts", "startLine": 79, "endLine": 99 },
+  "refuse": { "file": "src/tools/TeamDeleteTool/TeamDeleteTool.ts", "startLine": 89, "endLine": 98 },
+  "cleanup": { "file": "src/tools/TeamDeleteTool/TeamDeleteTool.ts", "startLine": 101, "endLine": 124 },
+  "env": { "file": "src/coordinator/coordinatorMode.ts", "startLine": 36, "endLine": 41 },
+  "gate": { "file": "src/coordinator/coordinatorMode.ts", "startLine": 36, "endLine": 41 },
+  "off": { "file": "src/coordinator/coordinatorMode.ts", "startLine": 36, "endLine": 41 },
+  "on": { "file": "src/coordinator/coordinatorMode.ts", "startLine": 36, "endLine": 41 },
+  "sysPrompt2": { "file": "src/coordinator/coordinatorMode.ts", "startLine": 111, "endLine": 369 },
+  "userCtx": { "file": "src/coordinator/coordinatorMode.ts", "startLine": 80, "endLine": 109 },
+  "forceAsync": { "file": "src/tools/AgentTool/AgentTool.tsx", "startLine": 557, "endLine": 567 },
+  "escKill": { "file": "src/tasks/LocalAgentTask/LocalAgentTask.tsx", "startLine": 309, "endLine": 315 },
+  "summary": { "file": "src/tasks/LocalAgentTask/LocalAgentTask.tsx", "startLine": 359, "endLine": 407 },
+  "match": { "file": "src/coordinator/coordinatorMode.ts", "startLine": 49, "endLine": 78 },
+  "switch": { "file": "src/coordinator/coordinatorMode.ts", "startLine": 60, "endLine": 73 },
+  "flip": { "file": "src/coordinator/coordinatorMode.ts", "startLine": 65, "endLine": 73 },
+  "noop": { "file": "src/coordinator/coordinatorMode.ts", "startLine": 60, "endLine": 62 },
+  "lifecycleStart2": { "file": "src/tools/AgentTool/agentToolUtils.ts", "startLine": 536, "endLine": 553 },
+  "loop": { "file": "src/tools/AgentTool/agentToolUtils.ts", "startLine": 554, "endLine": 570 },
+  "return": { "file": "src/tasks/stopTask.ts", "startLine": 95, "endLine": 97 }
+};
+</script>
+
+<aside id="source-panel"><div id="source-header"></div><div id="monaco-container"></div></aside>
+<script src="../assets/codeindex-runtime.js"></script>
+<script src="../assets/codeindex.js"></script>
+</body>
+</html>

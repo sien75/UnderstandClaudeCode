@@ -1,0 +1,500 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Conversation Engine and LLM Streaming</title>
+<link rel="stylesheet" href="../assets/codeindex.css">
+</head>
+<body>
+<nav class="topnav"><a href="../index.html">← Back to overview</a></nav>
+<h1>Conversation Engine and LLM Streaming</h1>
+
+<p>This is the core channel of Claude Code from "one user question" to "final response." When the user types a question in the REPL (or the SDK calls <code>ask</code> once), the engine's job is not simply to forward it to the model — it must first digest slash commands, attachments, and skill discovery in the user input, then call the Claude API with complete context; while the model streams tokens, the engine parses them on the fly, decides whether to call tools, feeds tool results back for another round, and loops until the model gives a final response; along the way it also handles thinking, rate-limit retries, model fallback, prompt-too-long / overlong-output recovery, context compression, budget caps, and turn limits. No step in this chain is allowed to "freeze" the conversation; there must be a clear exit and report for any failure.</p>
+
+<dl>
+  <dt>Input</dt>
+  <dd>A user question (text or content blocks with attachments) + current conversation history + tool/MCP/skill/permission context</dd>
+  <dt>Output</dt>
+  <dd>A <code>result</code> message (success / over budget / over turn limit / execution error), with final text, cumulative token usage, cost, model usage, and permission-denial records</dd>
+</dl>
+
+<ul>
+  <li>The outer <code>QueryEngine.submitMessage</code> handles "session-level" transactions: assembling the system prompt, running user-input preprocessing, converting messages yielded by query() into SDK messages, writing transcript, and watching budget/turn/structured-output retry limits.</li>
+  <li>The inner <code>query.ts</code> <code>queryLoop</code> is the real "model-tool" loop: <code>while(true)</code> compresses context each round, then calls the model in streaming mode, then decides whether to "finish" or "run tools and go to next round."</li>
+  <li>The bottom layer <code>claude.ts:queryModel</code> is responsible for sending the request into Anthropic SDK's streaming interface, parsing events one by one and accumulating them into an assistant message; <code>withRetry</code> wraps it with retry / fallback / rate-limit backoff.</li>
+</ul>
+
+<h2>I. Overall Data Flow: From User Question to Result Message</h2>
+
+<p>First, the full chain in one pass. After the user hits Enter, the message enters <code>QueryEngine.submitMessage</code> for session-level preparation (system prompt, user input processing, transcript persistence), then enters the <code>query()</code> loop. Each iteration either ends with "model didn't ask for tools → wrap up and return," or "model asked for tools → execute them → return to the top of the loop with results." After the loop, <code>submitMessage</code> performs a final result check (<code>isResultSuccessful</code>): failure yields <code>error_during_execution</code>, success yields <code>success</code>.</p>
+
+<pre class="mermaid">
+graph TD
+  user-prompt["User question / SDK ask()"] --> qe-submit["QueryEngine.submitMessage entry"]
+  qe-submit --> qe-sysprompt["Assemble system prompt + user context&lt;br/&gt;fetchSystemPromptParts"]
+  qe-sysprompt --> qe-process-input["Process user input&lt;br/&gt;processUserInput: slash commands / attachments / skills"]
+  qe-process-input --> should-query{"shouldQuery?"}
+  should-query -->|No, local-only command| qe-local-result["Yield local command output + success result"]
+  should-query -->|Yes| qe-transcript["Write user message to transcript&lt;br/&gt;(so kill-resume works)"]
+  qe-transcript --> qe-enter-loop["Enter query() main loop"]
+  qe-enter-loop --> loop-iter["queryLoop iteration"]
+  loop-iter --> loop-decision{"Model wants tools?"}
+  loop-decision -->|No, wrap up| qe-post["submitMessage wrap-up: isResultSuccessful?"]
+  loop-decision -->|Yes| loop-tools["Execute tools, collect results / attachments"]
+  loop-tools --> loop-iter
+  qe-post --> qe-success["Yield result: success"]
+  qe-post --> qe-ede["Yield result: error_during_execution"]
+  qe-local-result --> qe-end["Conversation ends"]
+  qe-success --> qe-end
+  qe-ede --> qe-end
+</pre>
+
+<h2>II. QueryEngine.submitMessage: Session-Level Orchestration</h2>
+
+<p><code>submitMessage</code> is the entry point called by the SDK/REPL (<code>ask</code> is just a one-shot wrapper around it). It does not call the model directly; instead it owns "all preparation before calling the model" and "all cleanup after." Key design: each <code>QueryEngine</code> instance corresponds to one session, with <code>mutableMessages</code>, <code>totalUsage</code>, and <code>readFileState</code> persisting across turns; <code>submitMessage</code> starts a new turn each time it is called.</p>
+
+<p>A few points worth noting: ① <code>canUseTool</code> is wrapped here to secretly record permission denials (later packed into the result for SDK reporting). ② User messages are written to transcript before entering the query loop — if the user hits Stop seconds after sending a message and the process is killed, resume can still recover from this message instead of "session not found." ③ After entering the <code>query()</code> <code>for await</code>, every assistant/user/compact_boundary message is pushed to <code>mutableMessages</code> and written to transcript; stream_event is used to accumulate token usage and stop_reason. ④ Each loop step checks budget limits and structured-output retry limits; exceeding them immediately yields the corresponding error result and returns.</p>
+
+<pre class="mermaid">
+graph TD
+  qe-entry["submitMessage(prompt, options)"] --> qe-wrap-can["Wrap canUseTool&lt;br/&gt;record permission denials"]
+  qe-wrap-can --> qe-model-pick["Determine model + thinking config"]
+  qe-model-pick --> qe-sys["fetchSystemPromptParts&lt;br/&gt;+ memory / coordinator injection"]
+  qe-sys --> qe-ctx["Build processUserInputContext"]
+  qe-ctx --> qe-orphan{"Orphaned permissions?"}
+  qe-orphan -->|Yes, once| qe-handle-orphan["handleOrphanedPermission"]
+  qe-handle-orphan --> qe-process
+  qe-orphan -->|No| qe-process["processUserInput&lt;br/&gt;parse slash commands / attachments"]
+  qe-process --> qe-should{"shouldQuery?"}
+  qe-should -->|No| qe-local["Yield local command output + success"]
+  qe-should -->|Yes| qe-persist["recordTranscript user message"]
+  qe-persist --> qe-skills["Load skills/plugins (cache-only)"]
+  qe-skills --> qe-sysinit["Yield system_init message"]
+  qe-sysinit --> qe-loop["for await msg of query(...)"]
+  qe-loop --> qe-switch{"message.type"}
+  qe-switch -->|assistant| qe-push-assist["push+yield normalizeMessage"]
+  qe-switch -->|user| qe-push-user["push+yield, turnCount++"]
+  qe-switch -->|stream_event| qe-usage["Accumulate usage/stop_reason"]
+  qe-switch -->|system| qe-sys-msg["compact_boundary/api_error/snip"]
+  qe-switch -->|attachment| qe-att["max_turns/structured_output/queued"]
+  qe-usage --> qe-budget{"Over budget?"}
+  qe-budget -->|Yes| qe-budget-err["Yield error_max_budget_usd, return"]
+  qe-budget -->|No| qe-structured{"Structured output retries exceeded?"}
+  qe-structured -->|Yes| qe-struct-err["Yield error_max_structured_output_retries, return"]
+  qe-structured -->|No| qe-loop
+  qe-push-assist --> qe-budget
+  qe-push-user --> qe-budget
+  qe-sys-msg --> qe-budget
+  qe-att --> qe-budget
+  qe-loop --> qe-result["Loop ended: isResultSuccessful?"]
+  qe-result -->|Failure| qe-ede2["Yield error_during_execution&lt;br/&gt;errors taken from logs after this turn's watermark"]
+  qe-result -->|Success| qe-success2["Yield success result&lt;br/&gt;with textResult/usage/cost"]
+</pre>
+
+<h2>III. query() Main Loop: Model-Tool while(true)</h2>
+
+<p>This is the heart of the engine. <code>query()</code> is just a thin shell around <code>queryLoop</code>, responsible for marking consumed command UUIDs as completed on normal return. <code>queryLoop</code> is a <code>while(true)</code> that does three things each round: ① compress context (snip → microcompact → context-collapse → autocompact, in order, not mutually exclusive); ② call the model in streaming mode and receive an assistant message; ③ see whether the model asked for tools — if not, take the wrap-up path (including prompt-too-long / overlong-output recovery, stop hooks, token-budget continuation); if yes, run the tools, collect attachments/memory prefetch/skill prefetch, assemble them into messages for the next round, and continue.</p>
+
+<p>State is passed between iterations via the <code>state: State</code> object (messages, turnCount, compression tracking, recovery counts, previous round's transition reason). Every <code>continue</code> point explicitly constructs a new <code>State</code> to avoid scattered mutations. A few recovery paths worth remembering: ① <b>Model fallback</b>: if a <code>FallbackTriggeredError</code> is thrown during streaming, switch to fallbackModel and retry the same request, clearing already-generated assistant messages (using tombstones so the UI removes them). ② <b>prompt-too-long</b>: during streaming, the error is "held back" instead of being yielded, and at wrap-up time context-collapse is tried first to drain, then reactive compact; if neither works, the held error is yielded and early-returned (without stop hooks, to avoid infinite loops). ③ <b>max_output_tokens</b>: first try raising max_tokens from the default 8k to 64k for one retry, then try "continuation message" recovery up to 3 times; only if all are exhausted is the held error surfaced. ④ <b>Empty streaming response</b>: if streaming ends without message_start or any content block, throw and fall back to non-streaming.</p>
+
+<pre class="mermaid">
+graph TD
+  loop-top["while true: take this round's state"] --> loop-prefetch["Start skill/memory prefetch (async)"]
+  loop-prefetch --> loop-compact["Compression chain: snip→microcompact→contextCollapse→autocompact"]
+  loop-compact --> loop-block{"Reached blocking limit?&lt;br/&gt;(when autoCompact off)"}
+  loop-block -->|Yes| loop-block-err["Yield prompt-too-long error, return blocking_limit"]
+  loop-block -->|No| loop-callmodel["callModel streaming call&lt;br/&gt;(with fallback retry inner loop)"]
+  loop-callmodel --> loop-stream["Receive assistant message event by event&lt;br/&gt;streaming tools can execute in parallel"]
+  loop-stream --> loop-abort{"Streaming interrupted?"}
+  loop-abort -->|Yes| loop-abort-handle["Fill in tool results / synthetic tool_result&lt;br/&gt;yield interrupt message, return aborted_streaming"]
+  loop-abort -->|No| loop-followup{"needsFollowUp?&lt;br/&gt;(tool_use block appeared)"}
+  loop-followup -->|No, wrap up| loop-recover["Held-error recovery check"]
+  loop-recover --> loop-ptl{"Holding prompt-too-long?"}
+  loop-ptl -->|Yes| loop-collapse-drain["context-collapse drain retry"]
+  loop-collapse-drain --> loop-reactive{"reactive compact?"}
+  loop-ptl -->|No| loop-maxout{"Holding max_output_tokens?"}
+  loop-maxout -->|Yes| loop-escalate["Raise max_tokens to 64k and retry"]
+  loop-escalate --> loop-resume-msg["Send continuation message retry (max 3)"]
+  loop-resume-msg --> loop-surface{"Recovery exhausted?"}
+  loop-surface -->|Yes| loop-yield-err["Yield held error, early return"]
+  loop-surface -->|No| loop-stop
+  loop-reactive -->|Success| loop-compact-retry["Retry this round with compressed messages"]
+  loop-reactive -->|Failure| loop-yield-err
+  loop-maxout -->|No| loop-api-err{"Is it an API error?"}
+  loop-api-err -->|Yes| loop-fail-hooks["executeStopFailureHooks, return completed"]
+  loop-api-err -->|No| loop-stop["handleStopHooks"]
+  loop-stop --> loop-stop-block{"Stop hook blocking?"}
+  loop-stop-block -->|Yes| loop-stop-retry["Inject blocking error and retry this round"]
+  loop-stop-block -->|No| loop-budget{"Token budget continuation?"}
+  loop-budget -->|Yes| loop-budget-cont["Inject nudge continuation and retry"]
+  loop-budget -->|No| loop-done["return completed"]
+  loop-followup -->|Yes| loop-tools["Execute remaining tools runTools/getRemainingResults"]
+  loop-tools --> loop-abort2{"Interrupted during tool execution?"}
+  loop-abort2 -->|Yes| loop-abort-tools["Yield interrupt, check maxTurns, return aborted_tools"]
+  loop-abort2 -->|No| loop-attach["Collect attachments: queued commands / memory prefetch / skill prefetch"]
+  loop-attach --> loop-maxturns{"Over maxTurns?"}
+  loop-maxturns -->|Yes| loop-maxturns-yield["Yield max_turns_reached, return"]
+  loop-maxturns -->|No| loop-next["state = next round's messages, continue"]
+  loop-next --> loop-top
+  loop-compact-retry --> loop-top
+  loop-stop-retry --> loop-top
+  loop-resume-msg --> loop-top
+  loop-budget-cont --> loop-top
+</pre>
+
+<h2>IV. Streaming Parsing: claude.ts queryModel</h2>
+
+<p><code>queryModelWithStreaming</code> calls <code>queryModel</code> after being wrapped by <code>withStreamingVCR</code>. <code>queryModel</code> does two things: ① construct request parameters (model resolution, beta headers, tool schema, tool search filtering, prompt caching, cached microcompact, advisor, task_budget, etc.), and ② use <code>withRetry</code> to obtain a <code>Stream</code>, then <code>for await</code> over it to parse events one by one.</p>
+
+<p>Streaming event handling is state-machine-like: <code>message_start</code> creates partialMessage and initial usage; <code>content_block_start</code> initializes a mutable block by type (text/thinking/tool_use/server_tool_use/advisor_tool_result); <code>content_block_delta</code> increments text/thinking/input_json/signature into the corresponding block; <code>content_block_stop</code> wraps the block into an AssistantMessage and yields it (so one assistant message may be split into multiple yields, one per content block); <code>message_delta</code> writes final usage and stop_reason back into the last yielded message (mutating in place rather than replacing the object, because the transcript write queue still holds the reference), and here it also calculates cost, detects max_tokens/context_window_exceeded, and yields the corresponding errors; <code>message_stop</code> is a no-op.</p>
+
+<p>Robustness has two watchdogs: ① <b>stream idle watchdog</b> — if no chunk is received for N milliseconds (default 90s), proactively abort the stream and fall back to non-streaming; ② <b>stall detection</b> — gaps between chunks over 30s are logged but do not interrupt. After the stream ends, it also validates that "message_start was actually received and at least one content block or stop_reason exists"; otherwise it is treated as the proxy returning an empty response, and an error is thrown to fall back to non-streaming.</p>
+
+<pre class="mermaid">
+graph TD
+  qm-entry["queryModel(messages, ...)"] --> qm-offswitch{"Off-switch active?&lt;br/&gt;(non-subscriber + Opus)"}
+  qm-offswitch -->|Yes| qm-off-err["Yield off-switch error, return"]
+  qm-offswitch -->|No| qm-params["Build params: betas/toolSchema/toolSearch/caching/advisor"]
+  qm-params --> qm-normalize["normalizeMessagesForAPI"]
+  qm-normalize --> qm-retry["withRetry get Stream"]
+  qm-retry --> qm-watchdog["Start stream idle watchdog (90s)"]
+  qm-watchdog --> qm-forawait["for await part of stream"]
+  qm-forawait --> qm-reset["resetStreamIdleTimer"]
+  qm-reset --> qm-switch{"part.type"}
+  qm-switch -->|message_start| qm-ms["partialMessage=part.message&lt;br/&gt;ttftMs/usage"]
+  qm-switch -->|content_block_start| qm-cbs["Initialize mutable block by type"]
+  qm-switch -->|content_block_delta| qm-cbd["Accumulate text/thinking/json/signature"]
+  qm-switch -->|content_block_stop| qm-cbstop["Wrap AssistantMessage and yield"]
+  qm-switch -->|message_delta| qm-md["Write back usage/stop_reason&lt;br/&gt;calculate cost / detect max_tokens"]
+  qm-switch -->|message_stop| qm-mstop["No-op"]
+  qm-ms --> qm-yield-evt["Yield stream_event to upper layer"]
+  qm-cbs --> qm-yield-evt
+  qm-cbd --> qm-yield-evt
+  qm-cbstop --> qm-yield-evt
+  qm-md --> qm-yield-evt
+  qm-mstop --> qm-yield-evt
+  qm-yield-evt --> qm-forawait
+  qm-forawait -->|Stream ends| qm-idle-abort{"Watchdog triggered?"}
+  qm-idle-abort -->|Yes| qm-idle-throw["Throw idle timeout, fall back to non-streaming"]
+  qm-idle-abort -->|No| qm-empty{"Empty response?"}
+  qm-empty -->|Yes| qm-empty-throw["Throw 'no events', fall back to non-streaming"]
+  qm-empty -->|No| qm-done["Streaming ended normally"]
+  qm-md --> qm-maxtokens{"stop_reason=max_tokens?"}
+  qm-maxtokens -->|Yes| qm-maxtokens-err["Yield max_output_tokens error message"]
+  qm-maxtokens -->|No| qm-refusal{"Refusal?"}
+  qm-refusal -->|Yes| qm-refusal-err["Yield refusal error"]
+  qm-refusal -->|No| qm-yield-evt
+</pre>
+
+<h2>V. Retry and Fallback: withRetry</h2>
+
+<p><code>withRetry</code> is a request-level retry shell wrapping <code>anthropic.beta.messages.create(stream:true)</code>. Default max 10 retries, with 529 (capacity overload) capped at 3 consecutive. Retry decisions: ① 529 on non-foreground sources is abandoned directly (avoid cascading amplification); ② 529 three times in a row and a fallbackModel is configured throws <code>FallbackTriggeredError</code> for the upper layer to switch models; ③ <code>shouldRetry</code> decides whether the error is retryable (rate limit, gateway 5xx, etc.); ④ max_tokens context-overflow errors call <code>parsetMaxTokensContextOverflowError</code> to compute available space, lowering the next round's max_tokens to continue; ⑤ persistent retry mode uses long backoff for 429/529 (up to 5 minutes, capped at 6 hours), yielding an <code>api_retry</code> system message every 30s so the upper layer/user knows it is waiting.</p>
+
+<p>Backoff duration prefers the server's <code>retry-after</code> header, otherwise exponential backoff (500ms × 2^n, capped at 32s). Before each retry it yields a <code>SystemAPIErrorMessage</code>, which in <code>QueryEngine.submitMessage</code> is converted into an <code>api_retry</code> SDK message for the frontend. The client instance is re-fetched after auth errors, and stale connections (ECONNRESET/EPIPE) close keep-alive and retry.</p>
+
+<pre class="mermaid">
+graph TD
+  wr-entry["withRetry(getClient, operation)"] --> wr-loop["for attempt 1..maxRetries+1"]
+  wr-loop --> wr-client["getClient (rebuild after auth error)"]
+  wr-client --> wr-op["operation(anthropic, attempt)"]
+  wr-op --> wr-ok{"Success?"}
+  wr-ok -->|Yes| wr-return["Return Stream/result"]
+  wr-ok -->|No| wr-err["Catch error"]
+  wr-err --> wr-529-bg{"529 and non-foreground?"}
+  wr-529-bg -->|Yes| wr-cannot["throw CannotRetryError"]
+  wr-529-bg -->|No| wr-529-count{"529 consecutive ≥3 and fallback exists?"}
+  wr-529-count -->|Yes| wr-fallback["throw FallbackTriggeredError"]
+  wr-529-count -->|No| wr-retry-able{"shouldRetry?"}
+  wr-retry-able -->|No| wr-cannot
+  wr-retry-able -->|Yes| wr-overflow{"max_tokens overflow error?"}
+  wr-overflow -->|Yes| wr-adjust["Lower maxTokensOverride, continue"]
+  wr-overflow -->|No| wr-delay["Compute backoff: retry-after or exponential"]
+  wr-delay --> wr-yield["Yield SystemAPIErrorMessage&lt;br/&gt;(api_retry system message)"]
+  wr-yield --> wr-sleep["sleep delayMs (abortable)"]
+  wr-sleep --> wr-persistent{"Persistent mode?"}
+  wr-persistent -->|Yes, attempt exhausted| wr-clamp["Clamp attempt back to maxRetries, continue"]
+  wr-persistent -->|No, attempt exhausted| wr-cannot-final["throw CannotRetryError"]
+  wr-clamp --> wr-loop
+  wr-adjust --> wr-loop
+  wr-sleep --> wr-loop
+</pre>
+
+<h2>VI. Tool Execution Loop</h2>
+
+<p>When the model produces <code>tool_use</code> blocks in the streaming response, <code>queryLoop</code> marks <code>needsFollowUp=true</code>. Tool execution has two paths: ① <b>StreamingToolExecutor</b> — while the model is still streaming, already-determined tool_use blocks are thrown in and run in parallel (only concurrency-safe read-only tools), <code>getCompletedResults</code> yields results as they arrive; after the stream, <code>getRemainingResults</code> cleans up. ② <b>runTools</b> — serial/concurrent batch execution when the streaming executor is closed: <code>partitionToolCalls</code> splits tool calls into batches, concurrency-safe batches use <code>runToolsConcurrently</code>, write batches use <code>runToolsSerially</code>. Each tool result is pushed into toolResults as a user message (with tool_result blocks) and fed back to the model as messages in the next round.</p>
+
+<p>Permissions are enforced here for real: <code>canUseTool</code> (wrapped in submitMessage to record denials) is called and decides allow/deny/ask; denied tools produce a tool_result with <code>tool_use_error</code>, which the model sees next round. Interruption handling: if the abort signal fires during streaming/tool execution, the executor generates synthetic tool_results for queued-but-not-finished tools (avoiding unpaired tool_use without tool_result that would cause API 400).</p>
+
+<pre class="mermaid">
+graph TD
+  te-stream{"Streaming tool execution enabled?"}
+  te-stream -->|Yes| te-se["new StreamingToolExecutor"]
+  te-stream -->|No| te-runtools["runTools (serial/batched)"]
+  te-se --> te-add["During streaming: addTool for each tool_use block"]
+  te-add --> te-completed["getCompletedResults: yield as ready"]
+  te-completed --> te-remaining["After stream ends: getRemainingResults"]
+  te-runtools --> te-partition["partitionToolCalls into batches"]
+  te-partition --> te-batch{"Batch type?"}
+  te-batch -->|Concurrency-safe| te-concurrent["runToolsConcurrently"]
+  te-batch -->|Write| te-serial["runToolsSerially"]
+  te-concurrent --> te-perm["canUseTool permission check"]
+  te-serial --> te-perm
+  te-perm --> te-allow{"allow?"}
+  te-allow -->|Yes| te-exec["Execute tool, produce tool_result"]
+  te-allow -->|No/deny| te-deny["Produce tool_use_error result"]
+  te-exec --> te-push["toolResults push user message"]
+  te-deny --> te-push
+  te-remaining --> te-push
+  te-push --> te-abort{"Abort signal?"}
+  te-abort -->|Yes| te-synthetic["Synthetic tool_result fill-in&lt;br/&gt;avoid unpaired tool_use"]
+  te-abort -->|No| te-next["Return to queryLoop for next round"]
+  te-synthetic --> te-next
+</pre>
+
+<h2>VII. Context Compression Chain</h2>
+
+<p>Compression is not a single mechanism but four processes run in fixed order at the top of each loop, not mutually exclusive (tokens freed by an earlier step may make later steps no-ops): ① <b>snip</b> (HISTORY_SNIP feature gate) — removes "zombie" messages and expired markers, used by long SDK sessions to limit memory growth. ② <b>microcompact</b> — replaces large tool_result content (images / long output) by tool_use_id with placeholders, based on time or cached edits; cached MC delays boundary messages until after the API response, using real <code>cache_deleted_input_tokens</code>. ③ <b>context-collapse</b> — folds history paragraphs into granular summaries (read-time projection, originals not deleted), and when overflowing <code>recoverFromOverflow</code> drains already-staged folds. ④ <b>autocompact</b> — threshold-triggered (when context nears the window limit) complete forked-agent summary, compressing a whole segment of history into one summary message + attachments, producing a compact_boundary. autocompact has a circuit breaker: after N consecutive failures it stops retrying.</p>
+
+<p>In addition to these four "active" compression methods, there is <b>reactive compact</b> — triggered only when the model's streaming response returns prompt-too-long or media-too-large errors (errors are held during streaming and one reactive compact is attempted at wrap-up). After any successful compression, a post-compact message is yielded (summary + attachments + hook results), and <code>messagesForQuery</code> is replaced with the compressed array; the next round continues from the compressed context. task_budget deducts the final pre-compression context token count during compression.</p>
+
+<pre class="mermaid">
+graph TD
+  compact-entry["Top of each loop iteration"] --> snip{"HISTORY_SNIP?"}
+  snip -->|Yes| snip-run["snipCompactIfNeeded&lt;br/&gt;remove zombie messages / expired markers"]
+  snip -->|No| mc
+  snip-run --> mc["microcompactMessages&lt;br/&gt;replace large tool_result with placeholder"]
+  mc --> cc{"CONTEXT_COLLAPSE?"}
+  cc -->|Yes| cc-run["applyCollapsesIfNeeded&lt;br/&gt;fold history paragraphs"]
+  cc -->|No| ac
+  cc-run --> ac["autoCompactIfNeeded&lt;br/&gt;run full summary when over threshold"]
+  ac --> ac-result{"Compression succeeded?"}
+  ac-result -->|Yes| ac-yield["Yield post-compact message&lt;br/&gt;replace messagesForQuery"]
+  ac-result -->|No, circuit broken| ac-skip["Skip, continue with original messages"]
+  ac-result -->|No, retryable| ac-track["Record consecutiveFailures"]
+  ac-yield --> main["Enter main model call"]
+  ac-skip --> main
+  ac-track --> main
+  main --> reactive{"Streaming returned PTL/media error?"}
+  reactive -->|Yes| reactive-try["Try reactive compact at wrap-up"]
+  reactive-try --> reactive-ok{"Success?"}
+  reactive-ok -->|Yes| reactive-retry["Retry this round with compressed messages"]
+  reactive-ok -->|No| reactive-surface["Yield held error, early return"]
+  reactive -->|No| done["Normal wrap-up"]
+</pre>
+
+<h2>VIII. Token / Cost Counting</h2>
+
+<p>Token and cost accumulation happens in the <code>message_delta</code> branch of <code>claude.ts:queryModel</code>: each time a message_delta with usage is received, first <code>updateUsage</code> accumulates this message's usage, then <code>calculateUSDCost</code> computes this message's USD cost, then <code>addToTotalSessionCost</code> adds it to the session ledger. <code>QueryEngine.submitMessage</code> calls <code>updateUsage</code> / <code>accumulateUsage</code> on message_start/message_delta/message_stop stream_events, accumulating each message's usage into <code>totalUsage</code>, which ends up in the result message. <code>cost-tracker.ts</code> maintains per-model usage (input/output/cacheRead/cacheCreation/webSearch/costUSD) and exposes <code>getTotalCost</code> / <code>getModelUsage</code> for results and budget checks.</p>
+
+<p>Token estimation (<code>tokenEstimation.ts</code>) is used for compression threshold decisions and blocking-limit checks: without calling the API, <code>roughTokenCountEstimationForMessages</code> produces a rough estimate (by bytes/type conversion), and both autocompact's <code>shouldAutoCompact</code> and the blocking limit check at the top of queryLoop rely on it. Note: tokens freed by snip must be explicitly subtracted from the estimate (<code>snipTokensFreed</code>); otherwise snip may have already compressed context below the threshold, but stale usage still shows above threshold, causing a false blocking trigger.</p>
+
+<pre class="mermaid">
+graph TD
+  md["claude.ts: message_delta event"] --> upd-usage["updateUsage accumulates this message's usage"]
+  upd-usage --> calc-cost["calculateUSDCost(model, usage)"]
+  calc-cost --> add-cost["addToTotalSessionCost&lt;br/&gt;accumulate in cost-tracker by model"]
+  add-cost --> adv-usage["Advisor usage also recursively counted"]
+  qe-start["QueryEngine: message_start/delta/stop"] --> qe-upd["updateUsage/accumulateUsage"]
+  qe-upd --> qe-total["totalUsage accumulated"]
+  qe-total --> result["result message: usage + total_cost_usd + modelUsage"]
+  add-cost --> budget-check["queryLoop: budget check&lt;br/&gt;getTotalCost &gt;= maxBudgetUsd?"]
+  budget-check -->|Over| budget-err["Yield error_max_budget_usd"]
+  te-est["tokenEstimation: rough token estimate for messages"] --> ac-threshold["autocompact threshold decision"]
+  te-est --> block-check["blocking limit check&lt;br/&gt;(when autoCompact off)"]
+  snip-freed["snipTokensFreed"] --> ac-threshold
+  snip-freed --> block-check
+</pre>
+
+<ul>
+  <li><b>State machine view</b>: queryLoop's <code>state.transition.reason</code> (next_turn / collapse_drain_retry / reactive_compact_retry / max_output_tokens_escalate / max_output_tokens_recovery / stop_hook_blocking / token_budget_continuation) is an implicit state machine — every continue point carries a reason, making it easy for tests to assert "which recovery path was triggered."</li>
+  <li><b>Permission view</b>: canUseTool is wrapped in submitMessage to record denials; it is called during tool execution; deny does not throw but produces a tool_use_error for the model to see; permission context (allowedTools, additionalWorkingDirectories) is updated into AppState after user input processing.</li>
+  <li><b>Lifecycle view</b>: QueryEngine is one instance per session, state persists across turns; submitMessage is once per turn; queryLoop is one state per round; withRetry is multiple attempts per request; streaming is one stream per request. The abort signal (abortController) runs through every layer, each with its own abort handling (stream fills synthetic results, tools fill synthetic results, stop hooks are skipped).</li>
+  <li><b>Transcript persistence</b>: user messages are written to transcript before entering query (so kill-resume doesn't fail); assistant messages are written fire-and-forget (to avoid blocking message_delta); compact_boundary flushes first to preserve the tail of the retained segment; result is force-flushed before yield in cowork/eager modes.</li>
+  <li><b>Non-streaming fallback</b>: streaming empty response, idle timeout, proxy returning non-SSE body, etc., all trigger <code>executeNonStreamingRequest</code> — using <code>messages.create(stream:false)</code> to retry, default timeout 300s (120s for remote), then the result goes through the same usage/cost accumulation path.</li>
+</ul>
+
+<script>
+window.__sourceMap = {
+  "user-prompt": { "file": "src/QueryEngine.ts", "startLine": 1186, "endLine": 1295 },
+  "qe-submit": { "file": "src/QueryEngine.ts", "startLine": 209, "endLine": 236 },
+  "qe-sysprompt": { "file": "src/QueryEngine.ts", "startLine": 284, "endLine": 325 },
+  "qe-process-input": { "file": "src/QueryEngine.ts", "startLine": 410, "endLine": 428 },
+  "should-query": { "file": "src/QueryEngine.ts", "startLine": 556, "endLine": 639 },
+  "qe-local-result": { "file": "src/QueryEngine.ts", "startLine": 618, "endLine": 638 },
+  "qe-transcript": { "file": "src/QueryEngine.ts", "startLine": 450, "endLine": 463 },
+  "qe-enter-loop": { "file": "src/QueryEngine.ts", "startLine": 675, "endLine": 686 },
+  "qe-post": { "file": "src/QueryEngine.ts", "startLine": 1058, "endLine": 1082 },
+  "qe-success": { "file": "src/QueryEngine.ts", "startLine": 1135, "endLine": 1155 },
+  "qe-ede": { "file": "src/QueryEngine.ts", "startLine": 1083, "endLine": 1117 },
+  "qe-end": { "file": "src/QueryEngine.ts", "startLine": 1156, "endLine": 1156 },
+  "loop-iter": { "file": "src/query.ts", "startLine": 307, "endLine": 321 },
+  "loop-decision": { "file": "src/query.ts", "startLine": 1062, "endLine": 1062 },
+  "loop-tools": { "file": "src/query.ts", "startLine": 1360, "endLine": 1408 },
+  "qe-wrap-can": { "file": "src/QueryEngine.ts", "startLine": 244, "endLine": 271 },
+  "qe-model-pick": { "file": "src/QueryEngine.ts", "startLine": 274, "endLine": 282 },
+  "qe-sys": { "file": "src/QueryEngine.ts", "startLine": 284, "endLine": 325 },
+  "qe-ctx": { "file": "src/QueryEngine.ts", "startLine": 335, "endLine": 395 },
+  "qe-orphan": { "file": "src/QueryEngine.ts", "startLine": 397, "endLine": 408 },
+  "qe-handle-orphan": { "file": "src/QueryEngine.ts", "startLine": 400, "endLine": 407 },
+  "qe-process": { "file": "src/QueryEngine.ts", "startLine": 410, "endLine": 428 },
+  "qe-should": { "file": "src/QueryEngine.ts", "startLine": 556, "endLine": 639 },
+  "qe-local": { "file": "src/QueryEngine.ts", "startLine": 560, "endLine": 638 },
+  "qe-persist": { "file": "src/QueryEngine.ts", "startLine": 450, "endLine": 463 },
+  "qe-skills": { "file": "src/QueryEngine.ts", "startLine": 534, "endLine": 538 },
+  "qe-sysinit": { "file": "src/QueryEngine.ts", "startLine": 540, "endLine": 551 },
+  "qe-loop": { "file": "src/QueryEngine.ts", "startLine": 675, "endLine": 1049 },
+  "qe-switch": { "file": "src/QueryEngine.ts", "startLine": 757, "endLine": 969 },
+  "qe-push-assist": { "file": "src/QueryEngine.ts", "startLine": 761, "endLine": 770 },
+  "qe-push-user": { "file": "src/QueryEngine.ts", "startLine": 784, "endLine": 787 },
+  "qe-usage": { "file": "src/QueryEngine.ts", "startLine": 788, "endLine": 828 },
+  "qe-sys-msg": { "file": "src/QueryEngine.ts", "startLine": 897, "endLine": 958 },
+  "qe-att": { "file": "src/QueryEngine.ts", "startLine": 829, "endLine": 893 },
+  "qe-budget": { "file": "src/QueryEngine.ts", "startLine": 972, "endLine": 1002 },
+  "qe-budget-err": { "file": "src/QueryEngine.ts", "startLine": 981, "endLine": 1001 },
+  "qe-structured": { "file": "src/QueryEngine.ts", "startLine": 1004, "endLine": 1048 },
+  "qe-struct-err": { "file": "src/QueryEngine.ts", "startLine": 1024, "endLine": 1046 },
+  "qe-result": { "file": "src/QueryEngine.ts", "startLine": 1058, "endLine": 1082 },
+  "qe-ede2": { "file": "src/QueryEngine.ts", "startLine": 1083, "endLine": 1117 },
+  "qe-success2": { "file": "src/QueryEngine.ts", "startLine": 1135, "endLine": 1155 },
+  "loop-top": { "file": "src/query.ts", "startLine": 307, "endLine": 321 },
+  "loop-prefetch": { "file": "src/query.ts", "startLine": 331, "endLine": 335 },
+  "loop-compact": { "file": "src/query.ts", "startLine": 396, "endLine": 543 },
+  "loop-block": { "file": "src/query.ts", "startLine": 628, "endLine": 648 },
+  "loop-block-err": { "file": "src/query.ts", "startLine": 642, "endLine": 647 },
+  "loop-callmodel": { "file": "src/query.ts", "startLine": 654, "endLine": 708 },
+  "loop-stream": { "file": "src/query.ts", "startLine": 712, "endLine": 863 },
+  "loop-abort": { "file": "src/query.ts", "startLine": 1015, "endLine": 1052 },
+  "loop-abort-handle": { "file": "src/query.ts", "startLine": 1015, "endLine": 1052 },
+  "loop-followup": { "file": "src/query.ts", "startLine": 1062, "endLine": 1062 },
+  "loop-recover": { "file": "src/query.ts", "startLine": 1062, "endLine": 1256 },
+  "loop-ptl": { "file": "src/query.ts", "startLine": 1085, "endLine": 1118 },
+  "loop-collapse-drain": { "file": "src/query.ts", "startLine": 1089, "endLine": 1117 },
+  "loop-reactive": { "file": "src/query.ts", "startLine": 1119, "endLine": 1183 },
+  "loop-maxout": { "file": "src/query.ts", "startLine": 1188, "endLine": 1256 },
+  "loop-escalate": { "file": "src/query.ts", "startLine": 1199, "endLine": 1221 },
+  "loop-resume-msg": { "file": "src/query.ts", "startLine": 1223, "endLine": 1252 },
+  "loop-surface": { "file": "src/query.ts", "startLine": 1254, "endLine": 1256 },
+  "loop-yield-err": { "file": "src/query.ts", "startLine": 1173, "endLine": 1175 },
+  "loop-compact-retry": { "file": "src/query.ts", "startLine": 1152, "endLine": 1165 },
+  "loop-stop": { "file": "src/query.ts", "startLine": 1267, "endLine": 1276 },
+  "loop-stop-block": { "file": "src/query.ts", "startLine": 1278, "endLine": 1306 },
+  "loop-stop-retry": { "file": "src/query.ts", "startLine": 1283, "endLine": 1305 },
+  "loop-budget": { "file": "src/query.ts", "startLine": 1308, "endLine": 1355 },
+  "loop-budget-cont": { "file": "src/query.ts", "startLine": 1321, "endLine": 1340 },
+  "loop-done": { "file": "src/query.ts", "startLine": 1357, "endLine": 1357 },
+  "loop-tools": { "file": "src/query.ts", "startLine": 1360, "endLine": 1408 },
+  "loop-abort2": { "file": "src/query.ts", "startLine": 1485, "endLine": 1516 },
+  "loop-abort-tools": { "file": "src/query.ts", "startLine": 1501, "endLine": 1515 },
+  "loop-attach": { "file": "src/query.ts", "startLine": 1580, "endLine": 1628 },
+  "loop-maxturns": { "file": "src/query.ts", "startLine": 1704, "endLine": 1712 },
+  "loop-maxturns-yield": { "file": "src/query.ts", "startLine": 1706, "endLine": 1711 },
+  "loop-next": { "file": "src/query.ts", "startLine": 1715, "endLine": 1727 },
+  "qm-entry": { "file": "src/services/api/claude.ts", "startLine": 1017, "endLine": 1027 },
+  "qm-offswitch": { "file": "src/services/api/claude.ts", "startLine": 1031, "endLine": 1048 },
+  "qm-off-err": { "file": "src/services/api/claude.ts", "startLine": 1044, "endLine": 1048 },
+  "qm-params": { "file": "src/services/api/claude.ts", "startLine": 1064, "endLine": 1296 },
+  "qm-normalize": { "file": "src/services/api/claude.ts", "startLine": 1265, "endLine": 1267 },
+  "qm-retry": { "file": "src/services/api/claude.ts", "startLine": 1778, "endLine": 1846 },
+  "qm-watchdog": { "file": "src/services/api/claude.ts", "startLine": 1874, "endLine": 1929 },
+  "qm-forawait": { "file": "src/services/api/claude.ts", "startLine": 1940, "endLine": 1940 },
+  "qm-reset": { "file": "src/services/api/claude.ts", "startLine": 1941, "endLine": 1941 },
+  "qm-switch": { "file": "src/services/api/claude.ts", "startLine": 1979, "endLine": 2297 },
+  "qm-ms": { "file": "src/services/api/claude.ts", "startLine": 1980, "endLine": 1993 },
+  "qm-cbs": { "file": "src/services/api/claude.ts", "startLine": 1995, "endLine": 2052 },
+  "qm-cbd": { "file": "src/services/api/claude.ts", "startLine": 2053, "endLine": 2170 },
+  "qm-cbstop": { "file": "src/services/api/claude.ts", "startLine": 2171, "endLine": 2212 },
+  "qm-md": { "file": "src/services/api/claude.ts", "startLine": 2213, "endLine": 2294 },
+  "qm-mstop": { "file": "src/services/api/claude.ts", "startLine": 2295, "endLine": 2296 },
+  "qm-yield-evt": { "file": "src/services/api/claude.ts", "startLine": 2299, "endLine": 2304 },
+  "qm-idle-abort": { "file": "src/services/api/claude.ts", "startLine": 2310, "endLine": 2335 },
+  "qm-idle-throw": { "file": "src/services/api/claude.ts", "startLine": 2334, "endLine": 2334 },
+  "qm-empty": { "file": "src/services/api/claude.ts", "startLine": 2350, "endLine": 2364 },
+  "qm-empty-throw": { "file": "src/services/api/claude.ts", "startLine": 2363, "endLine": 2363 },
+  "qm-done": { "file": "src/services/api/claude.ts", "startLine": 2377, "endLine": 2400 },
+  "qm-maxtokens": { "file": "src/services/api/claude.ts", "startLine": 2266, "endLine": 2292 },
+  "qm-maxtokens-err": { "file": "src/services/api/claude.ts", "startLine": 2270, "endLine": 2291 },
+  "qm-refusal": { "file": "src/services/api/claude.ts", "startLine": 2258, "endLine": 2264 },
+  "qm-refusal-err": { "file": "src/services/api/claude.ts", "startLine": 2263, "endLine": 2263 },
+  "wr-entry": { "file": "src/services/api/withRetry.ts", "startLine": 170, "endLine": 189 },
+  "wr-loop": { "file": "src/services/api/withRetry.ts", "startLine": 189, "endLine": 253 },
+  "wr-client": { "file": "src/services/api/withRetry.ts", "startLine": 212, "endLine": 252 },
+  "wr-op": { "file": "src/services/api/withRetry.ts", "startLine": 253, "endLine": 253 },
+  "wr-ok": { "file": "src/services/api/withRetry.ts", "startLine": 253, "endLine": 253 },
+  "wr-return": { "file": "src/services/api/withRetry.ts", "startLine": 253, "endLine": 256 },
+  "wr-err": { "file": "src/services/api/withRetry.ts", "startLine": 254, "endLine": 256 },
+  "wr-529-bg": { "file": "src/services/api/withRetry.ts", "startLine": 318, "endLine": 324 },
+  "wr-cannot": { "file": "src/services/api/withRetry.ts", "startLine": 323, "endLine": 323 },
+  "wr-529-count": { "file": "src/services/api/withRetry.ts", "startLine": 327, "endLine": 365 },
+  "wr-fallback": { "file": "src/services/api/withRetry.ts", "startLine": 347, "endLine": 350 },
+  "wr-retry-able": { "file": "src/services/api/withRetry.ts", "startLine": 367, "endLine": 382 },
+  "wr-overflow": { "file": "src/services/api/withRetry.ts", "startLine": 388, "endLine": 427 },
+  "wr-adjust": { "file": "src/services/api/withRetry.ts", "startLine": 416, "endLine": 425 },
+  "wr-delay": { "file": "src/services/api/withRetry.ts", "startLine": 431, "endLine": 463 },
+  "wr-yield": { "file": "src/services/api/withRetry.ts", "startLine": 493, "endLine": 512 },
+  "wr-sleep": { "file": "src/services/api/withRetry.ts", "startLine": 501, "endLine": 511 },
+  "wr-persistent": { "file": "src/services/api/withRetry.ts", "startLine": 477, "endLine": 513 },
+  "wr-clamp": { "file": "src/services/api/withRetry.ts", "startLine": 504, "endLine": 506 },
+  "wr-cannot-final": { "file": "src/services/api/withRetry.ts", "startLine": 370, "endLine": 371 },
+  "te-stream": { "file": "src/query.ts", "startLine": 561, "endLine": 568 },
+  "te-se": { "file": "src/query.ts", "startLine": 563, "endLine": 568 },
+  "te-runtools": { "file": "src/services/tools/toolOrchestration.ts", "startLine": 19, "endLine": 82 },
+  "te-add": { "file": "src/query.ts", "startLine": 841, "endLine": 843 },
+  "te-completed": { "file": "src/query.ts", "startLine": 851, "endLine": 862 },
+  "te-remaining": { "file": "src/query.ts", "startLine": 1380, "endLine": 1381 },
+  "te-partition": { "file": "src/services/tools/toolOrchestration.ts", "startLine": 26, "endLine": 26 },
+  "te-batch": { "file": "src/services/tools/toolOrchestration.ts", "startLine": 30, "endLine": 30 },
+  "te-concurrent": { "file": "src/services/tools/toolOrchestration.ts", "startLine": 36, "endLine": 53 },
+  "te-serial": { "file": "src/services/tools/toolOrchestration.ts", "startLine": 66, "endLine": 79 },
+  "te-perm": { "file": "src/QueryEngine.ts", "startLine": 244, "endLine": 271 },
+  "te-allow": { "file": "src/QueryEngine.ts", "startLine": 262, "endLine": 262 },
+  "te-exec": { "file": "src/services/tools/toolOrchestration.ts", "startLine": 36, "endLine": 79 },
+  "te-deny": { "file": "src/QueryEngine.ts", "startLine": 263, "endLine": 267 },
+  "te-push": { "file": "src/query.ts", "startLine": 1395, "endLine": 1400 },
+  "te-abort": { "file": "src/query.ts", "startLine": 1485, "endLine": 1485 },
+  "te-synthetic": { "file": "src/query.ts", "startLine": 1019, "endLine": 1023 },
+  "te-next": { "file": "src/query.ts", "startLine": 1715, "endLine": 1727 },
+  "compact-entry": { "file": "src/query.ts", "startLine": 396, "endLine": 543 },
+  "snip": { "file": "src/query.ts", "startLine": 401, "endLine": 410 },
+  "snip-run": { "file": "src/query.ts", "startLine": 403, "endLine": 405 },
+  "mc": { "file": "src/query.ts", "startLine": 414, "endLine": 426 },
+  "cc": { "file": "src/query.ts", "startLine": 440, "endLine": 447 },
+  "cc-run": { "file": "src/query.ts", "startLine": 441, "endLine": 446 },
+  "ac": { "file": "src/query.ts", "startLine": 454, "endLine": 468 },
+  "ac-result": { "file": "src/query.ts", "startLine": 470, "endLine": 543 },
+  "ac-yield": { "file": "src/query.ts", "startLine": 528, "endLine": 535 },
+  "ac-skip": { "file": "src/query.ts", "startLine": 536, "endLine": 543 },
+  "ac-track": { "file": "src/services/compact/autoCompact.ts", "startLine": 334, "endLine": 345 },
+  "main": { "file": "src/query.ts", "startLine": 654, "endLine": 708 },
+  "reactive": { "file": "src/query.ts", "startLine": 1085, "endLine": 1183 },
+  "reactive-try": { "file": "src/query.ts", "startLine": 1119, "endLine": 1132 },
+  "reactive-ok": { "file": "src/query.ts", "startLine": 1134, "endLine": 1166 },
+  "reactive-retry": { "file": "src/query.ts", "startLine": 1148, "endLine": 1165 },
+  "reactive-surface": { "file": "src/query.ts", "startLine": 1173, "endLine": 1175 },
+  "done": { "file": "src/query.ts", "startLine": 1357, "endLine": 1357 },
+  "md": { "file": "src/services/api/claude.ts", "startLine": 2213, "endLine": 2294 },
+  "upd-usage": { "file": "src/services/api/claude.ts", "startLine": 2214, "endLine": 2214 },
+  "calc-cost": { "file": "src/services/api/claude.ts", "startLine": 2251, "endLine": 2251 },
+  "add-cost": { "file": "src/services/api/claude.ts", "startLine": 2252, "endLine": 2256 },
+  "adv-usage": { "file": "src/cost-tracker.ts", "startLine": 316, "endLine": 333 },
+  "qe-start": { "file": "src/QueryEngine.ts", "startLine": 788, "endLine": 816 },
+  "qe-upd": { "file": "src/QueryEngine.ts", "startLine": 789, "endLine": 815 },
+  "qe-total": { "file": "src/QueryEngine.ts", "startLine": 812, "endLine": 815 },
+  "result": { "file": "src/QueryEngine.ts", "startLine": 1135, "endLine": 1155 },
+  "budget-check": { "file": "src/query.ts", "startLine": 972, "endLine": 1002 },
+  "budget-err": { "file": "src/QueryEngine.ts", "startLine": 981, "endLine": 1001 },
+  "te-est": { "file": "src/services/tokenEstimation.ts", "startLine": 327, "endLine": 340 },
+  "ac-threshold": { "file": "src/services/compact/autoCompact.ts", "startLine": 160, "endLine": 240 },
+  "block-check": { "file": "src/query.ts", "startLine": 637, "endLine": 647 },
+  "snip-freed": { "file": "src/query.ts", "startLine": 400, "endLine": 405 },
+  "qe-entry": { "file": "src/QueryEngine.ts", "startLine": 230, "endLine": 243 },
+  "loop-api-err": { "file": "src/query.ts", "startLine": 1257, "endLine": 1258 },
+  "loop-fail-hooks": { "file": "src/query.ts", "startLine": 1259, "endLine": 1266 }
+};
+</script>
+
+<aside id="source-panel"><div id="source-header"></div><div id="monaco-container"></div></aside>
+<script src="../assets/codeindex-runtime.js"></script>
+<script src="../assets/codeindex.js"></script>
+</body>
+</html>

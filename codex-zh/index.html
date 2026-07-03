@@ -28,77 +28,77 @@
   <li>经网络代理统一管控出站流量、按 host 策略放行/拦截 → 网络代理</li>
 </ul>
 
-<a class="module-card" href="%E4%BA%A4%E4%BA%92%E5%BC%8F%E7%BB%88%E7%AB%AF%E4%BC%9A%E8%AF%9D.html"><section>
+<a class="module-card" href="Interactive%20Terminal%20Session.html"><section>
   <h2>交互式终端会话</h2>
   <p>把用户在终端输入的一段 prompt 转成一次可审批、可流式展示、可续跑的 Codex 对话回合。</p>
 </section></a>
 
-<a class="module-card" href="%E9%9D%9E%E4%BA%A4%E4%BA%92%E6%89%A7%E8%A1%8C%E4%BB%BB%E5%8A%A1.html"><section>
+<a class="module-card" href="Non-Interactive%20Task%20Execution.html"><section>
   <h2>非交互执行任务</h2>
   <p>把命令行参数、stdin、图片和 schema 转成一次 headless app-server 任务,并把结果输出为文本或 JSONL。</p>
 </section></a>
 
-<a class="module-card" href="%E5%BA%94%E7%94%A8%E6%9C%8D%E5%8A%A1%E5%99%A8%E7%BA%BF%E7%A8%8B%E4%B8%8E%E5%9B%9E%E5%90%88%20API.html"><section>
+<a class="module-card" href="App-Server%20Threads%20and%20Turn%20API.html"><section>
   <h2>应用服务器线程与回合 API</h2>
   <p>把外部 JSON-RPC 请求转成线程创建、回合启动、事件订阅和线程读取响应。</p>
 </section></a>
 
-<a class="module-card" href="%E6%A8%A1%E5%9E%8B%E5%9B%9E%E5%90%88%E4%B8%8E%E5%B7%A5%E5%85%B7%E6%89%A7%E8%A1%8C.html"><section>
+<a class="module-card" href="Model%20Turn%20and%20Tool%20Execution.html"><section>
   <h2>模型回合与工具执行</h2>
   <p>把统一入口提交的用户输入转成模型采样、工具调用、权限处理和最终事件流。</p>
 </section></a>
 
-<a class="module-card" href="%E4%BB%A3%E7%A0%81%E6%A8%A1%E5%BC%8F.html"><section>
+<a class="module-card" href="Code%20Mode.html"><section>
   <h2>代码模式</h2>
   <p>给模型的"会写代码的子大脑":模型调 exec 工具把 JS 丢进 V8 沙箱,JS 可循环、判断、并行调工具并跨 cell 存中间值。</p>
 </section></a>
 
-<a class="module-card" href="%E7%99%BB%E5%BD%95%E4%B8%8E%E8%AE%A4%E8%AF%81.html"><section>
+<a class="module-card" href="Login%20and%20Authentication.html"><section>
   <h2>登录与认证</h2>
   <p>把浏览器 OAuth / 设备码登录、token 刷新与 401 恢复、固定优先级的凭据选择、多后端存储串成一条认证链。</p>
 </section></a>
 
-<a class="module-card" href="%E9%85%8D%E7%BD%AE%E5%8A%A0%E8%BD%BD%E4%B8%8E%E7%AE%A1%E7%90%86.html"><section>
+<a class="module-card" href="Configuration%20Loading%20and%20Management.html"><section>
   <h2>配置加载与管理</h2>
   <p>把 7 类配置源(MDM/系统/云端/用户/profile/项目/CLI)按数字优先级叠加合并,施加硬约束与命令行覆盖,产出运行时 Config。</p>
 </section></a>
 
-<a class="module-card" href="MCP%E4%B8%8E%E5%A4%96%E9%83%A8%E5%B7%A5%E5%85%B7%E6%8E%A5%E5%85%A5.html"><section>
+<a class="module-card" href="MCP%20and%20External%20Tool%20Integration.html"><section>
   <h2>MCP与外部工具接入</h2>
   <p>codex 在 MCP 协议里双向身份:作为 client 聚合外部 MCP server 工具喂模型,作为 server 把编码能力暴露给 Claude/IDE,含插件接入与审批通道。</p>
 </section></a>
 
-<a class="module-card" href="%E7%8A%B6%E6%80%81%E4%B8%8E%E8%AE%B0%E5%BF%86.html"><section>
+<a class="module-card" href="State%20and%20Memory.html"><section>
   <h2>状态与记忆</h2>
   <p>管 4 个独立 SQLite 库的会话运行时状态、rollout JSONL 持久化、记忆两阶段提取合并、线程存储与 agent 父子图。</p>
 </section></a>
 
-<a class="module-card" href="%E9%81%A5%E6%B5%8B%E4%B8%8E%E5%88%86%E6%9E%90.html"><section>
+<a class="module-card" href="Telemetry%20and%20Analytics.html"><section>
   <h2>遥测与分析</h2>
   <p>把协议事件聚合成 Analytics 事实并上报,经 OTLP 导出 trace/metrics/logs,rollout 双路径持久化与确定性回放追踪。</p>
 </section></a>
 
-<a class="module-card" href="%E6%B2%99%E7%AE%B1%E4%B8%8E%E5%91%BD%E4%BB%A4%E6%89%A7%E8%A1%8C%E9%9A%94%E7%A6%BB.html"><section>
+<a class="module-card" href="Sandbox%20and%20Command%20Execution%20Isolation.html"><section>
   <h2>沙箱与命令执行隔离</h2>
   <p>三平台(macOS seatbelt / Linux bubblewrap+landlock / Windows 降权)沙箱 + exec-server 执行端 + Starlark execpolicy 审批 + shell 提权拦截。</p>
 </section></a>
 
-<a class="module-card" href="TUI%E6%B8%B2%E6%9F%93%E4%B8%8E%E4%BA%A4%E4%BA%92%E8%BE%93%E5%85%A5.html"><section>
+<a class="module-card" href="TUI%20Rendering%20and%20Interactive%20Input.html"><section>
   <h2>TUI渲染与交互输入</h2>
   <p>BottomPane 的 view 栈、聊天合成器与文本区、用户输入请求 overlay、会话恢复选择器——把键盘输入流转成渲染拼装与提交。</p>
 </section></a>
 
-<a class="module-card" href="%E6%8F%92%E4%BB%B6%E4%B8%8E%E6%8A%80%E8%83%BD%E7%B3%BB%E7%BB%9F.html"><section>
+<a class="module-card" href="Plugin%20and%20Skill%20System.html"><section>
   <h2>插件与技能系统</h2>
   <p>插件作为"能力集装箱"分流到 skills/tools/hooks 三个子系统,含 marketplace 安装、系统/用户技能加载、10 事件点钩子矩阵。</p>
 </section></a>
 
-<a class="module-card" href="%E4%BA%91%E7%AB%AF%E5%90%8E%E7%AB%AF%E4%B8%8E%E4%BA%91%E4%BB%BB%E5%8A%A1.html"><section>
+<a class="module-card" href="Cloud%20Backend%20and%20Cloud%20Tasks.html"><section>
   <h2>云端后端与云任务</h2>
   <p>Responses API 请求主链路、按 provider 的认证分发(Bearer/AgentIdentity/Bedrock SigV4)、云任务远程执行与 diff apply、模型提供商管理与本地 OSS。</p>
 </section></a>
 
-<a class="module-card" href="%E7%BD%91%E7%BB%9C%E4%BB%A3%E7%90%86.html"><section>
+<a class="module-card" href="Network%20Proxy.html"><section>
   <h2>网络代理</h2>
   <p>HTTP/SOCKS5 MITM 代理统一管控出站流量:host 策略评估(防 DNS rebinding)、per-host CA 签发终结 TLS、环境变量注入、uds 桥接。</p>
 </section></a>

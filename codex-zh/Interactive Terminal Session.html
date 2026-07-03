@@ -1,0 +1,220 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>交互式终端会话</title>
+<link rel="stylesheet" href="assets/codeindex.css">
+</head>
+<body>
+<p><a href="index.html">← Back to overview</a></p>
+<h1>交互式终端会话</h1>
+
+<p>用户在终端运行 codex 后进入 TUI，在底部输入 prompt 并提交。这个场景把一段用户输入变成一次核心会话 turn：TUI 先负责终端事件、草稿、排队和本地展示，再通过 app-server 的 thread/turn 接口把输入交给 core session；模型、工具、权限请求和错误再沿 app-server 事件流回到当前可见线程，最终更新聊天记录、状态栏和审批弹窗。</p>
+
+<dl>
+  <dt>输入</dt>
+  <dd>用户在交互式终端里输入的 prompt、图片/mention 附件、当前工作目录、模型/推理强度、审批策略和权限配置。</dd>
+  <dt>输出</dt>
+  <dd>一次正在运行或已完成的 Codex 对话 turn：包含用户消息、模型流式回答、工具执行状态、权限/审批请求、错误提示、token 用量和会话续跑信息。</dd>
+</dl>
+
+<pre class="mermaid">
+graph TD
+  run-codex["运行 codex，默认进入交互式 TUI"] --> launch-tui["调用 codex_tui::run_main 启动 TUI"]
+  launch-tui --> bootstrap-app["启动或连接 app-server，并读取账号与模型信息"]
+  bootstrap-app --> create-widget["创建 ChatWidget 和主线程通道"]
+  create-widget --> event-loop["进入 TUI select 事件循环"]
+  event-loop --> terminal-key["收到终端按键或粘贴事件"]
+  terminal-key --> composer-route["底部输入区处理按键"]
+  composer-route --> submit-decision{"这次输入要提交吗"}
+  submit-decision -->|不是提交键| update-draft["更新草稿、弹窗或历史搜索"]
+  update-draft --> event-loop
+  submit-decision -->|提交键| normalize-input["整理文本、附件、mention 和 slash 命令"]
+  normalize-input --> queue-decision{"会话可立即接收输入吗"}
+  queue-decision -->|否| queue-input["把输入排队，等待 session 配置或当前 turn 结束"]
+  queue-input --> event-loop
+  queue-decision -->|是| build-user-turn["构造用户 turn 命令"]
+  build-user-turn --> app-event-op["发送 AppEvent::CodexOp"]
+  app-event-op --> submit-thread-op["TUI 将命令提交给活跃 thread"]
+  submit-thread-op --> active-turn{"当前 thread 已有活跃 turn 吗"}
+  active-turn -->|是| steer-turn["把输入作为 steer 追加到当前 turn"]
+  active-turn -->|否| start-turn["通过 app-server turn/start 开始新 turn"]
+  start-turn --> core-submit["app-server 映射输入并提交 Op::UserInput"]
+  steer-turn --> core-submit
+  core-submit --> session-loop["core session 从提交队列消费 Op"]
+  session-loop --> spawn-task["创建 turn 上下文并启动模型/工具任务"]
+  spawn-task --> core-events["模型、工具和权限边界产生 EventMsg"]
+  core-events --> appserver-events["app-server 把 EventMsg 翻译成通知或请求"]
+  appserver-events --> request-branch{"需要用户决策吗"}
+  request-branch -->|是| approval-request["在 TUI 中显示命令/文件/权限/输入请求"]
+  approval-request --> user-decision["用户在弹窗中批准、拒绝或填写答案"]
+  user-decision --> submit-thread-op
+  request-branch -->|否| enqueue-notification["按 thread 缓冲或投递通知"]
+  enqueue-notification --> active-thread-event["活跃线程事件被 TUI 主循环取出"]
+  active-thread-event --> render-update["ChatWidget 更新回答、工具输出、状态和完成信息"]
+  render-update --> event-loop
+</pre>
+
+<ul>
+  <li>通信边界：TUI 通过 `AppServerSession` 访问嵌入式或远程 app-server；core session 的 `CodexThread` 被 app-server 持有，TUI 不直接消费 core 的 `EventMsg`。</li>
+  <li>状态机边界：输入区会在“草稿、排队、等待 session configured、turn 运行中、审批弹窗、完成/错误”之间切换；正在运行的 turn 会让后续普通 prompt 进入队列或变成 steer。</li>
+  <li>权限/沙箱边界：审批策略、权限 profile、workspace roots 和可能的 sandbox 覆盖在 `turn/start` 时随请求传入后端；需要人类确认的命令、文件变更、权限扩展会作为 `ServerRequest` 回到 TUI。</li>
+  <li>生命周期边界：启动时建立 app-server bootstrap、主线程 channel 和 TUI 事件流；退出时先关闭 app-server，再清理终端显示并返回 token 用量与 resume hint。</li>
+</ul>
+
+<script>
+window.__sourceMap = {
+  "run-codex": {
+    "file": "codex-rs/cli/src/main.rs",
+    "startLine": 90,
+    "endLine": 116
+  },
+  "launch-tui": {
+    "file": "codex-rs/cli/src/main.rs",
+    "startLine": 2221,
+    "endLine": 2262
+  },
+  "bootstrap-app": {
+    "file": "codex-rs/tui/src/app.rs",
+    "startLine": 779,
+    "endLine": 846
+  },
+  "create-widget": {
+    "file": "codex-rs/tui/src/app.rs",
+    "startLine": 878,
+    "endLine": 914
+  },
+  "event-loop": {
+    "file": "codex-rs/tui/src/app.rs",
+    "startLine": 1157,
+    "endLine": 1205
+  },
+  "terminal-key": {
+    "file": "codex-rs/tui/src/app.rs",
+    "startLine": 1254,
+    "endLine": 1278
+  },
+  "composer-route": {
+    "file": "codex-rs/tui/src/bottom_pane/mod.rs",
+    "startLine": 571,
+    "endLine": 663
+  },
+  "submit-decision": {
+    "file": "codex-rs/tui/src/bottom_pane/chat_composer.rs",
+    "startLine": 3032,
+    "endLine": 3114
+  },
+  "update-draft": {
+    "file": "codex-rs/tui/src/bottom_pane/chat_composer.rs",
+    "startLine": 3210,
+    "endLine": 3362
+  },
+  "normalize-input": {
+    "file": "codex-rs/tui/src/bottom_pane/chat_composer.rs",
+    "startLine": 2738,
+    "endLine": 2881
+  },
+  "queue-decision": {
+    "file": "codex-rs/tui/src/chatwidget/input_flow.rs",
+    "startLine": 15,
+    "endLine": 45
+  },
+  "queue-input": {
+    "file": "codex-rs/tui/src/chatwidget/input_flow.rs",
+    "startLine": 72,
+    "endLine": 143
+  },
+  "build-user-turn": {
+    "file": "codex-rs/tui/src/chatwidget/input_submission.rs",
+    "startLine": 98,
+    "endLine": 160
+  },
+  "app-event-op": {
+    "file": "codex-rs/tui/src/chatwidget.rs",
+    "startLine": 1783,
+    "endLine": 1805
+  },
+  "submit-thread-op": {
+    "file": "codex-rs/tui/src/app/thread_routing.rs",
+    "startLine": 408,
+    "endLine": 451
+  },
+  "active-turn": {
+    "file": "codex-rs/tui/src/app/thread_routing.rs",
+    "startLine": 552,
+    "endLine": 631
+  },
+  "steer-turn": {
+    "file": "codex-rs/tui/src/app/thread_routing.rs",
+    "startLine": 566,
+    "endLine": 630
+  },
+  "start-turn": {
+    "file": "codex-rs/tui/src/app/thread_routing.rs",
+    "startLine": 631,
+    "endLine": 660
+  },
+  "core-submit": {
+    "file": "codex-rs/app-server/src/request_processors/turn_processor.rs",
+    "startLine": 381,
+    "endLine": 465
+  },
+  "session-loop": {
+    "file": "codex-rs/core/src/session/handlers.rs",
+    "startLine": 701,
+    "endLine": 757
+  },
+  "spawn-task": {
+    "file": "codex-rs/core/src/session/handlers.rs",
+    "startLine": 183,
+    "endLine": 260
+  },
+  "core-events": {
+    "file": "codex-rs/core/src/session/turn.rs",
+    "startLine": 1610,
+    "endLine": 1641
+  },
+  "appserver-events": {
+    "file": "codex-rs/app-server/src/request_processors/thread_lifecycle.rs",
+    "startLine": 301,
+    "endLine": 320
+  },
+  "request-branch": {
+    "file": "codex-rs/app-server/src/bespoke_event_handling.rs",
+    "startLine": 623,
+    "endLine": 646
+  },
+  "approval-request": {
+    "file": "codex-rs/tui/src/chatwidget/protocol_requests.rs",
+    "startLine": 9,
+    "endLine": 56
+  },
+  "user-decision": {
+    "file": "codex-rs/tui/src/app/thread_routing.rs",
+    "startLine": 780,
+    "endLine": 812
+  },
+  "enqueue-notification": {
+    "file": "codex-rs/tui/src/app/thread_routing.rs",
+    "startLine": 861,
+    "endLine": 918
+  },
+  "active-thread-event": {
+    "file": "codex-rs/tui/src/app.rs",
+    "startLine": 1165,
+    "endLine": 1183
+  },
+  "render-update": {
+    "file": "codex-rs/tui/src/chatwidget/protocol.rs",
+    "startLine": 31,
+    "endLine": 227
+  }
+};
+</script>
+
+<aside id="source-panel"><div id="source-header"></div><div id="monaco-container"></div></aside>
+<script src="assets/codeindex-runtime.js"></script>
+<script src="assets/codeindex.js"></script>
+</body>
+</html>

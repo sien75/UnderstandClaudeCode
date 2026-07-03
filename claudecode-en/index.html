@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Claude Code CLI (Leaked Source)</title>
+<link rel="stylesheet" href="assets/codeindex.css">
+</head>
+<body>
+<h1>Claude Code CLI (Leaked Source)</h1>
+
+<p>This is the leaked source code of Claude Code, Anthropic's terminal-native AI coding assistant (2026-03-31, unofficial release). A single-binary CLI running on Bun, with the entire terminal UI rendered via React + Ink. The core pipeline is: <b>user input → CLI parsing → conversation engine (QueryEngine) → LLM API stream → if the model wants to call tools, execute them and feed results back in a loop → terminal UI rendering</b>. TypeScript language, Bun package management, Zod validation, rule-based + auto classifier permissions, external capabilities via MCP, IDE integration via bridge, skills/plugins for extension, and CLAUDE.md for memory.</p>
+
+<p>This report slices the codebase vertically into 13 business modules based on "what a user or external triggerer can do," with each module following the data flow to explain "what becomes what." The primary view is <b>data flow</b>, with annotations for state machines, permissions, and lifecycles where relevant. Coverage focuses on deep reading of the core pipeline, with long-tail components understood at the level of responsibilities; non-runtime assets (lock/generated terminal.js/build scripts/docker/CI) are excluded.</p>
+
+<h2>What Users and External Systems Can Do</h2>
+<ul>
+  <li>Type <code>claude</code> in the terminal to launch and enter an interactive REPL → <a href="modules/cli-startup-init.html">CLI Startup and Session Initialization</a>, <a href="modules/terminal-ui.html">Terminal UI Layer</a></li>
+  <li>Ask questions and watch streaming responses (Claude may call tools multiple times along the way) → <a href="modules/query-engine-llm-stream.html">Conversation Engine and LLM Streaming</a>, <a href="modules/terminal-ui.html">Terminal UI Layer</a></li>
+  <li>Have Claude read/write files, run shell commands, search code → <a href="modules/tool-system-file-shell.html">Tool System and File/Shell Tools</a></li>
+  <li>Type slash commands like <code>/commit</code> <code>/review</code> <code>/compact</code> → <a href="modules/slash-commands.html">Slash Command System</a></li>
+  <li>(System side, automatic before each operation) Operations pass through the permission gate: allow/ask/deny → <a href="modules/permission-system.html">Permission System</a></li>
+  <li>Spawn child agents, launch background tasks, and coordinate multi-agent teams → <a href="modules/agent-task-coordinator.html">Agents, Tasks, and Multi-Agent Orchestration</a></li>
+  <li>Connect to external MCP servers to use their tools/resources, or expose Claude itself as an MCP server → <a href="modules/mcp-subsystem.html">MCP Subsystem</a></li>
+  <li>Use VS Code/JetBrains extensions to connect to the local CLI backend → <a href="modules/ide-bridge.html">IDE Bridge</a></li>
+  <li>Install plugins for extensibility, invoke built-in skill workflows, and have Claude remember facts persistently → <a href="modules/skills-plugins-memory.html">Skills, Plugins, and Memory System</a></li>
+  <li>Use a claude.ai/code-style web app in the browser (memory fully in the browser) → <a href="modules/web-app.html">Web Client</a></li>
+  <li>Let other AI clients browse this repo's source code through MCP → <a href="modules/mcp-server-subproject.html">MCP Exploration Server</a></li>
+  <li>(Support layer) Message processing, session storage, bash safe parsing, plugin loading, OAuth/analytics/LSP/policy limits, etc. → <a href="modules/core-utils-services.html">Core Utilities and Service Layer Notes</a></li>
+</ul>
+
+<a class="module-card" href="modules/cli-startup-init.html">
+  <section>
+    <h2>CLI Startup and Session Initialization</h2>
+    <p>Turns "the user types claude and hits Enter in the terminal" into "an authenticated, configured, ready-to-interact REPL session."</p>
+  </section>
+</a>
+
+<a class="module-card" href="modules/query-engine-llm-stream.html">
+  <section>
+    <h2>Conversation Engine and LLM Streaming</h2>
+    <p>Turns "the user's question" into "a streaming final response" — if the model wants to call tools along the way, execute them and feed results back in a loop, while also handling thinking, retry backoff, token/cost counting, and context compression.</p>
+  </section>
+</a>
+
+<a class="module-card" href="modules/tool-system-file-shell.html">
+  <section>
+    <h2>Tool System and File/Shell Tools</h2>
+    <p>Turns "the model's request to read/write files or execute commands" into "validated by Zod, passed through the permission gate, executed, and result returned to the model" — includes FileRead/Edit/Write, Bash (AST safe parsing), Glob, Grep.</p>
+  </section>
+</a>
+
+<a class="module-card" href="modules/slash-commands.html">
+  <section>
+    <h2>Slash Command System</h2>
+    <p>Turns "the /xxx slash command the user typed" into "the corresponding execution result" — three command types (prompt sent to model / local code returning text / Ink panel returning JSX) each have their own path.</p>
+  </section>
+</a>
+
+<a class="module-card" href="modules/permission-system.html">
+  <section>
+    <h2>Permission System</h2>
+    <p>Turns "the model wants to perform an operation that might change something" into an allow/ask/deny decision — hard rules first + four-mode split (default/plan/bypassPermissions/auto), with the auto mode having a classifier and circuit breaker.</p>
+  </section>
+</a>
+
+<a class="module-card" href="modules/agent-task-coordinator.html">
+  <section>
+    <h2>Agents, Tasks, and Multi-Agent Orchestration</h2>
+    <p>Turns "Claude wants to handle subtasks in parallel" into "spawned child agents / background shell tasks / multi-agent teams" — tasks have a full lifecycle (create → run → complete/stop), agents can message each other, and foreground/background can switch in both directions.</p>
+  </section>
+</a>
+
+<a class="module-card" href="modules/mcp-subsystem.html">
+  <section>
+    <h2>MCP Subsystem</h2>
+    <p>Turns "tools/resources exposed by external MCP servers" into "capabilities Claude can call" (seven transports, OAuth auth, reconnect on disconnect); conversely, Claude itself can also be exposed as an MCP server to other AIs.</p>
+  </section>
+</a>
+
+<a class="module-card" href="modules/ide-bridge.html">
+  <section>
+    <h2>IDE Bridge (IDE Integration)</h2>
+    <p>Turns "connection requests from VS Code/JetBrains extensions" into "a bidirectional communication session with the CLI backend" — both sides connect through a server relay, OAuth + JWT dual-token auth, message routing, permission proxying, disconnect/hibernation recovery.</p>
+  </section>
+</a>
+
+<a class="module-card" href="modules/skills-plugins-memory.html">
+  <section>
+    <h2>Skills, Plugins, and Memory System</h2>
+    <p>Turns "reusable workflows / extension capabilities / facts to remember" into "loaded and executed skills, installed plugins, and memory persisted to CLAUDE.md and recalled/synchronized across the team as needed."</p>
+  </section>
+</a>
+
+<a class="module-card" href="modules/terminal-ui.html">
+  <section>
+    <h2>Terminal UI Layer (React + Ink)</h2>
+    <p>Turns "the user's keystrokes and the engine's streaming events" into "a real-time conversation interface rendered in the terminal" — the messages array is the data-flow backbone, with permission popups, tool cards, diffs, and virtual scrolling all as React components.</p>
+  </section>
+</a>
+
+<a class="module-card" href="modules/web-app.html">
+  <section>
+    <h2>Web Client</h2>
+    <p>Turns "a message sent from the browser" into "a streaming rendered response" — Next.js front end, /api/chat passes through to the backend SSE; memory and permissions fully in browser localStorage, with a second set of API/Worker layers prepared but not yet wired.</p>
+  </section>
+</a>
+
+<a class="module-card" href="modules/mcp-server-subproject.html">
+  <section>
+    <h2>MCP Exploration Server</h2>
+    <p>Turns "read-source-code requests from external AI clients" into "location/read/search results for files in this repo" — an independently deployable MCP server, one createServer core + STDIO/HTTP/Vercel wrappers.</p>
+  </section>
+</a>
+
+<a class="module-card" href="modules/core-utils-services.html">
+  <section>
+    <h2>Core Utilities and Service Layer Notes</h2>
+    <p>Fills in support files not covered by the previous modules — message processing, session storage, bash safe parsing, attachment collection, plugin loading, OAuth, analytics, LSP, policy limits, etc. — at the level of "know the responsibilities, read the key functions."</p>
+  </section>
+</a>
+
+<section class="coverage">
+<h2>Coverage Notes</h2>
+<p>Coverage (total repo 573,780 lines): Deep 49,029 (8.5%) · Mapped 109,488 (19.1%) · Ignored 38,858 (6.8%) · total coverage 34.4%. The core pipeline (startup → engine → tools → permissions → commands → UI) has been deeply read; long-tail components/hooks/commands were sampled representatively; non-runtime assets (lock/generated terminal.js/build scripts/docker/CI/leaked system-prompt documents) were excluded. <b>Source code is embedded via codeindex-pack (108 files / 5.8MB), so no local files are needed to click flowchart nodes and view source; it can be deployed to any static host.</b></p>
+</section>
+<script src="assets/codeindex-runtime.js"></script>
+<script src="assets/codeindex.js"></script>
+</body>
+</html>

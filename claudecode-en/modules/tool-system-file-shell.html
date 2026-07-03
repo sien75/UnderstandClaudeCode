@@ -1,0 +1,376 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tool System Framework and File/Shell Tools</title>
+<link rel="stylesheet" href="../assets/codeindex.css">
+</head>
+<body>
+<nav class="topnav"><a href="../index.html">← Back to overview</a></nav>
+<h1>Tool System Framework and File/Shell Tools</h1>
+
+<p>When Claude (the LLM) decides "read a file, modify some code, or run a shell command," it emits a <code>tool_use</code> request block. This module covers the full lifecycle of that request from landing to being returned to the LLM: how the right tool is found, how inputs are validated, how the permission gate is passed, how it is actually executed, and how the result is assembled back into the message stream so the model can continue reasoning. Scope is limited to built-in file tools (Read/Edit/Write), the Shell tool (Bash), and two search tools (Glob/Grep, the latter wrapping ripgrep).</p>
+
+<dl>
+  <dt>Input</dt>
+  <dd>A tool_use block emitted by the model in an assistant message: tool name + arguments (e.g. <code>{file_path, old_string, new_string}</code> or <code>{command}</code>), plus current session context (permission rule set, file-read cache, abort signal, etc.).</dd>
+  <dt>Output</dt>
+  <dd>A user message containing a <code>tool_result</code> block (success returns tool output/summary, failure returns an error description with <code>is_error</code>), which the model sees in the next round and uses to decide.</dd>
+</dl>
+
+<ul>
+  <li>Tools are not loose functions but instances of a unified contract (the <code>Tool</code> interface): each tool carries <code>validateInput</code>, <code>checkPermissions</code>, <code>call</code>, <code>mapToolResultToToolResultBlockParam</code>, and other methods that the framework calls in fixed order.</li>
+  <li>Concurrency safety is the key watershed: read-only tools marked <code>isConcurrencySafe=true</code> (Read/Glob/Grep, and read-only Bash commands) are run in parallel batches, while writes and uncertain commands run serially to avoid overwriting each other.</li>
+  <li>Permission is not a single gate but multiple layers — tool self-check + rule matching + PreToolUse hooks + canUseTool decision — and any layer denying produces an error result returned directly to the model.</li>
+  <li>File-edit tools have a "staleness check": the file must have been Read first and its disk mtime must not have changed before writing is allowed, preventing the model from overwriting the user's latest changes based on stale content.</li>
+</ul>
+
+<h2>I. Tool Registration and Tool Pool Assembly</h2>
+
+<p>All built-in tools are centrally registered in <code>tools.ts</code>. Whether a tool is "visible" is decided by several filters: environment/feature flags determine whether to load, <code>isEnabled()</code> determines whether it is enabled, and deny rules in the permission context determine whether it is hidden from the model. The final tool list handed to the model is the built-in tools merged with MCP tools, deduplicated by name, with deny rules applied.</p>
+
+<pre class="mermaid">
+graph TD
+  base-list["getAllBaseTools list all built-in tools"] --> feat-gate{"feature/env flag enabled?"}
+  feat-gate -->|No| skip["Skip this tool (e.g. SleepTool/WorkflowTool)"]
+  feat-gate -->|Yes| enabled-check["Call tool.isEnabled()"]
+  enabled-check --> deny-check{"Hit by deny rule by whole name?"}
+  deny-check -->|Yes| hide["Remove from tool pool: model never sees it"]
+  deny-check -->|No| keep["Keep in allowedTools"]
+  keep --> merge-mcp["Merge with MCP tools"]
+  merge-mcp --> dedup["Deduplicate by name, built-ins win"]
+  dedup --> final-pool["Final tool pool handed to model"]
+  simple-mode{"CLAUDE_CODE_SIMPLE?"} -->|Yes| simple-only["Keep only Bash/Read/Edit(+coordinator mode tools)"]
+  simple-only --> final-pool
+</pre>
+
+<p>Key points: <code>getAllBaseTools</code> is the single source of "theoretically all tools," and comments emphasize it must stay in sync with the Statsig system cache configuration, otherwise cross-user prompt caching breaks. <code>filterToolsByDenyRules</code> uses the same matcher as runtime permission decisions, so a prefix rule like <code>mcp__server</code> hides the entire group from the model before it ever sees the tools, not just at call time.</p>
+
+<h2>II. Tool Contract: Tool Interface and buildTool</h2>
+
+<p><code>src/Tool.ts</code> defines the uniform shape for all tools. A tool is an object with a name, input schema (Zod), prompt template, and a set of methods. Several key methods form the fixed pipeline the framework calls:</p>
+
+<ul>
+  <li><code>validateInput</code>: pure logic validation (path format, parameter range, deny-path prediction), no permission-touching I/O. Failure returns an error directly, without entering the permission flow.</li>
+  <li><code>checkPermissions</code>: the tool's own permission opinion (allow/ask/deny), called only after validateInput passes. It is combined with the generic permission system (<code>hasPermissionsToUseTool</code>); a tool saying ask does not mean the user will definitely be asked.</li>
+  <li><code>isConcurrencySafe</code>: decides whether this tool can be batched and run in parallel with other read-only tools. Defaults to false (conservative); Read/Glob/Grep return true, and Bash returns true only when the command is judged read-only.</li>
+  <li><code>isReadOnly</code> / <code>isDestructive</code>: semantic tags affecting UI collapsing, auto-classifier input, etc.</li>
+  <li><code>call</code>: the actual work function, receiving permission-approved input and context, returning a <code>ToolResult</code>.</li>
+  <li><code>mapToolResultToToolResultBlockParam</code>: serializes call output into the <code>tool_result</code> text/image block sent to the model.</li>
+  <li><code>renderToolUseMessage</code> / <code>renderToolResultMessage</code>: pure UI rendering, does not affect what is sent to the model.</li>
+</ul>
+
+<p><code>buildTool(def)</code> is a factory: it merges the tool definition with a set of "safe defaults" (isEnabled defaults to true, isConcurrencySafe defaults to false, checkPermissions defaults to allow), so individual tools can omit common stub methods and callers always receive a complete object. The defaults are fail-closed — uncertain means unsafe, unsafe means permission required.</p>
+
+<h2>III. Complete Data Flow for a Single Tool Call</h2>
+
+<p>This is the core of the module. The model may emit several tool_use blocks in one turn. <code>runTools</code> first splits them by "concurrency safety": consecutive read-only tools merge into one concurrent batch, each write/uncertain tool becomes its own serial batch. Then each block follows the <code>runToolUse</code> → <code>checkPermissionsAndCallTool</code> main pipeline. The diagram below shows the key phases, branches, and error exits for one call.</p>
+
+<pre class="mermaid">
+graph TD
+  find-tool["Find tool by name findToolByName"] --> tool-found{"Found?"}
+  tool-found -->|No| unknown-tool["Return tool_result: No such tool available"]
+  tool-found -->|Yes| aborted{"Session already aborted?"}
+  aborted -->|Yes| cancel-msg["Return tool_result: cancelled"]
+  aborted -->|No| parse-input["Zod parse inputSchema.safeParse"]
+  parse-input --> parse-ok{"Type valid?"}
+  parse-ok -->|No| zod-err["Return InputValidationError + schema hint"]
+  parse-ok -->|Yes| validate-input["Call tool.validateInput business validation"]
+  validate-input --> validate-ok{"Passed?"}
+  validate-ok -->|No| validate-err["Return tool custom error message"]
+  validate-ok -->|Yes| backfill["backfillObservableInput: expand ~/relative paths for hooks"]
+  backfill --> pre-hooks["Run PreToolUse hooks"]
+  pre-hooks --> hook-stop{"Hook requested stop?"}
+  hook-stop -->|Yes| stop-msg["Return Execution stopped by hook"]
+  hook-stop -->|No| resolve-perm["resolveHookPermissionDecision + canUseTool"]
+  resolve-perm --> perm-decision{"Decision?"}
+  perm-decision -->|deny / ask rejected| deny-msg["Return is_error permission-denial message + trigger PermissionDenied hook"]
+  perm-decision -->|allow| call-tool["Call tool.call to perform actual operation"]
+  call-tool --> call-ok{"Execution succeeded?"}
+  call-ok -->|No| classify-err["classifyToolError + run PostToolUseFailure hook"]
+  classify-err --> err-msg["Return is_error exception message"]
+  call-ok -->|Yes| map-result["mapToolResultToToolResultBlockParam serialize"]
+  map-result --> post-hooks["Run PostToolUse hooks (can rewrite MCP output)"]
+  post-hooks --> assemble["Assemble tool_result + acceptFeedback + extra content blocks"]
+  assemble --> yield-msg["Produce user message, flow back into model context"]
+</pre>
+
+<p>A few easy-to-overlook details:</p>
+
+<ul>
+  <li><b>Input goes through Zod first, then business validation</b>. The model often generates malformed arguments (arrays written as strings, etc.). The Zod gate returns an error with a "schema not sent" hint, guiding the model to use ToolSearch to load the deferred tool and retry.</li>
+  <li><b>backfill happens before permissions/hooks</b>. <code>backfillObservableInput</code> expands <code>~</code> / relative paths into absolute paths so hook allowlists cannot be bypassed by a tilde. But it only changes the "copy for hooks"; <code>call()</code> still receives the model's original fields — keeping embedded path strings in tool results ("File created at: X") and transcript/VCR hashes stable.</li>
+  <li><b>Permission decisions draw from three stacked sources</b>: PreToolUse hooks can directly give allow/deny/modify input; <code>resolveHookPermissionDecision</code> prioritizes hook conclusions; only when there is no hook conclusion does it fall through to <code>canUseTool</code> (i.e. <code>hasPermissionsToUseTool</code>).</li>
+  <li><b>Permission denials also run hooks</b>: in auto mode, after the classifier denies, the <code>PermissionDenied</code> hook runs; if the hook says retry, an extra "this command is now approved, retry" meta-message is inserted for the model.</li>
+  <li><b>Errors also run hooks</b>: <code>runPostToolUseFailureHooks</code> lets hooks intervene when a tool throws (e.g. auto-fix). AbortError and Shell errors have dedicated branches and are not blindly logErrored.</li>
+  <li><b>Results larger than 30K/100K characters</b>: exceeding <code>maxResultSizeChars</code> is persisted to a disk file, and the model receives a <code>persisted-output</code> wrapper with preview; the Read tool is an exception (set to Infinity) to avoid a "read file → triggers another read" loop.</li>
+</ul>
+
+<h2>IV. Concurrent Batching: Why Read-Only Can Run in Parallel</h2>
+
+<p><code>partitionToolCalls</code> scans the model's tool_use sequence for this turn and calls <code>tool.isConcurrencySafe(input)</code> for each block. Consecutive blocks returning true are merged into one batch handled by <code>runToolsConcurrently</code> (tools are launched with <code>all</code>, capped at 10 concurrent); a false breaks the run, and that write operation goes alone through <code>runToolsSerially</code>. In serial batches, each tool updates <code>currentContext</code> after it finishes (because writes may change shared state like readFileState); concurrent batches defer contextModifier application until the end of the batch — reads do not affect each other, so they can safely run in parallel.</p>
+
+<p>Note: <code>isConcurrencySafe</code> parse failures (e.g. shell-quote parse throws) are caught and treated as false, conservatively downgrading to serial. Bash concurrency safety equals "whether the command is read-only": <code>isReadOnly</code> calls <code>checkReadOnlyConstraints</code> to decide; compound commands containing <code>cd</code> are handled specially.</p>
+
+<h2>V. Permission Gate Internals: Rules + Hooks + Classifier</h2>
+
+<p><code>hasPermissionsToUseTool</code> (<code>src/utils/permissions/permissions.ts</code>) is the generic permission layer. It combines the tool's self-reported <code>checkPermissions</code>, the user's configured allow/ask/deny rules, PreToolUse hook decisions, and (in auto mode) an AI classifier conclusion, ultimately giving allow/ask/deny. Mode switches affect the exit: <code>dontAsk</code> mode turns ask directly into deny (no user prompt); <code>auto</code> mode hands ask to the classifier instead of popping an interactive dialog.</p>
+
+<pre class="mermaid">
+graph TD
+  tool-self["Tool self-check checkPermissions"] --> rule-check["Match allow/ask/deny rules"]
+  rule-check --> deny-hit{"Hit deny?"}
+  deny-hit -->|Yes| deny-out["behavior: deny"]
+  deny-hit -->|No| allow-hit{"Hit allow?"}
+  allow-hit -->|Yes| allow-out["behavior: allow"]
+  allow-hit -->|No| ask-out["behavior: ask"]
+  ask-out --> mode{"Permission mode?"}
+  mode -->|dontAsk| ask-to-deny["Convert to deny: DONT_ASK_REJECT_MESSAGE"]
+  mode -->|auto| classifier["Call AI classifier (bash uses Haiku side-query)"]
+  classifier --> cls-verdict{"Classifier result?"}
+  cls-verdict -->|safe| allow-out
+  cls-verdict -->|unsafe| deny-out
+  cls-verdict -->|error/unavailable| fallback{"fail-closed?"}
+  fallback -->|Yes| deny-out
+  mode -->|default| prompt-user["Show interactive dialog asking user"]
+  prompt-user --> user-say{"User choice?"}
+  user-say -->|Accept| allow-out
+  user-say -->|Reject| deny-out
+</pre>
+
+<p>Bash permissions are more complex, handled in <code>bashToolHasPermission</code>: first it uses tree-sitter for AST-level safe parsing (detecting command injection, eval, zsh builtins, etc.), parses into SimpleCommand[], then goes through "exact match → sandbox auto-allow → prefix/wildcard rules → deny/ask classifier." AST judged too complex (command substitution / control flow) respects deny rules and then downgrades to ask, never silently allowing. When sandbox is enabled and the command is suitable, it auto-allows (still respecting explicit deny/ask rules).</p>
+
+<h2>VI. FileReadTool: Read Deduplication and Multiple Types</h2>
+
+<p>From the user's perspective: "Claude wants to look at a file." The Read tool's <code>call</code> first checks the <code>readFileState</code> cache: if the same file, same offset/limit range has already been read and the disk mtime hasn't changed, it returns a <code>file_unchanged</code> stub ("file unchanged," not resending the full text, saving cache tokens). Otherwise it branches by extension: text (with line numbers + cyber-risk reminder), image (base64 image block), PDF (page-extracted images or document blocks), notebook (mapped cells). On ENOENT it tries to find similar filenames for a "Did you mean" hint.</p>
+
+<pre class="mermaid">
+graph TD
+  read-start["Read.call(file_path, offset, limit)"] --> dedup-lookup["Check readFileState cache"]
+  dedup-lookup --> dedup-hit{"Same range and mtime unchanged?"}
+  dedup-hit -->|Yes| unchanged-stub["Return file_unchanged stub"]
+  dedup-hit -->|No| skill-discover["Background discover/activate skills for this path"]
+  skill-discover --> call-inner["Enter callInner, branch by extension"]
+  call-inner --> ext-switch{"File type?"}
+  ext-switch -->|Text| text-branch["Read bytes → detect encoding → normalize line endings → add line numbers → attach cyber-risk reminder"]
+  ext-switch -->|Image| image-branch["Base64 encode as image block"]
+  ext-switch -->|PDF| pdf-branch["Extract pages by pages param → Document/image blocks"]
+  ext-switch -->|Notebook| nb-branch["Parse cells → map into tool_result text"]
+  ext-switch -->|Other binary| bin-err["Error: cannot Read binary files"]
+  text-branch --> enoent-check
+  image-branch --> enoent-check
+  pdf-branch --> enoent-check
+  nb-branch --> enoent-check
+  enoent-check{"ENOENT?"}
+  enoent-check -->|Yes| suggest["Find similar filenames / cwd suggestions for Did you mean"]
+  enoent-check -->|No| update-state["Update readFileState (mtime/content/range)"]
+  suggest --> throw-err["Throw friendly error"]
+  update-state --> read-map-result["mapToolResultToToolResultBlockParam serialize by type"]
+</pre>
+
+<p>Key points: <code>validateInput</code> blocks deny paths, UNC paths (to prevent NTLM credential leakage), binary extensions, and blocking device files before permissions — these can be decided without needing permission. <code>checkPermissions</code> delegates to the generic <code>checkReadPermissionForTool</code>. <code>maxResultSizeChars: Infinity</code> is intentional, preventing a "read large file → persist → model reads the persisted file" loop.</p>
+
+<h2>VII. FileEditTool / FileWriteTool: Staleness Checks and Atomic Writes</h2>
+
+<p>The core defense of the two write tools is the "staleness check": the model must have Read the file first, and disk mtime must not have changed since the last Read, before writing is allowed. This prevents the model from overwriting code the user just changed based on content from several turns ago. Edit does read-modify-write: read original content → use <code>findActualString</code> to handle quote styles → generate patch → write to disk → update readFileState → notify LSP (didChange/didSave) and VSCode diff view. Write is whole-file replacement, additionally requiring the file to have been Read and not be a partial view.</p>
+
+<pre class="mermaid">
+graph TD
+  write-start["Edit/Write.call"] --> mkdir["Ensure parent directory exists (outside critical section)"]
+  mkdir --> backup["fileHistory backs up old content (idempotent by content hash)"]
+  backup --> load-current["Read current file content + encoding + line endings"]
+  load-current --> stale-check{"Has been Read and mtime unchanged?"}
+  stale-check -->|No| stale-err["Throw FILE_UNEXPECTEDLY_MODIFIED_ERROR"]
+  stale-check -->|Yes| compute-new["Edit: getPatchForEdit generates new content / Write: use input.content directly"]
+  compute-new --> write-disk["writeTextContent atomic write"]
+  write-disk --> lsp-notify["Notify LSP didChange/didSave + VSCode"]
+  lsp-notify --> update-state["Update readFileState (post-write mtime)"]
+  update-state --> return-diff["Return filePath/patch/userModified etc."]
+</pre>
+
+<p>Important constraints:</p>
+
+<ul>
+  <li><b>No await inside the critical section</b>: from "read current content" to "write to disk" the event loop must not yield, otherwise concurrent edits could interleave. mkdir and backup are explicitly placed outside the critical section.</li>
+  <li><b>Write does not change line endings</b>: whatever line endings the model provides in content are used, avoiding writing CRLF bash scripts on Linux.</li>
+  <li><b>UNC paths skip I/O validation</b>: <code>validateInput</code> returns true directly for UNC paths, leaving the decision to the permission layer — because <code>fs.existsSync</code> on Windows UNC paths can trigger SMB authentication and potentially leak credentials.</li>
+  <li><b>Team memory leak prevention</b>: before writing team memory files, secrets are scanned; a hit causes rejection.</li>
+</ul>
+
+<h2>VIII. BashTool: From Command to Shell Process</h2>
+
+<p>From the user's perspective: "Claude runs a shell command." BashTool's <code>call</code> first handles special "simulated sed edit" (writes directly to disk so the user preview matches what was written); otherwise it enters <code>runShellCommand</code>, an async generator: it uses <code>exec</code> to spawn a shell process, and as it runs, feeds the latest output back through the <code>onProgress</code> callback, yielding <code>bash_progress</code> events from the generator. Timeout, explicit <code>run_in_background</code>, or assistant-mode blocking-budget overrun all move the command to background, returning a <code>backgroundTaskId</code> for the model to later fetch results with TaskOutput.</p>
+
+<pre class="mermaid">
+graph TD
+  bash-start["Bash.call(input)"] --> sed-check{"_simulatedSedEdit?"}
+  sed-check -->|Yes| apply-sed["applySedEdit writes directly to disk"]
+  sed-check -->|No| start-exec["exec spawns shell process (timeout/sandbox/onProgress)"]
+  start-exec --> bg-req{"run_in_background?"}
+  bg-req -->|Yes| spawn-bg["spawnShellTask moves to background, return backgroundTaskId"]
+  spawn-bg --> bg-return["Return empty stdout + backgroundTaskId"]
+  bg-req -->|No| race["Promise.race(result vs progress threshold)"]
+  race --> early-done{"Command finishes quickly?"}
+  early-done -->|Yes| return-result["Return ExecResult directly"]
+  early-done -->|No| auto-bg{"Timeout / assistant budget reached?"}
+  auto-bg -->|Yes and allowed| to-bg["Move to background to continue, notify on completion"]
+  auto-bg -->|No| stream-progress["Loop yield bash_progress events"]
+  stream-progress --> final-result["Get final stdout/code/interrupted"]
+  return-result --> final-result
+  to-bg --> final-result
+  final-result --> interpret["interpretCommandResult semantic exit-code interpretation"]
+  interpret --> persist-check{"Output file &gt; threshold?"}
+  persist-check -->|Yes| copy-dest["Copy to tool-results directory, model reads via Read"]
+  persist-check -->|No| use-stdout["Use stdout directly"]
+  copy-dest --> assemble-out["Assemble Out(stdout/isImage/persistedOutputPath...)"]
+  use-stdout --> assemble-out
+  assemble-out --> bash-map-result["mapToolResult...: large output wrapped persisted-output, images as image blocks"]
+</pre>
+
+<p>Bash concurrency safety depends on whether the command is read-only: <code>isReadOnly</code> calls <code>checkReadOnlyConstraints</code>, and <code>isConcurrencySafe</code> directly reuses the <code>isReadOnly</code> result. So <code>ls</code> / <code>cat</code> run in parallel with other read-only tools, while <code>git push</code> runs serially. <code>preparePermissionMatcher</code> splits compound commands into subcommand lists so hook rules like <code>Bash(git *)</code> can hit the git subcommand inside <code>ls && git push</code> — if it can't split, it fails safely and lets hooks run.</p>
+
+<h2>IX. GlobTool / GrepTool: ripgrep Wrappers</h2>
+
+<p>Both search tools are read-only, concurrency-safe, and go through <code>checkReadPermissionForTool</code>. Glob calls the internal <code>glob</code> function to find filenames by pattern; Grep actually invokes ripgrep (<code>rg</code>) for content search. Grep's <code>call</code> translates model parameters into rg command-line flags: <code>--hidden</code>, excludes VCS directories, <code>--max-columns 500</code> (prevents base64/compressed files from flooding), <code>-l/-c/-n/-i/-C/-A/-B/-U</code>, etc., plus ignore patterns from the permission context and plugin-cache exclusions. Paths are passed as absolute paths to <code>ripgrep</code>, then results are relativized back to cwd-relative paths to save tokens.</p>
+
+<pre class="mermaid">
+graph TD
+  grep-start["Grep.call(pattern, path, output_mode, ...)"] --> build-args["Assemble rg args: --hidden / exclude VCS / --max-columns / pattern flags"]
+  build-args --> add-ignore["Add readFile ignore pattern + plugin cache exclusions"]
+  add-ignore --> call-rg["ripgrep(args, absolutePath, abortSignal)"]
+  call-rg --> rg-done{"rg returned?"}
+  rg-done --> timeout{"RipgrepTimeoutError?"}
+  timeout -->|Yes| propagate["Propagate upward (let model know search didn't finish, rather than assuming no matches)"]
+  timeout -->|No| mode-switch{"output_mode?"}
+  mode-switch -->|content| content-branch["Apply head_limit/offset → relativize paths → assemble content lines"]
+  mode-switch -->|count| count-branch["Output filename:count + total summary"]
+  mode-switch -->|files_with_matches| files-branch["Found N files + filename list"]
+  content-branch --> map-out
+  count-branch --> map-out
+  files-branch --> map-out["mapToolResultToToolResultBlockParam serialize"]
+</pre>
+
+<p>Grep's <code>validateInput</code> only checks path existence (UNC skipped). <code>head_limit</code> is applied before relativizing paths, avoiding useless per-line processing on a thousand-line result that will be truncated to a few dozen wide lines. Glob's <code>call</code> is similar but simpler: call <code>glob</code> for the file list, relativize, return filenames + whether truncated.</p>
+
+<script>
+window.__sourceMap = {
+  "base-list": { "file": "src/tools.ts", "startLine": 193, "endLine": 251 },
+  "feat-gate": { "file": "src/tools.ts", "startLine": 16, "endLine": 135 },
+  "skip": { "file": "src/tools.ts", "startLine": 16, "endLine": 135 },
+  "enabled-check": { "file": "src/tools.ts", "startLine": 179, "endLine": 183 },
+  "deny-check": { "file": "src/tools.ts", "startLine": 262, "endLine": 269 },
+  "hide": { "file": "src/tools.ts", "startLine": 262, "endLine": 269 },
+  "keep": { "file": "src/tools.ts", "startLine": 307, "endLine": 327 },
+  "merge-mcp": { "file": "src/tools.ts", "startLine": 345, "endLine": 367 },
+  "dedup": { "file": "src/tools.ts", "startLine": 345, "endLine": 367 },
+  "final-pool": { "file": "src/tools.ts", "startLine": 271, "endLine": 327 },
+  "simple-mode": { "file": "src/tools.ts", "startLine": 273, "endLine": 298 },
+  "simple-only": { "file": "src/tools.ts", "startLine": 287, "endLine": 297 },
+  "find-tool": { "file": "src/services/tools/toolExecution.ts", "startLine": 345, "endLine": 356 },
+  "tool-found": { "file": "src/services/tools/toolExecution.ts", "startLine": 369, "endLine": 411 },
+  "unknown-tool": { "file": "src/services/tools/toolExecution.ts", "startLine": 396, "endLine": 410 },
+  "aborted": { "file": "src/services/tools/toolExecution.ts", "startLine": 415, "endLine": 453 },
+  "cancel-msg": { "file": "src/services/tools/toolExecution.ts", "startLine": 443, "endLine": 452 },
+  "parse-input": { "file": "src/services/tools/toolExecution.ts", "startLine": 615, "endLine": 616 },
+  "parse-ok": { "file": "src/services/tools/toolExecution.ts", "startLine": 616, "endLine": 680 },
+  "zod-err": { "file": "src/services/tools/toolExecution.ts", "startLine": 664, "endLine": 679 },
+  "validate-input": { "file": "src/services/tools/toolExecution.ts", "startLine": 683, "endLine": 686 },
+  "validate-ok": { "file": "src/services/tools/toolExecution.ts", "startLine": 687, "endLine": 733 },
+  "validate-err": { "file": "src/services/tools/toolExecution.ts", "startLine": 717, "endLine": 732 },
+  "backfill": { "file": "src/services/tools/toolExecution.ts", "startLine": 775, "endLine": 793 },
+  "pre-hooks": { "file": "src/services/tools/toolExecution.ts", "startLine": 800, "endLine": 862 },
+  "hook-stop": { "file": "src/services/tools/toolExecution.ts", "startLine": 848, "endLine": 861 },
+  "stop-msg": { "file": "src/services/tools/toolExecution.ts", "startLine": 853, "endLine": 860 },
+  "resolve-perm": { "file": "src/services/tools/toolExecution.ts", "startLine": 921, "endLine": 929 },
+  "perm-decision": { "file": "src/services/tools/toolExecution.ts", "startLine": 930, "endLine": 995 },
+  "deny-msg": { "file": "src/services/tools/toolExecution.ts", "startLine": 995, "endLine": 1104 },
+  "call-tool": { "file": "src/services/tools/toolExecution.ts", "startLine": 1206, "endLine": 1222 },
+  "call-ok": { "file": "src/services/tools/toolExecution.ts", "startLine": 1589, "endLine": 1737 },
+  "classify-err": { "file": "src/services/tools/toolExecution.ts", "startLine": 1696, "endLine": 1714 },
+  "err-msg": { "file": "src/services/tools/toolExecution.ts", "startLine": 1715, "endLine": 1737 },
+  "map-result": { "file": "src/services/tools/toolExecution.ts", "startLine": 1292, "endLine": 1296 },
+  "post-hooks": { "file": "src/services/tools/toolExecution.ts", "startLine": 1483, "endLine": 1531 },
+  "assemble": { "file": "src/services/tools/toolExecution.ts", "startLine": 1403, "endLine": 1474 },
+  "yield-msg": { "file": "src/services/tools/toolExecution.ts", "startLine": 1456, "endLine": 1473 },
+  "tool-self": { "file": "src/Tool.ts", "startLine": 500, "endLine": 503 },
+  "rule-check": { "file": "src/utils/permissions/permissions.ts", "startLine": 1158, "endLine": 1328 },
+  "deny-hit": { "file": "src/utils/permissions/permissions.ts", "startLine": 1158, "endLine": 1328 },
+  "allow-hit": { "file": "src/utils/permissions/permissions.ts", "startLine": 1158, "endLine": 1328 },
+  "ask-out": { "file": "src/utils/permissions/permissions.ts", "startLine": 1158, "endLine": 1328 },
+  "mode": { "file": "src/utils/permissions/permissions.ts", "startLine": 505, "endLine": 518 },
+  "ask-to-deny": { "file": "src/utils/permissions/permissions.ts", "startLine": 508, "endLine": 517 },
+  "classifier": { "file": "src/utils/permissions/permissions.ts", "startLine": 518, "endLine": 540 },
+  "cls-verdict": { "file": "src/utils/permissions/permissions.ts", "startLine": 843, "endLine": 920 },
+  "fallback": { "file": "src/utils/permissions/permissions.ts", "startLine": 843, "endLine": 862 },
+  "prompt-user": { "file": "src/hooks/toolPermission/handlers/interactiveHandler.ts", "startLine": 1, "endLine": 536 },
+  "user-say": { "file": "src/hooks/toolPermission/handlers/interactiveHandler.ts", "startLine": 1, "endLine": 536 },
+  "deny-out": { "file": "src/utils/permissions/permissions.ts", "startLine": 904, "endLine": 920 },
+  "allow-out": { "file": "src/utils/permissions/permissions.ts", "startLine": 919, "endLine": 920 },
+  "read-start": { "file": "src/tools/FileReadTool/FileReadTool.ts", "startLine": 496, "endLine": 502 },
+  "dedup-lookup": { "file": "src/tools/FileReadTool/FileReadTool.ts", "startLine": 536, "endLine": 542 },
+  "dedup-hit": { "file": "src/tools/FileReadTool/FileReadTool.ts", "startLine": 547, "endLine": 573 },
+  "unchanged-stub": { "file": "src/tools/FileReadTool/FileReadTool.ts", "startLine": 562, "endLine": 568 },
+  "skill-discover": { "file": "src/tools/FileReadTool/FileReadTool.ts", "startLine": 575, "endLine": 591 },
+  "call-inner": { "file": "src/tools/FileReadTool/FileReadTool.ts", "startLine": 593, "endLine": 607 },
+  "ext-switch": { "file": "src/tools/FileReadTool/FileReadTool.ts", "startLine": 518, "endLine": 518 },
+  "text-branch": { "file": "src/tools/FileReadTool/FileReadTool.ts", "startLine": 593, "endLine": 607 },
+  "image-branch": { "file": "src/tools/FileReadTool/FileReadTool.ts", "startLine": 654, "endLine": 669 },
+  "pdf-branch": { "file": "src/tools/FileReadTool/FileReadTool.ts", "startLine": 672, "endLine": 678 },
+  "nb-branch": { "file": "src/tools/FileReadTool/FileReadTool.ts", "startLine": 670, "endLine": 671 },
+  "bin-err": { "file": "src/tools/FileReadTool/FileReadTool.ts", "startLine": 469, "endLine": 482 },
+  "enoent-check": { "file": "src/tools/FileReadTool/FileReadTool.ts", "startLine": 608, "endLine": 650 },
+  "suggest": { "file": "src/tools/FileReadTool/FileReadTool.ts", "startLine": 639, "endLine": 647 },
+  "update-state": { "file": "src/tools/FileReadTool/FileReadTool.ts", "startLine": 519, "endLine": 525 },
+  "throw-err": { "file": "src/tools/FileReadTool/FileReadTool.ts", "startLine": 647, "endLine": 648 },
+  "read-map-result": { "file": "src/tools/FileReadTool/FileReadTool.ts", "startLine": 652, "endLine": 717 },
+  "write-start": { "file": "src/tools/FileEditTool/FileEditTool.ts", "startLine": 387, "endLine": 398 },
+  "mkdir": { "file": "src/tools/FileEditTool/FileEditTool.ts", "startLine": 427, "endLine": 430 },
+  "backup": { "file": "src/tools/FileEditTool/FileEditTool.ts", "startLine": 431, "endLine": 440 },
+  "load-current": { "file": "src/tools/FileEditTool/FileEditTool.ts", "startLine": 442, "endLine": 449 },
+  "stale-check": { "file": "src/tools/FileEditTool/FileEditTool.ts", "startLine": 451, "endLine": 468 },
+  "stale-err": { "file": "src/tools/FileEditTool/FileEditTool.ts", "startLine": 465, "endLine": 466 },
+  "compute-new": { "file": "src/tools/FileEditTool/FileEditTool.ts", "startLine": 470, "endLine": 491 },
+  "write-disk": { "file": "src/tools/FileEditTool/FileEditTool.ts", "startLine": 491, "endLine": 491 },
+  "lsp-notify": { "file": "src/tools/FileEditTool/FileEditTool.ts", "startLine": 494, "endLine": 514 },
+  "return-diff": { "file": "src/tools/FileEditTool/FileEditTool.ts", "startLine": 560, "endLine": 573 },
+  "bash-start": { "file": "src/tools/BashTool/BashTool.tsx", "startLine": 624, "endLine": 629 },
+  "sed-check": { "file": "src/tools/BashTool/BashTool.tsx", "startLine": 627, "endLine": 629 },
+  "apply-sed": { "file": "src/tools/BashTool/BashTool.tsx", "startLine": 628, "endLine": 628 },
+  "start-exec": { "file": "src/tools/BashTool/BashTool.tsx", "startLine": 881, "endLine": 898 },
+  "bg-req": { "file": "src/tools/BashTool/BashTool.tsx", "startLine": 989, "endLine": 1001 },
+  "spawn-bg": { "file": "src/tools/BashTool/BashTool.tsx", "startLine": 904, "endLine": 921 },
+  "bg-return": { "file": "src/tools/BashTool/BashTool.tsx", "startLine": 994, "endLine": 1000 },
+  "race": { "file": "src/tools/BashTool/BashTool.tsx", "startLine": 1007, "endLine": 1024 },
+  "early-done": { "file": "src/tools/BashTool/BashTool.tsx", "startLine": 1011, "endLine": 1014 },
+  "return-result": { "file": "src/tools/BashTool/BashTool.tsx", "startLine": 1012, "endLine": 1013 },
+  "auto-bg": { "file": "src/tools/BashTool/BashTool.tsx", "startLine": 967, "endLine": 983 },
+  "to-bg": { "file": "src/tools/BashTool/BashTool.tsx", "startLine": 969, "endLine": 971 },
+  "stream-progress": { "file": "src/tools/BashTool/BashTool.tsx", "startLine": 662, "endLine": 679 },
+  "final-result": { "file": "src/tools/BashTool/BashTool.tsx", "startLine": 682, "endLine": 720 },
+  "interpret": { "file": "src/tools/BashTool/BashTool.tsx", "startLine": 690, "endLine": 701 },
+  "persist-check": { "file": "src/tools/BashTool/BashTool.tsx", "startLine": 732, "endLine": 753 },
+  "copy-dest": { "file": "src/tools/BashTool/BashTool.tsx", "startLine": 736, "endLine": 752 },
+  "use-stdout": { "file": "src/tools/BashTool/BashTool.tsx", "startLine": 726, "endLine": 727 },
+  "assemble-out": { "file": "src/tools/BashTool/BashTool.tsx", "startLine": 803, "endLine": 816 },
+  "grep-start": { "file": "src/tools/GrepTool/GrepTool.ts", "startLine": 310, "endLine": 328 },
+  "build-args": { "file": "src/tools/GrepTool/GrepTool.ts", "startLine": 330, "endLine": 409 },
+  "add-ignore": { "file": "src/tools/GrepTool/GrepTool.ts", "startLine": 411, "endLine": 434 },
+  "call-rg": { "file": "src/tools/GrepTool/GrepTool.ts", "startLine": 441, "endLine": 441 },
+  "rg-done": { "file": "src/tools/GrepTool/GrepTool.ts", "startLine": 441, "endLine": 442 },
+  "timeout": { "file": "src/tools/GrepTool/GrepTool.ts", "startLine": 436, "endLine": 440 },
+  "propagate": { "file": "src/tools/GrepTool/GrepTool.ts", "startLine": 440, "endLine": 440 },
+  "mode-switch": { "file": "src/tools/GrepTool/GrepTool.ts", "startLine": 443, "endLine": 443 },
+  "content-branch": { "file": "src/tools/GrepTool/GrepTool.ts", "startLine": 446, "endLine": 465 },
+  "count-branch": { "file": "src/tools/GrepTool/GrepTool.ts", "startLine": 480, "endLine": 499 },
+  "files-branch": { "file": "src/tools/GrepTool/GrepTool.ts", "startLine": 502, "endLine": 520 },
+  "bash-map-result": { "file": "src/tools/BashTool/BashTool.tsx", "startLine": 555, "endLine": 623 },
+  "map-out": { "file": "src/tools/GrepTool/GrepTool.ts", "startLine": 254, "endLine": 309 }
+};
+</script>
+
+<aside id="source-panel"><div id="source-header"></div><div id="monaco-container"></div></aside>
+<script src="../assets/codeindex-runtime.js"></script>
+<script src="../assets/codeindex.js"></script>
+</body>
+</html>

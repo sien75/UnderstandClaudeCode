@@ -1,0 +1,429 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>智能体、任务与多智能体编排</title>
+<link rel="stylesheet" href="../assets/codeindex.css">
+</head>
+<body>
+<nav class="topnav"><a href="../index.html">← 返回总览</a></nav>
+<h1>智能体、任务与多智能体编排</h1>
+
+<p>这是 Claude Code 的"并行执行大脑"。当主对话里的 Claude 想把一部分工作交给别人去做——派一个子智能体去搜代码、起一个后台 shell 跑测试、或者拉起一支多智能体团队分工合作——所有这些请求都汇聚到这里，再分流到具体的执行通道。一条请求从进入到最后把结果送回主对话，会经历：选派谁去做 → 在什么隔离环境跑 → 任务状态如何登记与流转 → 完成或失败时如何通知主循环 → 中途怎么停掉或继续。</p>
+
+<p>从用户/外部调用方的视角，能做的事有四类：(1) <b>派一个子智能体</b>（同步等结果，或后台跑完再通知）——通过 Agent 工具；(2) <b>起一个后台 shell 任务</b>（bash 监控、长命令）——通过 Bash 工具的 run_in_background 或 Task 工具族；(3) <b>组建多智能体团队</b>（一个 leader 带若干 teammate，各自独立进程/会话，互发消息）——通过 TeamCreate + Agent 带 name 参数；(4) <b>对正在跑的任务查进度/取输出/停止</b>——通过 TaskOutput、TaskList、TaskStop。本模块覆盖这四条链路的源码实现。</p>
+
+<dl>
+  <dt>输入</dt>
+  <dd>主对话产生的一个工具调用：一段自然语言任务描述（prompt）、可选的子智能体类型/模型/隔离模式/后台标志；或一个 shell 命令；或一条发给某 teammate 的消息。</dd>
+  <dt>输出</dt>
+  <dd>一个结构化的工具结果回到主对话：子智能体的最终文本回复 + token/工具调用统计；或后台任务的 async_launched 句柄（agentId + 输出文件路径）；或 shell 任务的退出码 + 输出；或 teammate 的"已派发"确认。终态通知以 <code>&lt;task-notification&gt;</code> XML 形式注入回主循环消息队列。</dd>
+</dl>
+
+<h2>一、Agent 工具：派子智能体的总入口</h2>
+
+<p>用户视角："我想让 Claude 并行处理子任务"——主对话的 Claude 调用 Agent 工具，传入 prompt、可选 subagent_type/model/run_in_background/name。Agent 工具是这一切的调度枢纽，它要回答几个问题：这次是要派一个普通子智能体、还是拉一个 teammate 进团队、还是 fork 出一个共享父上下文的 worker？走同步还是后台？需不需要 worktree 隔离？</p>
+
+<pre class="mermaid">
+graph TD
+  entry["Agent.call 收到调用"] --> teamCheck{"带 team_name + name？"}
+  teamCheck -->|"是"| spawnTeammate["派 teammate 进团队&lt;br/&gt;spawnTeammate()"]
+  teamCheck -->|"否"| resolveType["解析子智能体类型&lt;br/&gt;subagent_type / fork / general-purpose"]
+  resolveType --> forkCheck{"fork 路径？"}
+  forkCheck -->|"是 且已在 fork 子进程内"| forkReject["拒绝：fork 不能嵌套"]
+  forkCheck -->|"是 首层"| forkPath["选 FORK_AGENT&lt;br/&gt;继承父系统提示与工具集"]
+  forkCheck -->|"否"| normalPath["按 subagent_type 找定义&lt;br/&gt;过滤被权限拒绝的"]
+  normalPath --> agentNotFound{"找不到？"}
+  agentNotFound -->|"被权限拒绝"| denyErr["抛 denied 错误"]
+  agentNotFound -->|"不存在"| notFoundErr["抛 not found 错误"]
+  agentNotFound -->|"找到"| mcpCheck
+  forkPath --> mcpCheck{"需要 MCP 服务器？"}
+  mcpCheck -->|"是 且未就绪"| waitMcp["轮询等待最多 30s&lt;br/&gt;失败则抛错"]
+  mcpCheck -->|"否 / 已就绪"| remoteCheck{"isolation=remote？"}
+  remoteCheck -->|"是"| remoteLaunch["teleportToRemote&lt;br/&gt;注册 RemoteAgentTask"]
+  remoteCheck -->|"否"| asyncDecide
+  remoteLaunch --> remoteReturn["返回 remote_launched"]
+  asyncDecide{"应跑后台？&lt;br/&gt;run_in_background / background:true&lt;br/&gt;coordinator / fork / kairos"}
+  asyncDecide -->|"是"| asyncPath["registerAsyncAgent&lt;br/&gt;runAsyncAgentLifecycle 后台驱动"]
+  asyncDecide -->|"否"| syncPath["registerAgentForeground&lt;br/&gt;前台跑，可中途 background"]
+  asyncPath --> asyncReturn["返回 async_launched"]
+  syncPath --> syncLoop["前台消息循环&lt;br/&gt;与 backgroundSignal 竞速"]
+  syncLoop --> bgRace{"被 background？"}
+  bgRace -->|"是"| bgContinue["转后台续跑&lt;br/&gt;返回 async_launched"]
+  bgRace -->|"否"| syncDone["完成/失败/取消&lt;br/&gt;返回 completed"]
+</pre>
+
+<ul>
+  <li>入口在 <code>AgentTool.tsx</code> 的 <code>call()</code>，整个调度逻辑约 1000 行，是本模块最核心的一段。</li>
+  <li>"应跑后台吗"这一步是分水岭：同步子智能体共享父对话的 abortController（用户按 ESC 会一起取消），后台子智能体拿一个独立 abortController（ESC 取消主循环不会误杀后台）。</li>
+  <li>前台路径有个独特的"竞速循环"：每轮把"下一条消息"和"被转入后台的信号"做 Promise.race——一旦收到 background 信号就立即转后台，不阻塞等待下一轮。</li>
+  <li>worktree 隔离：选 <code>isolation: "worktree"</code> 时，给子智能体开一个临时 git worktree，跑完若无改动自动清理，有改动则保留并在结果里带 worktreePath。</li>
+</ul>
+
+<h2>二、子智能体执行循环：runAgent</h2>
+
+<p>一旦 Agent 工具决定"派谁、以什么隔离跑"，真正的执行交给 <code>runAgent()</code>。它是一个 async generator，逐条 yield 子智能体产生的消息。它负责把子智能体武装起来：解析它该用哪些工具、装上系统提示、连上它自己声明的 MCP 服务器、注册它的 frontmatter hooks、预加载它要用的 skills，然后把它喂进主 <code>query()</code> 推理循环。</p>
+
+<pre class="mermaid">
+graph TD
+  start["runAgent 入参&lt;br/&gt;agentDefinition + promptMessages"] --> resolveModel["解析模型&lt;br/&gt;agentDef.model / 父模型 / 显式 override"]
+  resolveModel --> filterTools["解析工具集&lt;br/&gt;resolveAgentTools()&lt;br/&gt;剔除 disallowed / async 不允许的"]
+  filterTools --> sysPrompt["构造系统提示&lt;br/&gt;override 或 getAgentSystemPrompt"]
+  sysPrompt --> hooks["执行 SubagentStart hooks&lt;br/&gt;收集附加上下文"]
+  hooks --> registerHooks["注册 frontmatter hooks&lt;br/&gt;（admin-trusted 才允许）"]
+  registerHooks --> preloadSkills["预加载 agent 声明的 skills"]
+  preloadSkills --> initMcp["初始化 agent 专属 MCP 服务器&lt;br/&gt;parent + inline 合并"]
+  initMcp --> buildCtx["createSubagentContext&lt;br/&gt;同步共享 setAppState/abort&lt;br/&gt;异步独立"]
+  buildCtx --> recordInit["写 sidechain 转录 + metadata"]
+  recordInit --> queryLoop["for await query() 消息循环"]
+  queryLoop --> msgType{"消息类型？"}
+  msgType -->|"stream_event message_start"| pushMetrics["转发 TTFT 给父指标"]
+  msgType -->|"attachment max_turns"| breakLoop["break"]
+  msgType -->|"可记录消息"| record["写 sidechain 转录&lt;br/&gt;更新 lastRecordedUuid"]
+  record --> yield["yield 消息给上层"]
+  yield --> queryLoop
+  breakLoop --> abortCheck{"abort 已触发？"}
+  abortCheck -->|"是"| throwAbort["抛 AbortError"]
+  abortCheck -->|"否"| callback["built-in agent 回调"]
+  callback --> cleanup
+  throwAbort --> cleanup["finally：MCP 清理 / hooks 清理 /&lt;br/&gt;killShellTasksForAgent / perfetto 注销"]
+</pre>
+
+<ul>
+  <li>工具解析 <code>resolveAgentTools</code>（在 <code>agentToolUtils.ts</code>）按权限模式过滤：async 子智能体只能用 <code>ASYNC_AGENT_ALLOWED_TOOLS</code> 白名单里的工具；in-process teammate 额外放行 Agent 和任务协调工具以便它再派同步子智能体。</li>
+  <li>fork 路径特殊：用 <code>useExactTools=true</code>，直接拿父的工具数组与系统提示，目的是让 API 请求前缀字节级一致以命中 prompt cache——所以 fork worker 不能嵌套 fork（递归保护在 AgentTool.call 里靠 querySource + 消息扫描双重判断）。</li>
+  <li>每个 agent 的转录写进 sidechain JSONL（<code>recordSidechainTranscript</code>），这是 SendMessage 续跑、--resume 恢复、UI 面板查看进度的数据基础。</li>
+  <li>finally 里的清理是"不留尾巴"的关键：杀掉这个 agent 自己 spawn 的 shell 任务、注销 session hooks、释放 perfetto 追踪、清空 todos 键——否则长会话里几百个 agent 会慢慢泄漏内存。</li>
+</ul>
+
+<h2>三、任务状态机：LocalAgentTask</h2>
+
+<p>每个被派出去的子智能体在 AppState.tasks 里都有一条 <code>LocalAgentTaskState</code>。状态字段 <code>status</code> 取自 <code>TaskStatus</code> 联合类型，流转有严格约束——这是本模块最典型的状态机视角。</p>
+
+<pre class="mermaid">
+graph TD
+  pending["pending&lt;br/&gt;createTaskStateBase 初始态"] -->|"spawn 时直接置"| running["running&lt;br/&gt;registerAsyncAgent / registerAgentForeground"]
+  running -->|"正常跑完&lt;br/&gt;completeAgentTask"| completed["completed&lt;br/&gt;带 result + endTime"]
+  running -->|"抛异常&lt;br/&gt;failAsyncAgent"| failed["failed&lt;br/&gt;带 error"]
+  running -->|"用户/TaskStop kill&lt;br/&gt;killAsyncAgent"| killed["killed&lt;br/&gt;abort + 清理"]
+  running -->|"前台转后台&lt;br/&gt;backgroundAgentTask"| runningBg["running (isBackgrounded=true)&lt;br/&gt;前台循环退出，后台续跑"]
+  runningBg -->|"后台跑完"| completed
+  runningBg -->|"后台失败"| failed
+  runningBg -->|"后台被 kill"| killed
+  completed -->|"evictAfter 到期&lt;br/&gt;非 retain"| evicted["从 AppState 移除"]
+  failed --> evicted
+  killed --> evicted
+  running -->|"SendMessage 续跑&lt;br/&gt;resumeAgentBackground"| running
+  killed -->|"SendMessage 复活&lt;br/&gt;resumeAgentBackground"| running
+  completed -.->|"retain=true 时&lt;br/&gt;UI 持有"| retained["保留在 AppState&lt;br/&gt;不进 evictAfter"]
+</pre>
+
+<ul>
+  <li>状态机定义在 <code>src/Task.ts</code>：<code>TaskStatus = pending | running | completed | failed | killed</code>，<code>isTerminalTaskStatus()</code> 把后三个标为终态——防止往死掉的 teammate 注入消息、防止清理路径重入。</li>
+  <li><b>notified 标志</b>是去重关键：任务进入终态后通过 <code>enqueueAgentNotification</code> 向主循环注入 <code>&lt;task-notification&gt;</code> XML。但 TaskStop 也会主动标 notified 以抑制冗余通知。所有终态转换函数（complete/fail/kill）都先 <code>updateTaskState</code> 再 <code>evictTaskOutput</code>——状态先翻，磁盘后清，保证 TaskOutput 的 block 等待能立刻解除。</li>
+  <li><b>retain 字段</b>控制 UI 是否"按住"这个任务：retained 任务不设 evictAfter，不会被后台指标清理，且会触发磁盘 bootstrap 把 sidechain 转录 UUID-merge 进 messages 供面板查看。</li>
+  <li><b>pendingMessages 队列</b>：SendMessage 给一个正在跑的 agent 发消息时，消息进 <code>task.pendingMessages</code>，在工具轮次边界被 <code>drainPendingMessages</code> 抽干注入 agent 的 API 输入——不打断当前轮。</li>
+  <li>面板可见性谓词 <code>isPanelAgentTask</code>：所有 pill/panel 过滤器必须共用这一个谓词，否则会不一致——agentType 为 'main-session' 的不算面板 agent。</li>
+</ul>
+
+<h2>四、后台生命周期驱动：runAsyncAgentLifecycle</h2>
+
+<p>无论从 Agent 工具直接后台派发，还是前台转后台，还是 SendMessage 复活一个已停止的 agent，最终都汇入 <code>runAsyncAgentLifecycle()</code>（在 <code>agentToolUtils.ts</code>）。它把"跑 agent + 追踪进度 + 终态转换 + 通知"这套流程封装成一个共享驱动器。</p>
+
+<pre class="mermaid">
+graph TD
+  start["runAsyncAgentLifecycle&lt;br/&gt;taskId + makeStream"] --> makeTracker["创建 ProgressTracker&lt;br/&gt;+ ActivityDescriptionResolver"]
+  makeTracker --> onCache["onCacheSafeParams 回调&lt;br/&gt;（启用摘要服务）"]
+  onCache --> loop["for await makeStream() 消息"]
+  loop --> pushMsg["消息入 agentMessages"]
+  pushMsg --> retainCheck{"task.retain？&lt;br/&gt;UI 持有"}
+  retainCheck -->|"是"| appendLive["messages 追加到 state&lt;br/&gt;实时显示"]
+  retainCheck -->|"否"| progress["更新 progress&lt;br/&gt;emit task_progress SDK 事件"]
+  appendLive --> progress
+  progress --> loop
+  loop -->|"流结束"| finalize["finalizeAgentTool&lt;br/&gt;提取最后一条 assistant 文本 + 统计"]
+  finalize --> complete["completeAsyncAgent&lt;br/&gt;状态翻 completed（先于通知）"]
+  complete --> handoff{"auto 模式&lt;br/&gt;需交接分类？"}
+  handoff -->|"是"| classify["classifyHandoffIfNeeded&lt;br/&gt;安全分类器审查子智能体产出"]
+  handoff -->|"否"| worktree["清理 worktree"]
+  classify --> worktree
+  worktree --> notify["enqueueAgentNotification&lt;br/&gt;status=completed + finalMessage"]
+  notify --> doneLoop["finally：清 skills / dumpState"]
+  loop -->|"AbortError"| killBranch["killAsyncAgent + extractPartialResult&lt;br/&gt;通知 status=killed + 部分结果"]
+  loop -->|"其他异常"| failBranch["failAsyncAgent&lt;br/&gt;通知 status=failed + 错误信息"]
+  killBranch --> doneLoop
+  failBranch --> worktree
+</pre>
+
+<ul>
+  <li><b>先翻状态再发通知</b>是硬约束（gh-20236）：completeAsyncAgent/failAsyncAgent/killAsyncAgent 立刻把 status 翻成终态，这样 <code>TaskOutput(block=true)</code> 的 <code>waitForTaskCompletion</code> 立刻解除阻塞；而分类器调用、worktree 清理这种可能挂起的步骤放在状态翻转之后——它们不能阻塞状态机推进。</li>
+  <li><b>extractPartialResult</b>：被 kill 时从已收集的 assistant 消息里倒序提取第一条有文本的，作为 finalMessage 通知——即使中途取消，父 agent 也能看到子智能体做到哪了。</li>
+  <li><b>classifyHandoffIfNeeded</b>：仅 auto 权限模式 + TRANSCRIPT_CLASSIFIER 特性开启时触发，用一个独立分类器模型审查子智能体的动作是否违反安全策略——不可用时放行但加警告，阻断时返回 SECURITY WARNING 给父 agent。</li>
+</ul>
+
+<h2>五、停止任务：TaskStop → stopTask</h2>
+
+<p>用户或主对话想中途停掉一个后台任务（shell 或 agent），调用 TaskStop 工具。它是个薄封装，真正逻辑在 <code>tasks/stopTask.ts</code> 的 <code>stopTask()</code>。</p>
+
+<pre class="mermaid">
+graph TD
+  entry["TaskStop.call(task_id)"] --> lookup["在 AppState.tasks 找任务"]
+  lookup --> found{"找到？"}
+  found -->|"否"| errNotFound["StopTaskError not_found"]
+  found -->|"是"| running{"status=running？"}
+  running -->|"否"| errNotRunning["StopTaskError not_running"]
+  running -->|"是"| impl["getTaskByType(task.type)&lt;br/&gt;拿 Task 实现"]
+  impl --> implFound{"有实现？"}
+  implFound -->|"否"| errUnsupported["StopTaskError unsupported_type"]
+  implFound -->|"是"| kill["taskImpl.kill(taskId, setAppState)&lt;br/&gt;多态分发到各 Task"]
+  kill --> shellCheck{"是 local_bash？"}
+  shellCheck -->|"是"| suppress["标 notified=true&lt;br/&gt;抑制 exit 137 噪声"]
+  shellCheck -->|"否"| return["返回 taskId/type/command"]
+  suppress --> emitSdk["emitTaskTerminatedSdk&lt;br/&gt;SDK 消费者仍看到终止事件"]
+  emitSdk --> return
+</pre>
+
+<ul>
+  <li>多态分发：<code>getTaskByType</code>（在 <code>tasks.ts</code>）按 type 字段返回 LocalShellTask / LocalAgentTask / RemoteAgentTask / DreamTask 等具体实现，每个都实现 <code>kill(taskId, setAppState)</code>。注意 <code>Task</code> 接口现在只保留 kill——spawn/render 不再走多态（commit 22546 移除）。</li>
+  <li>shell 任务被 kill 时主动标 notified 以抑制"exit code 137"那条噪声通知，但补发一个 SDK task_terminated 事件让 SDK 消费者（如 VS Code）看到关闭；agent 任务不抑制——因为 AbortError catch 里会用 extractPartialResult 生成有意义的 payload。</li>
+</ul>
+
+<h2>六、多智能体协作：团队、teammate、消息</h2>
+
+<p>上面讲的是"主对话 vs 一个子智能体"的二元关系。多智能体团队是另一套机制：一个 leader 通过 TeamCreate 建团，再用 Agent 带 name 参数派 teammate；teammate 之间通过 SendMessage 互发消息。这套由 TeamCreateTool / TeamDeleteTool / SendMessageTool / spawnMultiAgent 协作实现。</p>
+
+<pre class="mermaid">
+graph TD
+  create["TeamCreate.call(team_name)"] --> exists{"已有团队？"}
+  exists -->|"是"| errTeam["报错：一次只能一个团"]
+  exists -->|"否"| unique["生成唯一 team 名"]
+  unique --> writeTeam["写 TeamFile 到磁盘&lt;br/&gt;leader 作为首个 member"]
+  writeTeam --> resetTasks["重置任务列表目录&lt;br/&gt;团队=项目=任务列表"]
+  resetTasks --> setState["AppState.teamContext 置位&lt;br/&gt;leader 不设 agentId（保持 isTeammate=false）"]
+  setState --> spawnTeammate["leader 调 Agent(name=xx)&lt;br/&gt;spawnTeammate()"]
+  spawnTeammate --> mode{"spawn 模式？"}
+  mode -->|"in-process"| inProc["handleSpawnInProcess&lt;br/&gt;同进程 AsyncLocalStorage 隔离&lt;br/&gt;startInProcessTeammate 起循环"]
+  mode -->|"splitpane/separate"| pane["handleSpawnSplitPane&lt;br/&gt;tmux/iTerm2 开新窗格跑独立进程"]
+  mode -->|"auto 无后端"| fallback["回退 in-process"]
+  inProc --> running["teammate running&lt;br/&gt;pendingUserMessages 队列接消息"]
+  pane --> running
+  running --> msg["teammate 间 SendMessage"]
+  msg --> route{"路由目标？"}
+  route -->|"按 name 查 agentNameRegistry&lt;br/&gt;找到 LocalAgentTask"| queue["queuePendingMessage&lt;br/&gt;下个工具轮注入"]
+  route -->|"任务已停"| resume["resumeAgentBackground&lt;br/&gt;从磁盘转录复活"]
+  route -->|"按 teammate 名 / 邮箱"| mailbox["writeToMailbox&lt;br/&gt;落盘邮箱文件"]
+  route -->|"broadcast *"| broadcast["遍历 TeamFile.members&lt;br/&gt;逐个写邮箱"]
+  msg --> structured{"结构化消息？"}
+  structured -->|"shutdown_request"| shutReq["请求关闭&lt;br/&gt;对方决定 approve/reject"]
+  structured -->|"shutdown_response approve"| shutAppr["in-process: abort 自己&lt;br/&gt;tmux: gracefulShutdown"]
+  structured -->|"plan_approval"| plan["leader 审批 teammate 的 plan&lt;br/&gt;带 permissionMode 回传"]
+  shutReq --> delete["TeamDelete.call()"]
+  delete --> activeCheck{"有活跃 member？"}
+  activeCheck -->|"有"| refuse["拒绝清理"]
+  activeCheck -->|"无"| cleanup["cleanupTeamDirectories&lt;br/&gt;清 AppState.teamContext + inbox"]
+</pre>
+
+<ul>
+  <li>团队信息持久化在磁盘 TeamFile（<code>utils/swarm/teamHelpers.ts</code>），不在 AppState——这样 tmux 独立进程的 teammate 也能读到同一份花名册。会话级清理注册在 <code>registerTeamForSessionCleanup</code>，避免团队文件遗留（gh-32730）。</li>
+  <li><b>in-process teammate</b>用 AsyncLocalStorage 隔离，不是独立进程，生命周期绑在 leader 进程上——所以它不能再派后台 agent、不能再 spawn teammate（团队花名册是扁平的，嵌套会乱）。这些约束在 AgentTool.call 入口硬校验。</li>
+  <li><b>SendMessage 的路由优先级</b>：先看 <code>appState.agentNameRegistry</code>（name→agentId 映射，spawn 时注册），命中且是 LocalAgentTask 就走 pendingMessages 队列；任务已停就 resumeAgentBackground 从 sidechain 转录复活；都不是再退化到 teammate 邮箱（tmux/进程间）。</li>
+  <li><b>结构化消息</b>用于团队治理：shutdown_request/response 实现优雅关闭握手（in-process 直接 abort 自己，tmux 走 gracefulShutdown），plan_approval_response 让 leader 审批 teammate 的 plan 模式并回传要继承的 permissionMode。</li>
+  <li><b>UDS/bridge 跨会话</b>：SendMessage 还支持 <code>uds:&lt;socket&gt;</code> 和 <code>bridge:&lt;session&gt;</code> 地址，前者写本地 Unix socket，后者通过 Remote Control 跨机器投递——bridge 必须强制用户确认（bypass-immune 的安全检查），且只允许纯文本。</li>
+</ul>
+
+<h2>七、Coordinator 模式：leader 不亲自下场</h2>
+
+<p>普通模式下主对话的 Claude 自己用工具干活；Coordinator 模式（<code>COORDINATOR_MODE</code> feature flag + <code>CLAUDE_CODE_COORDINATOR_MODE</code> 环境变量）下，Claude 变成纯调度者——只用 Agent/SendMessage/TaskStop，所有实际工作派给 worker 子智能体。这套由 <code>coordinator/coordinatorMode.ts</code> 配置。</p>
+
+<pre class="mermaid">
+graph TD
+  env["环境变量&lt;br/&gt;CLAUDE_CODE_COORDINATOR_MODE"] --> gate{"COORDINATOR_MODE flag 开？"}
+  gate -->|"否"| off["isCoordinatorMode()=false&lt;br/&gt;普通模式"]
+  gate -->|"是"| on["isCoordinatorMode()=true"]
+  on --> sysPrompt["getCoordinatorSystemPrompt()&lt;br/&gt;注入 leader 角色提示"]
+  on --> userCtx["getCoordinatorUserContext()&lt;br/&gt;告知 worker 可用工具集 + scratchpad"]
+  on --> forceAsync["Agent 工具里 shouldRunAsync=true&lt;br/&gt;所有 spawn 强制后台"]
+  on --> escKill["ESC 取消时&lt;br/&gt;killAllRunningAgentTasks 全杀"]
+  on --> summary["启用 AgentSummary&lt;br/&gt;周期性摘要 worker 进度"]
+  match["matchSessionMode&lt;br/&gt;--resume 时"] --> switch{"session 模式 ≠ 当前？"}
+  switch -->|"是"| flip["翻转 env var&lt;br/&gt;返回提示语"]
+  switch -->|"否"| noop["无操作"]
+</pre>
+
+<ul>
+  <li>Coordinator 的系统提示（coordinatorMode.ts 111-369）是一份完整的工作手册：定义 leader 角色、Agent/SendMessage/TaskStop 工具用法、<code>&lt;task-notification&gt;</code> 格式、研究→综合→实现→验证四阶段、并发策略（只读并行、写串行）、continue vs spawn 决策表、worker prompt 撰写规范。</li>
+  <li>关键约束：leader 不设 model 参数（worker 用默认模型干实事）、不在一个 worker 里查另一个 worker（worker 完成会自动通知）、不臆造结果（结果作为独立消息到达）。</li>
+  <li><code>matchSessionMode</code> 处理 resume 时模式不一致：旧会话存了 coordinator 模式但当前没开，就翻转 env 让 isCoordinatorMode() 返回正确值——因为 isCoordinatorMode() 是实时读 env 不缓存。</li>
+  <li>scratchpad 目录（<code>tengu_scratch</code> gate）给 worker 们一个免权限提示的共享知识库——leader 在 userContext 里告诉 worker 路径，worker 们在此读写交接信息。</li>
+</ul>
+
+<h2>八、任务工具族：Create/Get/List/Output/Update/Stop</h2>
+
+<p>除了 Agent（派智能体）和 SendMessage（智能体间通信），还有一组面向"任务清单"的工具，让多智能体团队共享一个待办列表来协调分工。这组工具操作的是磁盘上的任务列表（<code>utils/tasks.ts</code>，团队=项目=任务列表），与上面的"后台执行任务"是两套概念——这里是一个 TODO 看板。</p>
+
+<ul>
+  <li><b>TaskCreate</b>：在当前任务列表（<code>getTaskListId()</code>，leader 用团队名、普通会话用 sessionId）建一条 pending 任务，触发 TaskCreated hooks；若 hook 返回 blockingError 就回滚删除。auto-expand 任务面板。</li>
+  <li><b>TaskUpdate</b>：改任务状态（pending→in_progress→completed）、owner、依赖关系。用于 teammate 领活、标记完成。</li>
+  <li><b>TaskList/TaskGet</b>：列出全部 / 查单条，供 teammate 看板协调。</li>
+  <li><b>TaskOutput</b>：读后台执行任务（LocalAgent/LocalShell/Remote）的输出。<code>block=true</code> 时 <code>waitForTaskCompletion</code> 阻塞到终态或 timeout——这是主对话"等某个后台 agent 跑完"的同步原语，依赖第三节的状态翻转及时解除阻塞。</li>
+  <li><b>TaskStop</b>：见第五节，多态 kill。</li>
+</ul>
+
+<h2>九、Remote 与 Dream：另两类任务</h2>
+
+<p>除了 LocalAgent（本机子智能体）和 LocalShell（本机 bash），任务系统还有两个成员：</p>
+
+<ul>
+  <li><b>RemoteAgentTask</b>（<code>tasks/RemoteAgentTask/</code>）：把 agent 派到远程 CCR 环境跑（ant-only，<code>isolation: "remote"</code> 或 ultraplan/review 等场景）。<code>registerRemoteAgentTask</code> 建任务态，<code>remoteTaskMetadata</code> 持久化到 sidecar 供 <code>--resume</code> 重连还活着的远程会话；<code>restoreRemoteAgentTasks</code> 在启动时从 CCR 拉取最新状态恢复任务。kill 通过 RemoteAgentTask.kill 多态分发。</li>
+  <li><b>DreamTask</b>（<code>tasks/DreamTask/</code>）：一种特殊的多轮迭代任务（DreamPhase: starting/updating），<code>addDreamTurn</code> 累加轮次、<code>completeDreamTask/failDreamTask</code> 终态转换，同样实现 Task 接口参与多态 kill。</li>
+  <li>所有具体 Task 实现都注册在 <code>getAllTasks()</code>（<code>tasks.ts</code>）：LocalShellTask、LocalAgentTask、RemoteAgentTask、DreamTask 始终在列，LocalWorkflowTask/MonitorMcpTask 受 feature flag 控制按需 require（避免循环依赖 + 死代码消除）。</li>
+  <li>任务 ID 前缀按 type 分配（local_bash→b、local_agent→a、remote_agent→r、in_process_teammate→t、dream→d），后接 8 位 36 进制随机——36^8≈2.8 万亿组合，抗符号链接暴力攻击。</li>
+</ul>
+
+<h2>关键设计要点回顾</h2>
+
+<ul>
+  <li><b>状态先翻，通知后发</b>：所有终态转换函数先 updateTaskState 再做可能挂起的清理/分类/通知，保证 TaskOutput 的阻塞等待能立刻解除（gh-20236）。</li>
+  <li><b>notified 去重</b>：enqueueAgentNotification 用 notified 标志原子地防止重复通知；TaskStop 也标 notified 抑制 shell 的 exit 噪声。</li>
+  <li><b>前台↔后台可逆</b>：前台 agent 跑到一半可以转后台（backgroundSignal race），后台 agent 被 SendMessage 续跑或复活——同一套 runAsyncAgentLifecycle 驱动。</li>
+  <li><b>隔离层次</b>：同步子智能体共享父 abortController；后台子智能体独立 abortController（ESC 不误杀）；in-process teammate 用 AsyncLocalStorage 同进程隔离；tmux teammate 独立进程；remote agent 独立 CCR 环境。</li>
+  <li><b>权限沿继承链收窄</b>：worker 的工具池用 worker 自己的 permissionMode 重新组装（assembleToolPool），不继承父的工具限制；allowedTools 提供时替换所有 session 级规则防泄漏，但保留 cliArg（SDK --allowedTools）。</li>
+  <li><b>fork 缓存对齐</b>：fork worker 继承父系统提示 + 父工具数组 + 父 thinkingConfig，目的是 API 请求前缀字节级一致以命中 prompt cache——所以禁止嵌套 fork，递归保护靠 querySource（autocompact 不改 context.options）+ 消息扫描双保险。</li>
+  <li><b>清理不留遗</b>：runAgent 的 finally 杀掉 agent 自己 spawn 的 shell 任务、注销 hooks、清 todos 键、释放 perfetto——长会话里几百个 agent 不至于慢慢泄漏。</li>
+</ul>
+
+<script>
+window.__sourceMap = {
+  "entry": { "file": "src/tools/AgentTool/AgentTool.tsx", "startLine": 239, "endLine": 316 },
+  "teamCheck": { "file": "src/tools/AgentTool/AgentTool.tsx", "startLine": 282, "endLine": 316 },
+  "spawnTeammate": { "file": "src/tools/AgentTool/AgentTool.tsx", "startLine": 290, "endLine": 316 },
+  "resolveType": { "file": "src/tools/AgentTool/AgentTool.tsx", "startLine": 318, "endLine": 356 },
+  "forkCheck": { "file": "src/tools/AgentTool/AgentTool.tsx", "startLine": 322, "endLine": 356 },
+  "forkReject": { "file": "src/tools/AgentTool/AgentTool.tsx", "startLine": 332, "endLine": 334 },
+  "forkPath": { "file": "src/tools/AgentTool/AgentTool.tsx", "startLine": 335, "endLine": 335 },
+  "normalPath": { "file": "src/tools/AgentTool/AgentTool.tsx", "startLine": 336, "endLine": 356 },
+  "agentNotFound": { "file": "src/tools/AgentTool/AgentTool.tsx", "startLine": 345, "endLine": 354 },
+  "denyErr": { "file": "src/tools/AgentTool/AgentTool.tsx", "startLine": 349, "endLine": 352 },
+  "notFoundErr": { "file": "src/tools/AgentTool/AgentTool.tsx", "startLine": 353, "endLine": 353 },
+  "mcpCheck": { "file": "src/tools/AgentTool/AgentTool.tsx", "startLine": 367, "endLine": 410 },
+  "waitMcp": { "file": "src/tools/AgentTool/AgentTool.tsx", "startLine": 377, "endLine": 392 },
+  "remoteCheck": { "file": "src/tools/AgentTool/AgentTool.tsx", "startLine": 435, "endLine": 482 },
+  "remoteLaunch": { "file": "src/tools/AgentTool/AgentTool.tsx", "startLine": 436, "endLine": 481 },
+  "remoteReturn": { "file": "src/tools/AgentTool/AgentTool.tsx", "startLine": 469, "endLine": 481 },
+  "asyncDecide": { "file": "src/tools/AgentTool/AgentTool.tsx", "startLine": 557, "endLine": 567 },
+  "asyncPath": { "file": "src/tools/AgentTool/AgentTool.tsx", "startLine": 686, "endLine": 764 },
+  "asyncReturn": { "file": "src/tools/AgentTool/AgentTool.tsx", "startLine": 754, "endLine": 764 },
+  "syncPath": { "file": "src/tools/AgentTool/AgentTool.tsx", "startLine": 765, "endLine": 806 },
+  "syncLoop": { "file": "src/tools/AgentTool/AgentTool.tsx", "startLine": 846, "endLine": 1126 },
+  "bgRace": { "file": "src/tools/AgentTool/AgentTool.tsx", "startLine": 897, "endLine": 1053 },
+  "bgContinue": { "file": "src/tools/AgentTool/AgentTool.tsx", "startLine": 911, "endLine": 1052 },
+  "syncDone": { "file": "src/tools/AgentTool/AgentTool.tsx", "startLine": 1223, "endLine": 1261 },
+  "start": { "file": "src/tools/AgentTool/runAgent.ts", "startLine": 248, "endLine": 329 },
+  "resolveModel": { "file": "src/tools/AgentTool/runAgent.ts", "startLine": 340, "endLine": 345 },
+  "filterTools": { "file": "src/tools/AgentTool/runAgent.ts", "startLine": 500, "endLine": 502 },
+  "sysPrompt": { "file": "src/tools/AgentTool/runAgent.ts", "startLine": 508, "endLine": 518 },
+  "hooks": { "file": "src/tools/AgentTool/runAgent.ts", "startLine": 530, "endLine": 555 },
+  "registerHooks": { "file": "src/tools/AgentTool/runAgent.ts", "startLine": 557, "endLine": 575 },
+  "preloadSkills": { "file": "src/tools/AgentTool/runAgent.ts", "startLine": 577, "endLine": 646 },
+  "initMcp": { "file": "src/tools/AgentTool/runAgent.ts", "startLine": 648, "endLine": 664 },
+  "buildCtx": { "file": "src/tools/AgentTool/runAgent.ts", "startLine": 700, "endLine": 730 },
+  "recordInit": { "file": "src/tools/AgentTool/runAgent.ts", "startLine": 732, "endLine": 745 },
+  "queryLoop": { "file": "src/tools/AgentTool/runAgent.ts", "startLine": 748, "endLine": 806 },
+  "msgType": { "file": "src/tools/AgentTool/runAgent.ts", "startLine": 761, "endLine": 790 },
+  "pushMetrics": { "file": "src/tools/AgentTool/runAgent.ts", "startLine": 761, "endLine": 768 },
+  "breakLoop": { "file": "src/tools/AgentTool/runAgent.ts", "startLine": 773, "endLine": 787 },
+  "record": { "file": "src/tools/AgentTool/runAgent.ts", "startLine": 792, "endLine": 805 },
+  "yield": { "file": "src/tools/AgentTool/runAgent.ts", "startLine": 804, "endLine": 805 },
+  "abortCheck": { "file": "src/tools/AgentTool/runAgent.ts", "startLine": 808, "endLine": 810 },
+  "throwAbort": { "file": "src/tools/AgentTool/runAgent.ts", "startLine": 809, "endLine": 810 },
+  "callback": { "file": "src/tools/AgentTool/runAgent.ts", "startLine": 813, "endLine": 815 },
+  "cleanup": { "file": "src/tools/AgentTool/runAgent.ts", "startLine": 816, "endLine": 859 },
+  "pending": { "file": "src/Task.ts", "startLine": 44, "endLine": 57 },
+  "running": { "file": "src/tasks/LocalAgentTask/LocalAgentTask.tsx", "startLine": 466, "endLine": 515 },
+  "runningBg": { "file": "src/tasks/LocalAgentTask/LocalAgentTask.tsx", "startLine": 620, "endLine": 652 },
+  "completed": { "file": "src/tasks/LocalAgentTask/LocalAgentTask.tsx", "startLine": 412, "endLine": 432 },
+  "failed": { "file": "src/tasks/LocalAgentTask/LocalAgentTask.tsx", "startLine": 437, "endLine": 456 },
+  "killed": { "file": "src/tasks/LocalAgentTask/LocalAgentTask.tsx", "startLine": 281, "endLine": 303 },
+  "evicted": { "file": "src/tasks/LocalAgentTask/LocalAgentTask.tsx", "startLine": 657, "endLine": 682 },
+  "retained": { "file": "src/tasks/LocalAgentTask/LocalAgentTask.tsx", "startLine": 137, "endLine": 148 },
+  "lifecycleStart": { "file": "src/tools/AgentTool/agentToolUtils.ts", "startLine": 508, "endLine": 535 },
+  "makeTracker": { "file": "src/tools/AgentTool/agentToolUtils.ts", "startLine": 536, "endLine": 553 },
+  "onCache": { "file": "src/tools/AgentTool/agentToolUtils.ts", "startLine": 543, "endLine": 553 },
+  "pushMsg": { "file": "src/tools/AgentTool/agentToolUtils.ts", "startLine": 554, "endLine": 555 },
+  "retainCheck": { "file": "src/tools/AgentTool/agentToolUtils.ts", "startLine": 559, "endLine": 570 },
+  "appendLive": { "file": "src/tools/AgentTool/agentToolUtils.ts", "startLine": 559, "endLine": 570 },
+  "progress": { "file": "src/tools/AgentTool/agentToolUtils.ts", "startLine": 571, "endLine": 593 },
+  "finalize": { "file": "src/tools/AgentTool/agentToolUtils.ts", "startLine": 597, "endLine": 597 },
+  "complete": { "file": "src/tools/AgentTool/agentToolUtils.ts", "startLine": 603, "endLine": 603 },
+  "handoff": { "file": "src/tools/AgentTool/agentToolUtils.ts", "startLine": 607, "endLine": 620 },
+  "classify": { "file": "src/tools/AgentTool/agentToolUtils.ts", "startLine": 389, "endLine": 481 },
+  "worktree": { "file": "src/tools/AgentTool/agentToolUtils.ts", "startLine": 622, "endLine": 622 },
+  "notify": { "file": "src/tasks/LocalAgentTask/LocalAgentTask.tsx", "startLine": 197, "endLine": 262 },
+  "doneLoop": { "file": "src/tools/AgentTool/agentToolUtils.ts", "startLine": 682, "endLine": 685 },
+  "killBranch": { "file": "src/tools/AgentTool/agentToolUtils.ts", "startLine": 640, "endLine": 668 },
+  "failBranch": { "file": "src/tools/AgentTool/agentToolUtils.ts", "startLine": 670, "endLine": 681 },
+  "stopEntry": { "file": "src/tools/TaskStopTool/TaskStopTool.ts", "startLine": 107, "endLine": 131 },
+  "lookup": { "file": "src/tasks/stopTask.ts", "startLine": 38, "endLine": 48 },
+  "found": { "file": "src/tasks/stopTask.ts", "startLine": 46, "endLine": 48 },
+  "running2": { "file": "src/tasks/stopTask.ts", "startLine": 50, "endLine": 55 },
+  "impl": { "file": "src/tasks/stopTask.ts", "startLine": 57, "endLine": 63 },
+  "implFound": { "file": "src/tasks/stopTask.ts", "startLine": 58, "endLine": 63 },
+  "kill": { "file": "src/tasks/stopTask.ts", "startLine": 65, "endLine": 65 },
+  "shellCheck": { "file": "src/tasks/stopTask.ts", "startLine": 70, "endLine": 97 },
+  "suppress": { "file": "src/tasks/stopTask.ts", "startLine": 71, "endLine": 86 },
+  "emitSdk": { "file": "src/tasks/stopTask.ts", "startLine": 89, "endLine": 94 },
+  "return2": { "file": "src/tasks/stopTask.ts", "startLine": 97, "endLine": 100 },
+  "errNotFound": { "file": "src/tasks/stopTask.ts", "startLine": 47, "endLine": 47 },
+  "errNotRunning": { "file": "src/tasks/stopTask.ts", "startLine": 51, "endLine": 54 },
+  "errUnsupported": { "file": "src/tasks/stopTask.ts", "startLine": 59, "endLine": 62 },
+  "create": { "file": "src/tools/TeamCreateTool/TeamCreateTool.ts", "startLine": 128, "endLine": 237 },
+  "exists": { "file": "src/tools/TeamCreateTool/TeamCreateTool.ts", "startLine": 136, "endLine": 140 },
+  "errTeam": { "file": "src/tools/TeamCreateTool/TeamCreateTool.ts", "startLine": 137, "endLine": 139 },
+  "unique": { "file": "src/tools/TeamCreateTool/TeamCreateTool.ts", "startLine": 143, "endLine": 143 },
+  "writeTeam": { "file": "src/tools/TeamCreateTool/TeamCreateTool.ts", "startLine": 157, "endLine": 181 },
+  "resetTasks": { "file": "src/tools/TeamCreateTool/TeamCreateTool.ts", "startLine": 183, "endLine": 191 },
+  "setState": { "file": "src/tools/TeamCreateTool/TeamCreateTool.ts", "startLine": 194, "endLine": 212 },
+  "spawnTeammate2": { "file": "src/tools/shared/spawnMultiAgent.ts", "startLine": 1040, "endLine": 1078 },
+  "mode": { "file": "src/tools/shared/spawnMultiAgent.ts", "startLine": 1044, "endLine": 1077 },
+  "inProc": { "file": "src/tools/shared/spawnMultiAgent.ts", "startLine": 840, "endLine": 938 },
+  "pane": { "file": "src/tools/shared/spawnMultiAgent.ts", "startLine": 305, "endLine": 544 },
+  "fallback": { "file": "src/tools/shared/spawnMultiAgent.ts", "startLine": 1057, "endLine": 1068 },
+  "msg": { "file": "src/tools/SendMessageTool/SendMessageTool.ts", "startLine": 741, "endLine": 913 },
+  "route": { "file": "src/tools/SendMessageTool/SendMessageTool.ts", "startLine": 802, "endLine": 874 },
+  "queue": { "file": "src/tools/SendMessageTool/SendMessageTool.ts", "startLine": 808, "endLine": 820 },
+  "resume": { "file": "src/tools/SendMessageTool/SendMessageTool.ts", "startLine": 823, "endLine": 844 },
+  "mailbox": { "file": "src/tools/SendMessageTool/SendMessageTool.ts", "startLine": 149, "endLine": 189 },
+  "broadcast": { "file": "src/tools/SendMessageTool/SendMessageTool.ts", "startLine": 191, "endLine": 266 },
+  "structured": { "file": "src/tools/SendMessageTool/SendMessageTool.ts", "startLine": 887, "endLine": 912 },
+  "shutReq": { "file": "src/tools/SendMessageTool/SendMessageTool.ts", "startLine": 268, "endLine": 303 },
+  "shutAppr": { "file": "src/tools/SendMessageTool/SendMessageTool.ts", "startLine": 305, "endLine": 399 },
+  "plan": { "file": "src/tools/SendMessageTool/SendMessageTool.ts", "startLine": 434, "endLine": 518 },
+  "delete": { "file": "src/tools/TeamDeleteTool/TeamDeleteTool.ts", "startLine": 71, "endLine": 135 },
+  "activeCheck": { "file": "src/tools/TeamDeleteTool/TeamDeleteTool.ts", "startLine": 79, "endLine": 99 },
+  "refuse": { "file": "src/tools/TeamDeleteTool/TeamDeleteTool.ts", "startLine": 89, "endLine": 98 },
+  "cleanup": { "file": "src/tools/TeamDeleteTool/TeamDeleteTool.ts", "startLine": 101, "endLine": 124 },
+  "env": { "file": "src/coordinator/coordinatorMode.ts", "startLine": 36, "endLine": 41 },
+  "gate": { "file": "src/coordinator/coordinatorMode.ts", "startLine": 36, "endLine": 41 },
+  "off": { "file": "src/coordinator/coordinatorMode.ts", "startLine": 36, "endLine": 41 },
+  "on": { "file": "src/coordinator/coordinatorMode.ts", "startLine": 36, "endLine": 41 },
+  "sysPrompt2": { "file": "src/coordinator/coordinatorMode.ts", "startLine": 111, "endLine": 369 },
+  "userCtx": { "file": "src/coordinator/coordinatorMode.ts", "startLine": 80, "endLine": 109 },
+  "forceAsync": { "file": "src/tools/AgentTool/AgentTool.tsx", "startLine": 557, "endLine": 567 },
+  "escKill": { "file": "src/tasks/LocalAgentTask/LocalAgentTask.tsx", "startLine": 309, "endLine": 315 },
+  "summary": { "file": "src/tasks/LocalAgentTask/LocalAgentTask.tsx", "startLine": 359, "endLine": 407 },
+  "match": { "file": "src/coordinator/coordinatorMode.ts", "startLine": 49, "endLine": 78 },
+  "switch": { "file": "src/coordinator/coordinatorMode.ts", "startLine": 60, "endLine": 73 },
+  "flip": { "file": "src/coordinator/coordinatorMode.ts", "startLine": 65, "endLine": 73 },
+  "noop": { "file": "src/coordinator/coordinatorMode.ts", "startLine": 60, "endLine": 62 },
+  "lifecycleStart2": { "file": "src/tools/AgentTool/agentToolUtils.ts", "startLine": 536, "endLine": 553 },
+  "loop": { "file": "src/tools/AgentTool/agentToolUtils.ts", "startLine": 554, "endLine": 570 },
+  "return": { "file": "src/tasks/stopTask.ts", "startLine": 95, "endLine": 97 }
+};
+</script>
+
+<aside id="source-panel"><div id="source-header"></div><div id="monaco-container"></div></aside>
+<script src="../assets/codeindex-runtime.js"></script>
+<script src="../assets/codeindex.js"></script>
+</body>
+</html>

@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Core Utility Functions and Service Layer Additions</title>
+<link rel="stylesheet" href="../assets/codeindex.css">
+</head>
+<body>
+<nav class="topnav"><a href="../index.html">← Back to overview</a></nav>
+<h1>Core Utility Functions and Service Layer Additions</h1>
+
+<p>The previous ten modules covered the main threads (startup, query engine, tool system, permissions, MCP, skills/plugins, terminal UI, IDE, agent coordination, slash commands), but there is still a large collection of "utility functions" and "background services" underneath that were not read in detail. This module fills in those scattered large files: they do not form an independent business chain by themselves, but almost every main thread passes through them—how messages are assembled, how sessions are persisted to disk, how bash commands are parsed, how attachments are collected, how plugins are loaded, how OAuth login works, how analytics are reported, how LSP is integrated, how policy limits and remote-managed settings are synced, and so on. The perspective is "data flow"-centric: each section looks at "where the data comes from, who processes it, and where it goes".</p>
+
+<dl>
+  <dt>Input</dt>
+  <dd>User input text / LLM streaming responses / external callbacks (OAuth, LSP, remote policy) and other raw signals</dd>
+  <dt>Output</dt>
+  <dd>Structured message lists, persisted session records, parsed command trees, collected attachments, fully loaded plugins, authenticated tokens, synced settings</dd>
+</dl>
+
+<pre class="mermaid">
+graph TD
+  user-input["User input text"] --> get-attachments["Collect attachments getAttachments"]
+  get-attachments --> create-user-msg["Assemble user message createUserMessage"]
+  llm-stream["LLM streaming response"] --> handle-stream-msg["Stream message handling handleMessageFromStream"]
+  handle-stream-msg --> session-storage["Persist session Project.recordTranscript"]
+  bash-cmd["Bash tool command"] --> bash-parse["bash parsing bashParser"]
+  bash-parse --> ast-security["AST security audit parseForSecurity"]
+  plugin-enable["settings.enabledPlugins"] --> load-plugins["Load plugins loadPluginsFromMarketplaces"]
+  load-plugins --> marketplace["Fetch marketplace cache marketplaceManager"]
+  oauth-login["Login request"] --> oauth-flow["OAuth PKCE flow OAuthService.startOAuthFlow"]
+  lsp-diag["LSP diagnostic notification"] --> lsp-reg["Diagnostic registry LSPDiagnosticRegistry"]
+  policy-fetch["Remote policy fetch"] --> policy-limit["Policy restriction isPolicyAllowed"]
+</pre>
+
+<h2>1. Message Handling: messages.ts</h2>
+
+<p>This is the "central kitchen" of the message layer. Every message produced in a conversation—user messages, assistant replies, tool results, system prompts, compact boundaries, thinking blocks—is constructed, normalized, merged, shaped here, and finally sent to the API or dropped into the session file. The file is about 5500 lines, but its responsibilities split into three parts: message factories (create various messages), message normalization and merging (shape before sending to the API), and stream message handling (turn LLM streaming deltas into complete messages).</p>
+
+<ul>
+  <li><strong>Message factories</strong>: a series of create* functions such as createUserMessage, createAssistantMessage, createToolResultMessage, createSystemMessage wrap raw content into Message objects with UUID, timestamp, and source markers. Each factory corresponds to a business semantic: for example, createPermissionRetryMessage is used after a permission denial retry, and createCompactBoundaryMessage draws a "boundary line" after context compaction.</li>
+  <li><strong>Normalization and merging</strong>: normalizeMessagesForAPI is the final shaping step before sending to the LLM—stripping tool reference blocks, reordering attachments, merging adjacent same-type messages, and wrapping system reminders into a system reminder. mergeUserMessagesAndToolResults handles the "user message + tool results" merge/sewing after compaction. reorderMessagesInUI handles UI display order (which may differ from API order).</li>
+  <li><strong>Stream handling</strong>: handleMessageFromStream is the entry point for streaming responses. It receives stream_event objects from the SDK (content_block_start/delta/stop, message_start/stop), updating text deltas, thinking blocks, and tool-use blocks respectively; when a tombstone (delete-message signal) appears it calls onTombstone to remove the target message; when a complete assistant message arrives it hands it to onMessage for storage. This block is the junction between "real-time display" and "final storage".</li>
+</ul>
+
+<pre class="mermaid">
+graph TD
+  stream-event["Streaming event stream_event"] --> stream-dispatch{"Event type?"}
+  stream-dispatch -->|message_start| set-request-mode["Switch to requesting mode"]
+  stream-dispatch -->|content_block_start| block-type{"Block type?"}
+  block-type -->|text| stream-text["Update text delta onStreamingText"]
+  block-type -->|thinking| stream-think["Update thinking block onStreamingThinking"]
+  block-type -->|tool_use| stream-tool["Accumulate tool input onStreamingToolUses"]
+  stream-dispatch -->|message_stop| clear-tool["Clear streaming tool block, switch to tool-use mode"]
+  stream-dispatch -->|tombstone| remove-msg["Remove target message onTombstone"]
+  stream-dispatch -->|Complete assistant| append-msg["Store onMessage"]
+  append-msg --> clear-stream-text["Clear streaming text to avoid duplication"]
+</pre>
+
+<h2>2. Session Storage: sessionStorage.ts</h2>
+
+<p>This file is the "butler for session files". Every conversation segment (user messages, assistant replies, tool results, file history snapshots, attribution snapshots, context fold commits) is appended to a local transcript file (.jsonl format). The core is the Project class—a process-wide singleton that manages the current session's file handle, write queue, flush timer, and remote ingress channel.</p>
+
+<p>Data flow: every message produced by the query engine calls recordTranscript, Project wraps it as an Entry and queues it into a file-grouped write queue (writeQueues), flushing to disk in batches every 100ms (scheduleDrain). flushSessionStorage waits for all pending writes to land before returning, so --resume does not lose messages. On session recovery, buildConversationChain reads all TranscriptMessages from the file, chains them by parent UUID, and then handles orphan repair for parallel tool results and re-linking of preserved fragments.</p>
+
+<ul>
+  <li>Session file paths are organized by "project directory + session ID"; agent sub-sessions have their own subdirectory (getAgentTranscriptPath).</li>
+  <li>Remote ingress: when remoteIngressUrl is set, each Entry is also sent to the remote endpoint via internalEventWriter, batched every 10ms.</li>
+  <li>On resum a consistency check (checkResumeConsistency) is performed: if parent-chain breaks are found, it tries to repair misaligned parallel tool results.</li>
+</ul>
+
+<h2>3. Bash Parsing: bashParser.ts and ast.ts</h2>
+
+<p>The Bash tool needs to "understand" a user-given shell command—it does not actually execute it, but parses it into an AST and then performs a security audit. bashParser.ts is a hand-written lexer + parser that parses a piece of shell text into a tree-sitter-style node tree (TsNode). ast.ts then performs security semantic analysis on this tree: identifying commands, arguments, redirects, heredocs, command substitutions, variable assignments, arithmetic expansion, and judging which are "known safe", which are "too complex to judge", and which have dangerous characteristics.</p>
+
+<p>Data flow: Bash tool receives a command string → parseForSecurity calls parseSource to get the AST root → walkProgram traverses the whole tree → collectCommands converges command nodes into SimpleCommand list → checkSemantics performs overall semantic validation. The audit result (ParseForSecurityResult) contains the command list, safety flag, and reasons for flags, for the permission system to decide whether to allow or block.</p>
+
+<ul>
+  <li>The parser has a timeout budget (checkBudget); beyond a certain complexity it gives up and returns "too complex".</li>
+  <li>Variable scope is partially supported: applyVarToScope can substitute known variable values into simple $var expansions, making the audit more accurate.</li>
+  <li>heredoc cat safe extraction (extractSafeCatHeredoc) is a special handling for one of the few "content-known" dangerous scenarios.</li>
+</ul>
+
+<h2>4. Attachment Collection: attachments.ts</h2>
+
+<p>When the user inputs a sentence, a lot of things need to be "attached" and sent to the LLM: @-mentioned files, IDE-selected code, plan-mode reminders, memory files, MCP resources, agent mentions, skill discovery results, date-change reminders, etc. attachments.ts is the total collector for these "attachments". getAttachments is the entry point; it runs several maybe tasks (subtasks with timeout) in parallel, each returning a set of Attachments, and finally merges them into one array.</p>
+
+<p>There is a 1-second hard timeout (abortController)—attachment collection must not block user submission. After timeout, whatever has been collected is sent as-is, and the rest is dropped. Attachments that need "per-turn throttling" such as plan mode, auto mode, and memory files have their own turn counters (getPlanModeAttachmentTurnCount, etc.) controlling how often they are inserted. Attachments are ultimately shaped into API-acceptable content blocks by normalizeAttachmentForAPI in messages.ts.</p>
+
+<h2>5. Plugin Loading: pluginLoader.ts and marketplaceManager.ts</h2>
+
+<p>The "logistics layer" of the plugin system. marketplaceManager handles the "marketplace"—fetching marketplace manifests from git repositories or HTTP URLs, caching them locally, and supporting sparse checkout to only pull the needed subdirectories. pluginLoader handles the "plugins"—loading a specific plugin by its plugin@marketplace identifier from a registered marketplace, reading its manifest, loading hooks, merging settings, and handling enterprise policy (allowlist/blocklist fail-closed).</p>
+
+<p>Data flow: at startup loadAllPlugins (memoized singleton) → reads settings.enabledPlugins → loadPluginsFromMarketplaces preloads manifests grouped by marketplace → for each plugin performs enterprise policy validation → loadPluginFromMarketplaceEntry reads manifest + hooks → assemblePluginLoadResult aggregates. Enterprise policy here is fail-closed: if the policy is configured but the marketplace source cannot be resolved (corrupted config file), it blocks directly instead of "silently allowing".</p>
+
+<ul>
+  <li>Plugin cache is versioned by directory (getVersionedCachePath), supporting multiple versions side by side.</li>
+  <li>git clone/pull has dedicated timeouts and SSH detection (isGitHubSshLikelyConfigured).</li>
+  <li>loadAllPluginsCacheOnly provides a "cache-only" read version for permission pre-checks without triggering network fetches.</li>
+</ul>
+
+<h2>6. OAuth Login: oauth/</h2>
+
+<p>User login to Claude Code follows standard OAuth 2.0 + PKCE. OAuthService.startOAuthFlow is the main flow: generate PKCE codeVerifier/challenge and state → start a local callback listener (AuthCodeListener, occupying a localhost port) → construct the authorization URL (distinguishing automatic and manual flows) → wait for the callback to get the authorization code → exchangeCodeForTokens swaps it for access/refresh tokens → fetchProfileInfo retrieves subscription type and rate-limit tier → the caller installOAuthTokens persists them.</p>
+
+<p>client.ts is the pure protocol layer: buildAuthUrl, exchangeCodeForTokens, refreshOAuthToken, createAndStoreApiKey. crypto.ts is PKCE utilities. auth-code-listener.ts is the local HTTP service that receives the callback and validates state to prevent CSRF. Token expiration check (isOAuthTokenExpired) and refresh logic are also in client.ts.</p>
+
+<h2>7. Analytics: analytics/</h2>
+
+<p>The multi-layer pipeline of the analytics system. logEvent (index.ts) is the unified entry; after stripProtoFields sanitizes the event, it fans out to all registered sinks. The two main sinks: Datadog (datadog.ts, initializeDatadog singleton) and first-party event logs (firstPartyEventLogger.ts + firstPartyEventLoggingExporter.ts, OTLP exporter). growthbook.ts is feature flags / AB experiments, providing cached queries such as checkStatsigFeatureGate_CACHED_MAY_BE_STALE and getFeatureValue (may be stale; callers must tolerate). metadata.ts is responsible for sanitizing telemetry metadata such as tool names, MCP tool details, and skill names. sinkKillswitch.ts provides a runtime switch to turn sinks off.</p>
+
+<ul>
+  <li>Telemetry sampling is decided by shouldSampleEvent in firstPartyEventLogger.</li>
+  <li>growthbook config can be overridden by environment variables (hasGrowthBookEnvOverride) for testing and gray release.</li>
+</ul>
+
+<h2>8. LSP Integration: lsp/</h2>
+
+<p>Connects to language servers to obtain diagnostic information (errors, warnings), bringing "code health" signals outside the IDE into context. manager.ts is the process-level singleton manager; initializeLspServerManager starts it, shutdownLspServerManager stops it. LSPServerManager manages multiple LSPServerInstances (one per language), each instance being a child process + JSON-RPC channel. LSPClient is the request-issuing client wrapper. LSPDiagnosticRegistry registers diagnostics received from LSP; checkForLSPDiagnostics retrieves ready ones, and passiveFeedback.formatDiagnosticsForAttachment formats them into attachments to be stuffed into the next round of messages.</p>
+
+<h2>9. Policy Limits and Remote-Managed Settings: policyLimits/ and remoteManagedSettings/</h2>
+
+<p>These are the "configuration distribution" channels for enterprise / managed scenarios. policyLimits pulls a policy list from remote (allow/deny various capabilities, such as whether a tool type or beta can be used); isPolicyAllowed is the query entry. remoteManagedSettings pulls a complete settings.json from remote to override local settings, with a checksum (computeChecksumFromSettings) to prevent tampering; syncCacheState provides a synced cache so queries do not block. Both have loadPromise + waitForXxxToLoad async loading patterns, plus background polling refresh (startBackgroundPolling). securityCheck.tsx performs the security confirmation UI when managed settings change.</p>
+
+<h2>10. Other Services (briefly by responsibility)</h2>
+
+<ul>
+  <li><strong>tips/</strong>: tipRegistry maintains a list of displayable "tips"; tipScheduler picks the one least recently shown on the spinner; tipHistory records display history.</li>
+  <li><strong>AgentSummary/</strong>: startAgentSummarization generates a summary for a child agent session and feeds it back to the coordinator.</li>
+  <li><strong>PromptSuggestion/</strong>: tryGenerateSuggestion asynchronously generates "completion suggestions" as the user types; speculation.ts is a more aggressive "speculative pre-run"—generating a likely response before the user even submits (startSpeculation/acceptSpeculation/abortSpeculation).</li>
+  <li><strong>MagicDocs/</strong>: detectMagicDocHeader recognizes "magic document" headers, registerMagicDoc tracks document changes, initMagicDocs initializes, and buildMagicDocsUpdatePrompt constructs document update prompts.</li>
+  <li><strong>autoDream/</strong>: initAutoDream starts "auto dreaming"—idle integration of session memory (executeAutoDream), consolidationLock prevents concurrency, and consolidationPrompt constructs the integration prompt.</li>
+  <li><strong>x402/</strong>: implements the x402 payment protocol (createPayment, handlePaymentRequired, wrapFetchWithX402 adds automatic payment interceptor to fetch), used for accessing paid MCP/resources.</li>
+  <li><strong>voice.ts / voiceStreamSTT.ts / voiceKeyterms.ts</strong>: the voice input trio. voice.ts handles microphone permission and recording (startRecording/stopRecording), voiceStreamSTT.ts is the streaming STT connection (connectVoiceStream), and voiceKeyterms.ts extracts keywords from context to assist recognition.</li>
+  <li><strong>hooks.ts</strong>: the overall executor of the Hook system. getMatchingHooks matches configured hooks by event type; a series of execute* generators such as executePreToolHooks/executePostToolHooks/executeStopHooks run hooks by lifecycle event, and the aggregated results affect the main flow (intercept, rewrite, notify). Hooks can be command-line, HTTP, or function form; outputs are parsed via parseHookOutput.</li>
+</ul>
+
+<h2>11. Shims and Native Modules: shims/, native-ts/, outputStyles/, constants/, types/</h2>
+
+<ul>
+  <li><strong>shims/</strong>: bun-bundle.ts (runtime shim for bundle macros and feature flags), macro.ts (MACRO global), preload.ts (preload entry). Small, purely runtime adaptation.</li>
+  <li><strong>native-ts/</strong>: color-diff (color difference calculation, for UI color schemes), file-index (file indexing/retrieval), yoga-layout (TypeScript port of the Flexbox layout engine, used for Ink/TUI layout). These three are compute-intensive pure algorithm modules and do not participate in business data flow.</li>
+  <li><strong>outputStyles/loadOutputStylesDir.ts</strong>: loads custom output styles from a directory (affecting how LLM responses are styled).</li>
+  <li><strong>constants/</strong>: various constants—oauth (OAuth endpoints/scopes), outputStyles (style definitions), prompts (system prompt snippets, 916 lines), tools (tool metadata), files (file path conventions), etc. Pure data, no logic.</li>
+  <li><strong>types/</strong>: centralized type definitions (bun-bundle.d.ts, etc.), no runtime logic.</li>
+</ul>
+
+<script>
+window.__sourceMap = {
+  "get-attachments": { "file": "src/utils/attachments.ts", "startLine": 743, "endLine": 812 },
+  "create-user-msg": { "file": "src/utils/messages.ts", "startLine": 460, "endLine": 524 },
+  "handle-stream-msg": { "file": "src/utils/messages.ts", "startLine": 2930, "endLine": 3020 },
+  "session-storage": { "file": "src/utils/sessionStorage.ts", "startLine": 1408, "endLine": 1471 },
+  "bash-parse": { "file": "src/utils/bash/bashParser.ts", "startLine": 610, "endLine": 632 },
+  "ast-security": { "file": "src/utils/bash/ast.ts", "startLine": 381, "endLine": 462 },
+  "load-plugins": { "file": "src/utils/plugins/pluginLoader.ts", "startLine": 1888, "endLine": 1960 },
+  "marketplace": { "file": "src/utils/plugins/marketplaceManager.ts", "startLine": 1433, "endLine": 1530 },
+  "oauth-flow": { "file": "src/services/oauth/index.ts", "startLine": 32, "endLine": 110 },
+  "lsp-reg": { "file": "src/services/lsp/LSPDiagnosticRegistry.ts", "startLine": 65, "endLine": 193 },
+  "policy-limit": { "file": "src/services/policyLimits/index.ts", "startLine": 510, "endLine": 580 },
+  "policy-fetch": { "file": "src/services/policyLimits/index.ts", "startLine": 556, "endLine": 595 },
+  "user-input": { "file": "src/utils/messages.ts", "startLine": 460, "endLine": 475 },
+  "llm-stream": { "file": "src/utils/messages.ts", "startLine": 2930, "endLine": 2949 },
+  "bash-cmd": { "file": "src/utils/bash/bashParser.ts", "startLine": 610, "endLine": 632 },
+  "plugin-enable": { "file": "src/utils/plugins/pluginLoader.ts", "startLine": 3096, "endLine": 3136 },
+  "oauth-login": { "file": "src/services/oauth/index.ts", "startLine": 32, "endLine": 50 },
+  "lsp-diag": { "file": "src/services/lsp/LSPDiagnosticRegistry.ts", "startLine": 12, "endLine": 65 },
+  "stream-event": { "file": "src/utils/messages.ts", "startLine": 2949, "endLine": 3000 },
+  "stream-dispatch": { "file": "src/utils/messages.ts", "startLine": 3000, "endLine": 3020 },
+  "set-request-mode": { "file": "src/utils/messages.ts", "startLine": 2984, "endLine": 2993 },
+  "block-type": { "file": "src/utils/messages.ts", "startLine": 3011, "endLine": 3020 },
+  "stream-text": { "file": "src/utils/messages.ts", "startLine": 3016, "endLine": 3018 },
+  "stream-think": { "file": "src/utils/messages.ts", "startLine": 3012, "endLine": 3015 },
+  "stream-tool": { "file": "src/utils/messages.ts", "startLine": 3018, "endLine": 3020 },
+  "clear-tool": { "file": "src/utils/messages.ts", "startLine": 2995, "endLine": 2999 },
+  "remove-msg": { "file": "src/utils/messages.ts", "startLine": 2954, "endLine": 2958 },
+  "append-msg": { "file": "src/utils/messages.ts", "startLine": 2964, "endLine": 2981 },
+  "clear-stream-text": { "file": "src/utils/messages.ts", "startLine": 2976, "endLine": 2980 }
+};
+</script>
+
+<aside id="source-panel"><div id="source-header"></div><div id="monaco-container"></div></aside>
+<script src="../assets/codeindex-runtime.js"></script>
+<script src="../assets/codeindex.js"></script>
+</body>
+</html>

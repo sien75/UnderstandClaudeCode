@@ -1,0 +1,283 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>应用服务器线程与回合 API</title>
+<link rel="stylesheet" href="assets/codeindex.css">
+</head>
+<body>
+<p><a href="index.html">← Back to overview</a></p>
+<h1>应用服务器线程与回合 API</h1>
+
+<p>外部客户端通过 app-server transport 发送 JSON-RPC。这个场景把 `thread/start` 的建线程请求、`turn/start` 的发起回合请求、订阅后的事件通知、以及 `thread/read` 的线程读取串成一条数据流：客户端输入先被协议层反序列化成强类型请求，再由 message processor 分派到线程或回合处理器，最终把线程摘要、回合状态和通知写回原连接或订阅了该线程的连接。</p>
+
+<dl>
+  <dt>Input</dt>
+  <dd>外部客户端发送的 JSON-RPC request：`thread/start` 带模型、工作目录、权限/沙箱、指令、动态工具等线程启动参数；`turn/start` 带 threadId、用户输入、上下文和本回合设置；`thread/read` 带 threadId 和是否包含 turns。</dd>
+  <dt>Output</dt>
+  <dd>JSON-RPC response 和 server notification：`thread/start` 返回新线程与配置快照并广播 `thread/started`；`turn/start` 返回 InProgress turn，后续 `turn/started`、`turn/completed` 等通知只发给订阅该线程的连接；`thread/read` 返回由持久化线程数据和实时线程状态合成的 Thread 视图。</dd>
+</dl>
+
+<pre class="mermaid">
+graph TD
+  client-jsonrpc["客户端发送 JSON-RPC"] --> transport-open["transport 建立连接并登记 writer"]
+  transport-open --> incoming-message["收到 JSONRPCMessage::Request"]
+  incoming-message --> deserialize-request["反序列化为 ClientRequest"]
+  deserialize-request --> protocol-methods["协议表识别 thread/start、turn/start、thread/read"]
+  protocol-methods --> dispatch-request["MessageProcessor 按请求类型分派"]
+  dispatch-request --> thread-start-branch{"method 是 thread/start?"}
+  thread-start-branch -->|是| validate-thread-start["校验线程启动参数和环境选择"]
+  validate-thread-start --> spawn-thread-task["生成后台建线程任务"]
+  spawn-thread-task --> create-thread["加载配置并调用 ThreadManager 创建 core 线程"]
+  create-thread --> attach-listener["自动把当前连接订阅到新线程"]
+  attach-listener --> persist-watch["更新线程列表观察状态"]
+  persist-watch --> send-thread-response["向请求连接发送 ThreadStartResponse"]
+  send-thread-response --> notify-thread-started["广播 thread/started 通知"]
+  thread-start-branch -->|否| turn-start-branch{"method 是 turn/start?"}
+  turn-start-branch -->|是| load-thread["按 threadId 找到已加载线程"]
+  load-thread --> validate-turn-input["校验直接输入权限和输入长度"]
+  validate-turn-input --> map-turn-input["把 v2 用户输入映射为 core 输入"]
+  map-turn-input --> submit-turn["向 core 线程提交 UserInput"]
+  submit-turn --> record-turn["记录请求对应 turnId"]
+  record-turn --> send-turn-response["返回 InProgress TurnStartResponse"]
+  submit-turn --> core-events["core 线程产生 turn 事件"]
+  attach-listener --> listener-loop["线程监听任务读取 core 事件"]
+  core-events --> listener-loop
+  listener-loop --> track-thread-state["更新 ThreadState 的活动回合快照"]
+  track-thread-state --> map-turn-started{"事件是 TurnStarted?"}
+  map-turn-started -->|是| notify-turn-started["向订阅连接发送 turn/started"]
+  map-turn-started -->|否| map-turn-complete{"事件是 TurnComplete 或中断?"}
+  map-turn-complete -->|是| notify-turn-completed["向订阅连接发送 turn/completed"]
+  map-turn-complete -->|否| other-thread-events["继续映射其他线程/条目通知"]
+  turn-start-branch -->|否| thread-read-branch{"method 是 thread/read?"}
+  thread-read-branch -->|是| parse-thread-id["解析 threadId"]
+  parse-thread-id --> choose-read-source{"请求 includeTurns 或线程已加载?"}
+  choose-read-source -->|持久化可用| read-store["从 ThreadStore 读取线程元数据/历史"]
+  choose-read-source -->|实时线程可用| read-live["从 live CodexThread 快照补齐线程视图"]
+  read-store --> merge-status["合并线程状态并修正活动回合"]
+  read-live --> merge-status
+  merge-status --> send-read-response["返回 ThreadReadResponse"]
+  thread-read-branch -->|否| unrelated-request["其他 app-server API，不属于本场景"]
+  send-thread-response --> outgoing-route["outgoing router 按连接路由消息"]
+  notify-thread-started --> outgoing-route
+  send-turn-response --> outgoing-route
+  notify-turn-started --> outgoing-route
+  notify-turn-completed --> outgoing-route
+  send-read-response --> outgoing-route
+  outgoing-route --> client-receives["客户端收到 response 或 notification"]
+</pre>
+
+<ul>
+  <li>通信边界：transport 只负责连接、读写队列和 JSON-RPC message 分类；业务分派发生在 `MessageProcessor`，真正的线程/回合语义在 request processors 中完成。</li>
+  <li>生命周期：`thread/start` 创建线程后立即为发起连接建立 listener。listener 负责持续读取 core 线程事件，因此客户端订阅不是单独的 “subscribe” 方法，而是通过 start/resume/fork 等线程入口自动挂接，`thread/unsubscribe` 再移除连接。</li>
+  <li>权限/沙箱边界：线程启动时拒绝同时传 `permissions` 与旧 `sandbox`；回合启动时也会把本回合权限、沙箱、工作目录、环境选择转成线程设置覆盖，交给 core 线程执行。</li>
+  <li>状态机：回合在 API 响应中先以 `InProgress` 返回；之后 listener 根据 core 事件把状态推进到 `InProgress`、`Completed`、`Failed` 或 `Interrupted` 并发通知。</li>
+  <li>读取路径：`thread/read` 优先复用持久化 ThreadStore；如果线程已加载但持久化还没落盘，则从 live thread snapshot 补齐。请求 turns 时会重放 rollout 历史，ephemeral 线程不支持读取完整 turns。</li>
+</ul>
+
+<script>
+window.__sourceMap = {
+  "client-jsonrpc": {
+    "file": "codex-rs/app-server/src/lib.rs",
+    "startLine": 716,
+    "endLine": 745
+  },
+  "transport-open": {
+    "file": "codex-rs/app-server/src/lib.rs",
+    "startLine": 944,
+    "endLine": 987
+  },
+  "incoming-message": {
+    "file": "codex-rs/app-server/src/lib.rs",
+    "startLine": 1010,
+    "endLine": 1026
+  },
+  "deserialize-request": {
+    "file": "codex-rs/app-server/src/message_processor.rs",
+    "startLine": 98,
+    "endLine": 107
+  },
+  "protocol-methods": {
+    "file": "codex-rs/app-server-protocol/src/protocol/common.rs",
+    "startLine": 473,
+    "endLine": 480
+  },
+  "dispatch-request": {
+    "file": "codex-rs/app-server/src/message_processor.rs",
+    "startLine": 572,
+    "endLine": 623
+  },
+  "thread-start-branch": {
+    "file": "codex-rs/app-server/src/message_processor.rs",
+    "startLine": 1067,
+    "endLine": 1077
+  },
+  "validate-thread-start": {
+    "file": "codex-rs/app-server/src/request_processors/thread_processor.rs",
+    "startLine": 879,
+    "endLine": 925
+  },
+  "spawn-thread-task": {
+    "file": "codex-rs/app-server/src/request_processors/thread_processor.rs",
+    "startLine": 926,
+    "endLine": 966
+  },
+  "create-thread": {
+    "file": "codex-rs/app-server/src/request_processors/thread_processor.rs",
+    "startLine": 1032,
+    "endLine": 1159
+  },
+  "attach-listener": {
+    "file": "codex-rs/app-server/src/request_processors/thread_processor.rs",
+    "startLine": 1189,
+    "endLine": 1206
+  },
+  "persist-watch": {
+    "file": "codex-rs/app-server/src/request_processors/thread_processor.rs",
+    "startLine": 1208,
+    "endLine": 1227
+  },
+  "send-thread-response": {
+    "file": "codex-rs/app-server/src/request_processors/thread_processor.rs",
+    "startLine": 1237,
+    "endLine": 1259
+  },
+  "notify-thread-started": {
+    "file": "codex-rs/app-server/src/request_processors/thread_processor.rs",
+    "startLine": 1251,
+    "endLine": 1268
+  },
+  "turn-start-branch": {
+    "file": "codex-rs/app-server/src/message_processor.rs",
+    "startLine": 1292,
+    "endLine": 1301
+  },
+  "load-thread": {
+    "file": "codex-rs/app-server/src/request_processors/turn_processor.rs",
+    "startLine": 239,
+    "endLine": 254
+  },
+  "validate-turn-input": {
+    "file": "codex-rs/app-server/src/request_processors/turn_processor.rs",
+    "startLine": 388,
+    "endLine": 415
+  },
+  "map-turn-input": {
+    "file": "codex-rs/app-server/src/request_processors/turn_processor.rs",
+    "startLine": 417,
+    "endLine": 449
+  },
+  "submit-turn": {
+    "file": "codex-rs/app-server/src/request_processors/turn_processor.rs",
+    "startLine": 451,
+    "endLine": 470
+  },
+  "record-turn": {
+    "file": "codex-rs/app-server/src/request_processors/turn_processor.rs",
+    "startLine": 484,
+    "endLine": 486
+  },
+  "send-turn-response": {
+    "file": "codex-rs/app-server/src/request_processors/turn_processor.rs",
+    "startLine": 487,
+    "endLine": 498
+  },
+  "core-events": {
+    "file": "codex-rs/app-server/src/request_processors/thread_lifecycle.rs",
+    "startLine": 301,
+    "endLine": 340
+  },
+  "listener-loop": {
+    "file": "codex-rs/app-server/src/request_processors/thread_lifecycle.rs",
+    "startLine": 212,
+    "endLine": 340
+  },
+  "track-thread-state": {
+    "file": "codex-rs/app-server/src/thread_state.rs",
+    "startLine": 138,
+    "endLine": 153
+  },
+  "map-turn-started": {
+    "file": "codex-rs/app-server/src/bespoke_event_handling.rs",
+    "startLine": 152,
+    "endLine": 182
+  },
+  "notify-turn-started": {
+    "file": "codex-rs/app-server/src/bespoke_event_handling.rs",
+    "startLine": 175,
+    "endLine": 181
+  },
+  "map-turn-complete": {
+    "file": "codex-rs/app-server/src/bespoke_event_handling.rs",
+    "startLine": 183,
+    "endLine": 198
+  },
+  "notify-turn-completed": {
+    "file": "codex-rs/app-server/src/bespoke_event_handling.rs",
+    "startLine": 1325,
+    "endLine": 1346
+  },
+  "other-thread-events": {
+    "file": "codex-rs/app-server/src/bespoke_event_handling.rs",
+    "startLine": 200,
+    "endLine": 220
+  },
+  "thread-read-branch": {
+    "file": "codex-rs/app-server/src/message_processor.rs",
+    "startLine": 1192,
+    "endLine": 1194
+  },
+  "parse-thread-id": {
+    "file": "codex-rs/app-server/src/request_processors/thread_processor.rs",
+    "startLine": 2131,
+    "endLine": 2147
+  },
+  "choose-read-source": {
+    "file": "codex-rs/app-server/src/request_processors/thread_processor.rs",
+    "startLine": 2150,
+    "endLine": 2222
+  },
+  "read-store": {
+    "file": "codex-rs/app-server/src/request_processors/thread_processor.rs",
+    "startLine": 2224,
+    "endLine": 2262
+  },
+  "read-live": {
+    "file": "codex-rs/app-server/src/request_processors/thread_processor.rs",
+    "startLine": 2264,
+    "endLine": 2313
+  },
+  "merge-status": {
+    "file": "codex-rs/app-server/src/request_processors/thread_processor.rs",
+    "startLine": 2205,
+    "endLine": 2221
+  },
+  "send-read-response": {
+    "file": "codex-rs/app-server/src/request_processors/thread_processor.rs",
+    "startLine": 661,
+    "endLine": 668
+  },
+  "unrelated-request": {
+    "file": "codex-rs/app-server/src/message_processor.rs",
+    "startLine": 1302,
+    "endLine": 1325
+  },
+  "outgoing-route": {
+    "file": "codex-rs/app-server/src/transport.rs",
+    "startLine": 198,
+    "endLine": 237
+  },
+  "client-receives": {
+    "file": "codex-rs/app-server/src/outgoing_message.rs",
+    "startLine": 503,
+    "endLine": 592
+  }
+};
+</script>
+
+<aside id="source-panel"><div id="source-header"></div><div id="monaco-container"></div></aside>
+<script src="assets/codeindex-runtime.js"></script>
+<script src="assets/codeindex.js"></script>
+</body>
+</html>

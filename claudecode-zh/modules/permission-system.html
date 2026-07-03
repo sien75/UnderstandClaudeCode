@@ -1,0 +1,297 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>权限系统</title>
+<link rel="stylesheet" href="../assets/codeindex.css">
+</head>
+<body>
+<nav class="topnav"><a href="../index.html">← 返回总览</a></nav>
+<h1>权限系统</h1>
+
+<p>每次 Claude 准备执行一个可能改动环境的操作（跑一段 bash、写文件、调 MCP 工具……）之前，系统都要先"过一道关卡"决定怎么处理这个动作：是直接放行、停下来问用户、还是当场拒绝。这个模块就是那道关卡。它综合四种运行模式（default / plan / bypassPermissions / auto，外加 ant 内部的 dontAsk）、用户配置的允许/拒绝/必问规则、工具自报的命令级检查、以及（在 auto 模式下）一个 AI 分类器，给每一个待执行的工具调用给出一个最终裁决：allow / ask / deny。</p>
+
+<dl>
+  <dt>输入</dt>
+  <dd>一个待执行的工具调用（工具名 + 输入参数）+ 当前会话的权限上下文（模式、各来源的允许/拒绝/必问规则列表、附加工作目录）+ 当前对话历史（auto 模式分类器要用）</dd>
+  <dt>输出</dt>
+  <dd>一个裁决：allow（放行，可能带用户改过的输入）、ask（弹窗问用户，可能附"建议加哪条规则"和并发分类器检查）、deny（拒绝，带原因）。裁决同时被记进日志和埋点。</dd>
+</dl>
+
+<ul>
+  <li>四种模式不是平级的开关，而是一套"预处理 + 后处理"分层：先做规则检查（deny/ask/safetyCheck 这几类 bypass 也躲不掉），再按模式分流（bypass 直接放行、auto 调分类器、dontAsk 把 ask 翻成 deny、headless 把 ask 翻成 deny/走 hook）。</li>
+  <li>用户配的规则按来源分（userSettings/projectSettings/localSettings/flagSettings/policySettings/cliArg/command/session），规则语法是 <code>ToolName</code> 或 <code>ToolName(content)</code>，括号内支持转义；MCP 工具按 <code>mcp__server__tool</code> 全名匹配，也支持 <code>mcp__server__*</code> 整服务器粒度。</li>
+  <li>安全检查（safetyCheck，比如碰 <code>.git/</code>、<code>.claude/</code>、shell 配置文件）是"bypass 免疫"的——哪怕在 bypassPermissions 模式也得停下来问；其中 <code>classifierApprovable=true</code> 的那些（敏感文件路径）在 auto 模式下可以让分类器去判，<code>false</code> 的（Windows 路径绕过、跨机桥接消息）则任何模式都必须人工确认。</li>
+  <li>auto 模式有熔断：连续 3 次或本会话累计 20 次被分类器拒绝就降级回人工确认；分类器 API 不可用时按 <code>tengu_iron_gate_closed</code> 开关决定 fail-closed（拒并提示重试）还是 fail-open（回退人工）；transcript 超长是确定性错误，直接回退人工或 headless 下中止。</li>
+</ul>
+
+<h2>主决策链：从工具调用到最终裁决</h2>
+
+<p>这是核心数据流。用户视角的触发点：Claude 在对话里产生了一个 tool_use（比如要跑 <code>rm</code>）。工具系统在真正执行前调用 <code>hasPermissionsToUseTool</code>，于是下面这条链开始跑。先做"无论什么模式都得过的硬规则检查"，再按模式分流，最后做一些后处理（dontAsk 翻 deny、auto 跑分类器、headless 兜底拒绝）。</p>
+
+<pre class="mermaid">
+graph TD
+  abort-check["会话已被中止?"] -->|是| throw-abort["抛 AbortError"]
+  abort-check -->|否| deny-rule["整工具是否有 deny 规则?&lt;br/&gt;getDenyRuleForTool"]
+  deny-rule -->|命中| ret-deny-rule["返回 deny + 命中规则"]
+  deny-rule -->|未命中| ask-rule["整工具是否有 ask 规则?&lt;br/&gt;getAskRuleForTool"]
+  ask-rule -->|命中且非沙箱自动放行| ret-ask-rule["返回 ask + 命中规则"]
+  ask-rule -->|未命中/可沙箱放行| tool-check["调用工具自报 checkPermissions&lt;br/&gt;(bash 子命令规则等)"]
+  tool-check --> tool-deny{"工具返回 deny?"}
+  tool-deny -->|是| ret-tool-deny["返回该 deny"]
+  tool-deny -->|否| ask-content{"ask 且 reason=rule&lt;br/&gt;(内容级必问)?"}
+  ask-content -->|是| ret-ask-content["返回该 ask&lt;br/&gt;(bypass 也躲不掉)"]
+  ask-content -->|否| safety{"ask 且 reason=safetyCheck?&lt;br/&gt;(敏感路径)"}
+  safety -->|是| ret-safety["返回该 ask&lt;br/&gt;(bypass 免疫)"]
+  safety -->|否| mode-branch["按模式分流"]
+  mode-branch --> bypass{"bypassPermissions?&lt;br/&gt;(或 plan+原 bypass)"}
+  bypass -->|是| ret-allow-bypass["返回 allow&lt;br/&gt;reason=mode"]
+  bypass -->|否| allow-rule{"整工具有 allow 规则?&lt;br/&gt;toolAlwaysAllowedRule"}
+  allow-rule -->|是| ret-allow-rule["返回 allow&lt;br/&gt;reason=rule"]
+  allow-rule -->|否| passthrough-to-ask["passthrough→ask&lt;br/&gt;准备交给后处理"]
+  passthrough-to-ask --> postproc["进入后处理 hasPermissionsToUseTool"]
+</pre>
+
+<p>后处理（<code>hasPermissionsToUseTool</code> 包裹层）拿到上面的结果后，对 <code>ask</code> 结果再做一次模式相关的转换，对 <code>allow</code> 顺手重置 auto 模式的连续拒绝计数。下面是 ask 之后的那段后处理分流。</p>
+
+<pre class="mermaid">
+graph TD
+  inner-result["内层裁决结果"] --> allow{"behavior=allow?"}
+  allow -->|是| reset-denial["auto 模式下重置连续拒绝计数&lt;br/&gt;recordSuccess"] --> done-allow["返回 allow"]
+  allow -->|否| ask2{"behavior=ask?"}
+  ask2 -->|否| done-other["返回原结果(deny 等)"]
+  ask2 -->|是| dontask{"模式=dontAsk?"}
+  dontask -->|是| ret-deny-dontask["翻成 deny&lt;br/&gt;'不该问的工具不问'"]
+  dontask -->|否| auto-decide{"模式=auto&lt;br/&gt;(或 plan+auto 激活)?"}
+  auto-decide -->|否| headless{"shouldAvoidPermissionPrompts?&lt;br/&gt;(headless/后台)"}
+  auto-decide -->|是| auto-flow["进入 auto 分类器流程"]
+  headless -->|是| hook-headless["跑 PermissionRequest hook&lt;br/&gt;runPermissionRequestHooksForHeadlessAgent"]
+  headless -->|否| ret-ask-user["返回 ask&lt;br/&gt;交给 useCanUseTool 弹窗"]
+  hook-headless --> hook-decided{"hook 给了裁决?"}
+  hook-decided -->|是| ret-hook["返回 hook 裁决"]
+  hook-decided -->|否| ret-deny-headless["返回 deny&lt;br/&gt;'此环境无法弹权限窗'"]
+</pre>
+
+<h2>auto 模式分类器流程</h2>
+
+<p>当模式是 auto（或 plan 模式下 auto 临时激活）且内层结果是 ask 时，进入这段。它的目标是用一个独立的 AI 分类器代替人工确认：把当前对话历史 + 这一步要做的动作喂给分类器，让它判这个动作该不该放行。但前面有几条快速通道，能不调分类器就不调（省 token、省延迟）。</p>
+
+<pre class="mermaid">
+graph TD
+  auto-enter["auto 模式 + ask 结果"] --> safety-immune{"safetyCheck 且&lt;br/&gt;classifierApprovable=false?"}
+  safety-immune -->|是| ret-ask-safety["保持 ask&lt;br/&gt;(敏感安全检查不交给分类器)"]
+  safety-immune -->|否| needs-interact{"工具需用户交互?"}
+  needs-interact -->|是| ret-ask-interact["保持 ask"]
+  needs-interact -->|否| ps-guard{"PowerShell 且未开&lt;br/&gt;POWERSHELL_AUTO_MODE?"}
+  ps-guard -->|是| ret-ask-ps["保持 ask&lt;br/&gt;(PS 需人工确认)"]
+  ps-guard -->|否| accept-edits-fast["快速通道1: 假装 acceptEdits&lt;br/&gt;再问一次工具 checkPermissions"]
+  accept-edits-fast --> ae-allow{"acceptEdits 下会 allow?"}
+  ae-allow -->|是| ret-allow-ae["返回 allow&lt;br/&gt;fastPath=acceptEdits"]
+  ae-allow -->|否| allowlist-fast["快速通道2: 工具在&lt;br/&gt;安全白名单 isAutoModeAllowlistedTool?"]
+  allowlist-fast -->|是| ret-allow-wl["返回 allow&lt;br/&gt;fastPath=allowlist"]
+  allowlist-fast -->|否| call-classifier["调用分类器&lt;br/&gt;classifyYoloAction"]
+  call-classifier --> cls-result{"分类器结果"}
+  cls-result -->|shouldBlock=false| ret-allow-cls["返回 allow&lt;br/&gt;reason=classifier"]
+  cls-result -->|transcriptTooLong| ret-fallback-tl["回退人工 ask&lt;br/&gt;(headless 则中止)"]
+  cls-result -->|unavailable| iron-gate{"tengu_iron_gate_closed?"}
+  cls-result -->|shouldBlock=true| record-denial["记录拒绝计数&lt;br/&gt;recordDenial"]
+  iron-gate -->|"true(默认)"| ret-deny-closed["返回 deny&lt;br/&gt;'分类器不可用,请重试'"]
+  iron-gate -->|false| ret-ask-open["回退人工 ask"]
+  record-denial --> denial-limit{"达上限?&lt;br/&gt;连续3/累计20"}
+  denial-limit -->|是| ret-fallback-limit["回退人工 ask&lt;br/&gt;(headless 则中止)"]
+  denial-limit -->|否| ret-deny-cls["返回 deny&lt;br/&gt;reason=classifier"]
+</pre>
+
+<h2>用户交互：ask 之后弹窗到裁决落地</h2>
+
+<p>当 <code>hasPermissionsToUseTool</code> 返回 ask 时，<code>useCanUseTool</code> 接手把权限请求推进 UI 队列等用户响应。这段描述的是用户看到弹窗后能做什么、系统怎么把用户的选择落回裁决。三种来源的"放行"（用户手动 yes、PreToolUse hook、并发 bash 分类器）会竞争同一个裁决，靠 <code>createResolveOnce</code> 的原子 claim 保证只有第一个赢家生效。</p>
+
+<pre class="mermaid">
+graph TD
+  ask-result["hasPermissionsToUseTool 返回 ask"] --> coord{"awaitAutomatedChecksBeforeDialog?"}
+  coord -->|是| coordinator["先跑 coordinatorHandler&lt;br/&gt;(hook / bash 分类器抢答)"]
+  coordinator --> coord-decided{"有裁决?"}
+  coord-decided -->|是| done-coord["落地该裁决"]
+  coord-decided -->|否| swarm["再跑 swarmWorkerHandler"]
+  coord -->|否| swarm
+  swarm --> swarm-decided{"有裁决?"}
+  swarm-decided -->|是| done-swarm["落地该裁决"]
+  swarm-decided -->|否| interactive["handleInteractivePermission&lt;br/&gt;推 UI 队列等用户"]
+  interactive --> user-resp{"用户响应"}
+  user-resp -->|"允许(可能改输入/加规则)"| on-allow["handleUserAllow&lt;br/&gt;持久化规则+记日志"]
+  user-resp -->|"拒绝(可能带反馈)"| on-deny["记拒绝日志"]
+  user-resp -->|Esc 中止| on-abort["cancelAndAbort&lt;br/&gt;中止本工具调用"]
+  on-allow --> done-allow2["落地 allow"]
+  on-deny --> done-deny["落地 deny"]
+  on-abort --> done-abort["落地 ask(中止消息)"]
+</pre>
+
+<ul>
+  <li>弹窗期间如果 bash 并发分类器（BASH_CLASSIFIER）跑出 allow，会抢在用户点击前自动放行；用户一开始用键盘交互（200ms 宽限期后）就取消这个自动抢答。</li>
+  <li>用户选"允许并总是允许这类操作"时，会通过 <code>persistPermissions</code> 把新规则写到对应来源（userSettings/projectSettings/localSettings/session 之一），下次同类调用直接走 allow 规则通道。</li>
+  <li>auto 模式下被分类器 deny 的工具会在 UI 上弹一条通知"被 auto 模式拒绝"，并把拒绝记进 <code>recordAutoModeDenial</code> 供后续展示。</li>
+</ul>
+
+<h2>模式切换状态机（Shift+Tab 循环）</h2>
+
+<p>用户按 Shift+Tab 在模式间循环，<code>getNextPermissionMode</code> 决定下一个模式。default/plan/acceptEdits/bypassPermissions 是用户可见的四个；auto 仅 ant 内部用户、且 TRANSCRIPT_CLASSIFIER 开关打开、且 auto 门禁（<code>isAutoModeGateEnabled</code>，含熔断状态）通过才出现；dontAsk 不在循环里暴露。进入 auto 时 <code>transitionPermissionMode</code> 会顺手剥掉危险权限规则（防止 auto + 危险规则组合）。</p>
+
+<pre class="mermaid">
+graph TD
+  def["default"] -->|Shift+Tab| def-next{"ant 用户?"}
+  def-next -->|是| def-bypass{"bypass 可用?"}
+  def-next -->|否| ae["acceptEdits"]
+  def-bypass -->|是| bp["bypassPermissions"]
+  def-bypass -->|否| def-auto{"auto 门禁开?"}
+  def-auto -->|是| auto["auto"]
+  def-auto -->|否| def["default"]
+  ae -->|Shift+Tab| plan["plan"]
+  plan -->|Shift+Tab| plan-bp{"bypass 可用?"}
+  plan-bp -->|是| bp
+  plan-bp -->|否| plan-auto{"auto 门禁开?"}
+  plan-auto -->|是| auto
+  plan-auto -->|否| def
+  bp -->|Shift+Tab| bp-auto{"auto 门禁开?"}
+  bp-auto -->|是| auto
+  bp-auto -->|否| def
+  auto -->|Shift+Tab| def
+</pre>
+
+<h2>规则匹配决策表</h2>
+
+<p>规则按行为分三桶：allow / deny / ask。匹配时"整工具"和"带内容"分开看：<code>ToolName</code>（无括号）匹配整工具；<code>ToolName(content)</code> 由工具自己的 <code>checkPermissions</code> 解释 content（bash 是命令前缀匹配，Write/Edit 是 glob 路径匹配）。整工具级的 deny/ask 在工具自报检查之前跑，allow 在工具自报检查之后跑——这个顺序是刻意设计的：deny 优先级最高，ask 强制弹窗，而 allow 只在没有 deny/ask 反对时才生效。</p>
+
+<pre class="mermaid">
+graph TD
+  start["规则匹配入口"] --> d1{"整工具 deny 规则?&lt;br/&gt;toolMatchesRule(无 content)"}
+  d1 -->|命中| out-deny["deny, reason=rule"]
+  d1 -->|否| d2{"整工具 ask 规则?"}
+  d2 -->|命中且不沙箱放行| out-ask["ask, reason=rule"]
+  d2 -->|否/可沙箱| d3{"工具 checkPermissions&lt;br/&gt;返回 deny/内容级 ask/safetyCheck?"}
+  d3 -->|deny| out-tool-deny["deny(工具自报)"]
+  d3 -->|"内容级 ask(rule)"| out-ask-content["ask, reason=rule&lt;br/&gt;(bypass 免疫)"]
+  d3 -->|safetyCheck| out-ask-safety["ask, reason=safetyCheck&lt;br/&gt;(bypass 免疫)"]
+  d3 -->|passthrough/allow| d4{"模式=bypass?"}
+  d4 -->|是| out-allow-bypass["allow, reason=mode"]
+  d4 -->|否| d5{"整工具 allow 规则?&lt;br/&gt;toolAlwaysAllowedRule"}
+  d5 -->|命中| out-allow-rule["allow, reason=rule"]
+  d5 -->|否| out-ask-default["passthrough→ask&lt;br/&gt;(交给模式后处理)"]
+</pre>
+
+<ul>
+  <li>规则来源优先级在 <code>permissionsLoader</code> 里合并（policy > userSettings > projectSettings > localSettings > ...），最终压成三桶规则列表挂在 <code>ToolPermissionContext</code> 上；同一桶里前来源的规则会遮蔽后来源的同内容规则（shadowedRuleDetection 负责提示被遮蔽的规则）。</li>
+  <li>规则字符串解析在 <code>permissionRuleValueFromString</code>：找第一个未转义的 <code>(</code> 和最后一个未转义的 <code>)</code>，括号内为 ruleContent；<code>Bash(*)</code> 和 <code>Bash()</code> 退化成整工具规则；括号本身可用 <code>\( \)</code> 转义。</li>
+  <li>Agent 类型拒绝是特殊语法 <code>Agent(Explore)</code>，<code>filterDeniedAgents</code> 一次性收集所有被拒 agent 类型再过滤，避免 O(agent×rule) 重复解析。</li>
+</ul>
+
+<script>
+window.__sourceMap = {
+  "abort-check": { "file": "src/utils/permissions/permissions.ts", "startLine": 1163, "endLine": 1165 },
+  "throw-abort": { "file": "src/utils/permissions/permissions.ts", "startLine": 1163, "endLine": 1165 },
+  "deny-rule": { "file": "src/utils/permissions/permissions.ts", "startLine": 1171, "endLine": 1181 },
+  "ret-deny-rule": { "file": "src/utils/permissions/permissions.ts", "startLine": 1172, "endLine": 1180 },
+  "ask-rule": { "file": "src/utils/permissions/permissions.ts", "startLine": 1184, "endLine": 1206 },
+  "ret-ask-rule": { "file": "src/utils/permissions/permissions.ts", "startLine": 1195, "endLine": 1204 },
+  "tool-check": { "file": "src/utils/permissions/permissions.ts", "startLine": 1210, "endLine": 1223 },
+  "tool-deny": { "file": "src/utils/permissions/permissions.ts", "startLine": 1226, "endLine": 1228 },
+  "ret-tool-deny": { "file": "src/utils/permissions/permissions.ts", "startLine": 1226, "endLine": 1228 },
+  "ask-content": { "file": "src/utils/permissions/permissions.ts", "startLine": 1244, "endLine": 1250 },
+  "ret-ask-content": { "file": "src/utils/permissions/permissions.ts", "startLine": 1244, "endLine": 1250 },
+  "safety": { "file": "src/utils/permissions/permissions.ts", "startLine": 1255, "endLine": 1260 },
+  "ret-safety": { "file": "src/utils/permissions/permissions.ts", "startLine": 1255, "endLine": 1260 },
+  "mode-branch": { "file": "src/utils/permissions/permissions.ts", "startLine": 1262, "endLine": 1264 },
+  "bypass": { "file": "src/utils/permissions/permissions.ts", "startLine": 1268, "endLine": 1281 },
+  "ret-allow-bypass": { "file": "src/utils/permissions/permissions.ts", "startLine": 1272, "endLine": 1281 },
+  "allow-rule": { "file": "src/utils/permissions/permissions.ts", "startLine": 1284, "endLine": 1297 },
+  "ret-allow-rule": { "file": "src/utils/permissions/permissions.ts", "startLine": 1288, "endLine": 1297 },
+  "passthrough-to-ask": { "file": "src/utils/permissions/permissions.ts", "startLine": 1299, "endLine": 1318 },
+  "postproc": { "file": "src/utils/permissions/permissions.ts", "startLine": 473, "endLine": 480 },
+  "inner-result": { "file": "src/utils/permissions/permissions.ts", "startLine": 480, "endLine": 486 },
+  "allow": { "file": "src/utils/permissions/permissions.ts", "startLine": 486, "endLine": 501 },
+  "reset-denial": { "file": "src/utils/permissions/permissions.ts", "startLine": 488, "endLine": 499 },
+  "done-allow": { "file": "src/utils/permissions/permissions.ts", "startLine": 500, "endLine": 501 },
+  "ask2": { "file": "src/utils/permissions/permissions.ts", "startLine": 505, "endLine": 517 },
+  "done-other": { "file": "src/utils/permissions/permissions.ts", "startLine": 955, "endLine": 956 },
+  "dontask": { "file": "src/utils/permissions/permissions.ts", "startLine": 508, "endLine": 517 },
+  "ret-deny-dontask": { "file": "src/utils/permissions/permissions.ts", "startLine": 509, "endLine": 516 },
+  "auto-decide": { "file": "src/utils/permissions/permissions.ts", "startLine": 520, "endLine": 525 },
+  "headless": { "file": "src/utils/permissions/permissions.ts", "startLine": 932, "endLine": 952 },
+  "auto-flow": { "file": "src/utils/permissions/permissions.ts", "startLine": 526, "endLine": 927 },
+  "ret-ask-user": { "file": "src/utils/permissions/permissions.ts", "startLine": 955, "endLine": 956 },
+  "hook-headless": { "file": "src/utils/permissions/permissions.ts", "startLine": 933, "endLine": 943 },
+  "hook-decided": { "file": "src/utils/permissions/permissions.ts", "startLine": 941, "endLine": 943 },
+  "ret-hook": { "file": "src/utils/permissions/permissions.ts", "startLine": 941, "endLine": 943 },
+  "ret-deny-headless": { "file": "src/utils/permissions/permissions.ts", "startLine": 944, "endLine": 951 },
+  "auto-enter": { "file": "src/utils/permissions/permissions.ts", "startLine": 520, "endLine": 525 },
+  "safety-immune": { "file": "src/utils/permissions/permissions.ts", "startLine": 532, "endLine": 548 },
+  "ret-ask-safety": { "file": "src/utils/permissions/permissions.ts", "startLine": 536, "endLine": 548 },
+  "needs-interact": { "file": "src/utils/permissions/permissions.ts", "startLine": 549, "endLine": 551 },
+  "ret-ask-interact": { "file": "src/utils/permissions/permissions.ts", "startLine": 549, "endLine": 551 },
+  "ps-guard": { "file": "src/utils/permissions/permissions.ts", "startLine": 572, "endLine": 591 },
+  "ret-ask-ps": { "file": "src/utils/permissions/permissions.ts", "startLine": 576, "endLine": 591 },
+  "accept-edits-fast": { "file": "src/utils/permissions/permissions.ts", "startLine": 600, "endLine": 656 },
+  "ae-allow": { "file": "src/utils/permissions/permissions.ts", "startLine": 620, "endLine": 649 },
+  "ret-allow-ae": { "file": "src/utils/permissions/permissions.ts", "startLine": 641, "endLine": 648 },
+  "allowlist-fast": { "file": "src/utils/permissions/permissions.ts", "startLine": 660, "endLine": 686 },
+  "ret-allow-wl": { "file": "src/utils/permissions/permissions.ts", "startLine": 678, "endLine": 685 },
+  "call-classifier": { "file": "src/utils/permissions/permissions.ts", "startLine": 688, "endLine": 702 },
+  "cls-result": { "file": "src/utils/permissions/permissions.ts", "startLine": 818, "endLine": 926 },
+  "ret-allow-cls": { "file": "src/utils/permissions/permissions.ts", "startLine": 918, "endLine": 926 },
+  "ret-fallback-tl": { "file": "src/utils/permissions/permissions.ts", "startLine": 822, "endLine": 842 },
+  "iron-gate": { "file": "src/utils/permissions/permissions.ts", "startLine": 845, "endLine": 876 },
+  "record-denial": { "file": "src/utils/permissions/permissions.ts", "startLine": 879, "endLine": 880 },
+  "ret-deny-closed": { "file": "src/utils/permissions/permissions.ts", "startLine": 856, "endLine": 869 },
+  "ret-ask-open": { "file": "src/utils/permissions/permissions.ts", "startLine": 870, "endLine": 876 },
+  "denial-limit": { "file": "src/utils/permissions/permissions.ts", "startLine": 890, "endLine": 901 },
+  "ret-fallback-limit": { "file": "src/utils/permissions/permissions.ts", "startLine": 984, "endLine": 1070 },
+  "ret-deny-cls": { "file": "src/utils/permissions/permissions.ts", "startLine": 903, "endLine": 911 },
+  "ask-result": { "file": "src/hooks/useCanUseTool.tsx", "startLine": 64, "endLine": 93 },
+  "coord": { "file": "src/hooks/useCanUseTool.tsx", "startLine": 95, "endLine": 109 },
+  "coordinator": { "file": "src/hooks/toolPermission/handlers/coordinatorHandler.ts", "startLine": 26, "endLine": 64 },
+  "coord-decided": { "file": "src/hooks/useCanUseTool.tsx", "startLine": 105, "endLine": 109 },
+  "done-coord": { "file": "src/hooks/useCanUseTool.tsx", "startLine": 105, "endLine": 108 },
+  "swarm": { "file": "src/hooks/useCanUseTool.tsx", "startLine": 113, "endLine": 120 },
+  "swarm-decided": { "file": "src/hooks/toolPermission/handlers/swarmWorkerHandler.ts", "startLine": 40, "endLine": 158 },
+  "done-swarm": { "file": "src/hooks/useCanUseTool.tsx", "startLine": 113, "endLine": 120 },
+  "interactive": { "file": "src/hooks/toolPermission/handlers/interactiveHandler.ts", "startLine": 57, "endLine": 176 },
+  "user-resp": { "file": "src/hooks/toolPermission/handlers/interactiveHandler.ts", "startLine": 154, "endLine": 176 },
+  "on-allow": { "file": "src/hooks/toolPermission/handlers/interactiveHandler.ts", "startLine": 154, "endLine": 176 },
+  "on-deny": { "file": "src/hooks/toolPermission/handlers/interactiveHandler.ts", "startLine": 57, "endLine": 176 },
+  "on-abort": { "file": "src/hooks/toolPermission/handlers/interactiveHandler.ts", "startLine": 137, "endLine": 153 },
+  "done-allow2": { "file": "src/hooks/toolPermission/PermissionContext.ts", "startLine": 291, "endLine": 318 },
+  "done-deny": { "file": "src/hooks/toolPermission/PermissionContext.ts", "startLine": 285, "endLine": 290 },
+  "done-abort": { "file": "src/hooks/toolPermission/PermissionContext.ts", "startLine": 154, "endLine": 173 },
+  "def": { "file": "src/utils/permissions/getNextPermissionMode.ts", "startLine": 38, "endLine": 50 },
+  "def-next": { "file": "src/utils/permissions/getNextPermissionMode.ts", "startLine": 41, "endLine": 50 },
+  "def-bypass": { "file": "src/utils/permissions/getNextPermissionMode.ts", "startLine": 42, "endLine": 44 },
+  "ae": { "file": "src/utils/permissions/getNextPermissionMode.ts", "startLine": 50, "endLine": 50 },
+  "bp": { "file": "src/utils/permissions/getNextPermissionMode.ts", "startLine": 42, "endLine": 44 },
+  "def-auto": { "file": "src/utils/permissions/getNextPermissionMode.ts", "startLine": 45, "endLine": 47 },
+  "auto": { "file": "src/utils/permissions/getNextPermissionMode.ts", "startLine": 45, "endLine": 47 },
+  "plan": { "file": "src/utils/permissions/getNextPermissionMode.ts", "startLine": 52, "endLine": 53 },
+  "plan-bp": { "file": "src/utils/permissions/getNextPermissionMode.ts", "startLine": 56, "endLine": 58 },
+  "plan-auto": { "file": "src/utils/permissions/getNextPermissionMode.ts", "startLine": 59, "endLine": 61 },
+  "bp-auto": { "file": "src/utils/permissions/getNextPermissionMode.ts", "startLine": 65, "endLine": 67 },
+  "start": { "file": "src/utils/permissions/permissions.ts", "startLine": 1158, "endLine": 1162 },
+  "d1": { "file": "src/utils/permissions/permissions.ts", "startLine": 1171, "endLine": 1181 },
+  "out-deny": { "file": "src/utils/permissions/permissions.ts", "startLine": 1172, "endLine": 1180 },
+  "d2": { "file": "src/utils/permissions/permissions.ts", "startLine": 1184, "endLine": 1206 },
+  "out-ask": { "file": "src/utils/permissions/permissions.ts", "startLine": 1195, "endLine": 1204 },
+  "d3": { "file": "src/utils/permissions/permissions.ts", "startLine": 1210, "endLine": 1260 },
+  "out-tool-deny": { "file": "src/utils/permissions/permissions.ts", "startLine": 1226, "endLine": 1228 },
+  "out-ask-content": { "file": "src/utils/permissions/permissions.ts", "startLine": 1244, "endLine": 1250 },
+  "out-ask-safety": { "file": "src/utils/permissions/permissions.ts", "startLine": 1255, "endLine": 1260 },
+  "d4": { "file": "src/utils/permissions/permissions.ts", "startLine": 1268, "endLine": 1281 },
+  "out-allow-bypass": { "file": "src/utils/permissions/permissions.ts", "startLine": 1272, "endLine": 1281 },
+  "d5": { "file": "src/utils/permissions/permissions.ts", "startLine": 1284, "endLine": 1297 },
+  "out-allow-rule": { "file": "src/utils/permissions/permissions.ts", "startLine": 1288, "endLine": 1297 },
+  "out-ask-default": { "file": "src/utils/permissions/permissions.ts", "startLine": 1299, "endLine": 1318 }
+};
+</script>
+
+<aside id="source-panel"><div id="source-header"></div><div id="monaco-container"></div></aside>
+<script src="../assets/codeindex-runtime.js"></script>
+<script src="../assets/codeindex.js"></script>
+</body>
+</html>

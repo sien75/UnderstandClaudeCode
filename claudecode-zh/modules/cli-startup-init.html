@@ -1,0 +1,370 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CLI 启动与会话初始化</title>
+<link rel="stylesheet" href="../assets/codeindex.css">
+</head>
+<body>
+<nav class="topnav"><a href="../index.html">← 返回总览</a></nav>
+<h1>CLI 启动与会话初始化</h1>
+
+<p>这个模块讲的是：用户在终端敲下 <code>claude</code> 回车之后，到屏幕上出现可交互的 REPL 输入框之前，程序内部到底走了一条什么样的路。整条链路的核心目标是"又快又稳地进入对话状态"——快体现在大量并行预取和快速通道（fast-path）提前 return，避免无谓地加载整个 CLI；稳体现在信任对话框、权限沙箱校验、配置错误处理等一道道关卡。从数据流的角度看，输入是用户敲下的一条命令行（argv），输出要么是一个正在跑的交互式 REPL 进程，要么是一次性的 headless 结果打印后退出。</p>
+
+<dl>
+  <dt>输入</dt>
+  <dd>用户在终端敲的 <code>claude</code> 及其后跟的参数（子命令、flags、prompt 文本、stdin 管道内容）</dd>
+  <dt>输出</dt>
+  <dd>一个就绪的可交互 REPL（屏幕渲染完成、上下文装配好、权限模式确定），或一次性打印完回复后进程退出（<code>--print</code> 模式）</dd>
+</dl>
+
+<p>整条链路大致分四段，下面用四张图分别展开。第一段是入口文件 <code>cli.tsx</code> 的"快速通道分发"——它像一个门卫，识别出一批不需要加载完整 CLI 的特殊调用方式并直接处理掉。</p>
+
+<pre class="mermaid">
+graph TD
+  user-typing["用户在终端敲 claude"] --> bin-entry["bin 入口: src/entrypoints/cli.tsx"]
+  bin-entry --> top-env["设环境变量: COREPACK/autoPin/远程堆栈/ablation"]
+  top-env --> read-argv["读 process.argv.slice(2)"]
+  read-argv --> version-check{"仅 --version/-v?"}
+  version-check -->|是| print-version["打印 MACRO.VERSION 后 return"]
+  version-check -->|否| load-profiler["动态 import startupProfiler, 打点 cli_entry"]
+  load-profiler --> dump-check{"--dump-system-prompt?"}
+  dump-check -->|是| dump-prompt["渲染系统提示词并打印后 return"]
+  dump-check -->|否| chrome-check{"--claude-in-chrome-mcp / --chrome-native-host?"}
+  chrome-check -->|是| chrome-path["跑 Chrome 集成 MCP/NativeHost 后 return"]
+  chrome-check -->|否| daemon-worker-check{"--daemon-worker?"}
+  daemon-worker-check -->|是| daemon-worker-path["跑 runDaemonWorker 后 return"]
+  daemon-worker-check -->|否| bridge-check{"remote-control/rc/remote/sync/bridge?"}
+  bridge-check -->|是| bridge-path["enableConfigs→鉴权→GrowthBook→版本→policy→bridgeMain 后 return"]
+  bridge-check -->|否| daemon-cmd-check{"daemon 子命令?"}
+  daemon-cmd-check -->|是| daemon-cmd-path["enableConfigs+initSinks→daemonMain 后 return"]
+  daemon-cmd-check -->|否| bg-check{"ps/logs/attach/kill/--bg?"}
+  bg-check -->|是| bg-path["enableConfigs→bg 各 handler 后 return"]
+  bg-check -->|否| templates-check{"new/list/reply?"}
+  templates-check -->|是| templates-path["templatesMain 后 process.exit(0)"]
+  templates-check -->|否| runner-check{"environment-runner / self-hosted-runner?"}
+  runner-check -->|是| runner-path["对应 runner main 后 return"]
+  runner-check -->|否| tmux-wt-check{"--tmux + --worktree?"}
+  tmux-wt-check -->|是| tmux-wt-path["enableConfigs→isWorktreeModeEnabled→execIntoTmuxWorktree"]
+  tmux-wt-path --> tmux-result{"handled?"}
+  tmux-result -->|是| tmux-return["return"]
+  tmux-result -->|否, 有 error| tmux-error["exitWithError"]
+  tmux-wt-check -->|否| update-redirect{"仅 --update/--upgrade?"}
+  update-redirect -->|是| rewrite-argv["改写 argv 为 update 子命令, 落到下一段"]
+  update-redirect -->|否| bare-flag{"含 --bare?"}
+  bare-flag -->|是| set-simple["设 CLAUDE_CODE_SIMPLE=1"]
+  bare-flag -->|否| load-full-cli["加载完整 CLI"]
+  set-simple --> load-full-cli
+  load-full-cli --> early-input["startCapturingEarlyInput + 打点"]
+  early-input --> import-main["动态 import ../main.js 的 main"]
+  import-main --> call-cli-main["await cliMain() 打点收尾"]
+</pre>
+
+<p>上面这张图里，每一个"是"分支都是一次"提前 return"，意味着对应场景下根本不会去加载庞大的 <code>main.tsx</code>，这是启动速度优化的关键设计——比如 <code>--version</code> 连一个动态 import 都不需要。只有所有快速通道都不命中，才会落到最底下加载完整 CLI、调用 <code>main()</code>。需要留意 <code>--update/--upgrade</code> 会被改写成 <code>update</code> 子命令再继续往下走（而非直接 return）。</p>
+
+<p>第二段进入 <code>main.tsx</code> 的 <code>main()</code> 与 <code>run()</code>：<code>main()</code> 做一批"必须在任何代码执行前完成"的安全与状态初始化，并把一些特殊调用形式（<code>cc://</code> URL、<code>ssh</code>、<code>assistant</code>）从 argv 里剥离暂存到全局 pending 对象里，让后续默认 action handler 来接管；<code>run()</code> 则构建 commander 程序并注册一个 <code>preAction</code> 钩子——这个钩子在任意命令真正执行前运行，负责把配置系统、MDM/keychain 预取、init()、日志 sinks、迁移、远程设置等"公共初始化"集中跑掉。</p>
+
+<pre class="mermaid">
+graph TD
+  cli-main-called["cliMain() 被调用"] --> security-env["设 NoDefaultCurrentDirectoryInExePath 防 PATH 劫持"]
+  security-env --> warn-handler["挂 warning 处理 + exit/SIGINT 处理"]
+  warn-handler --> cc-url-check{"argv 含 cc:// 或 cc+unix://?"}
+  cc-url-check -->|是| cc-rewrite["改写 argv: headless 走 open 子命令, 交互剥离 URL 入 _pendingConnect"]
+  cc-url-check -->|否| uri-check{"--handle-uri / macOS URL scheme?"}
+  cc-rewrite --> uri-check
+  uri-check -->|是| uri-path["enableConfigs→处理 deep link URI→process.exit"]
+  uri-check -->|否| assistant-check{"argv[0]===assistant?"}
+  assistant-check -->|是| assistant-stash["剥离并暂存到 _pendingAssistantChat"]
+  assistant-check -->|否| ssh-check{"argv[0]===ssh?"}
+  assistant-stash --> ssh-check
+  ssh-check -->|是| ssh-extract["剥离 ssh flags/host/cwd 暂存到 _pendingSSH, 改写 argv"]
+  ssh-check -->|否| mode-detect["判定 isNonInteractive: -p/--init-only/--sdk-url/!TTY"]
+  ssh-extract --> mode-detect
+  mode-detect --> set-state["setIsInteractive + initializeEntrypoint + clientType 判定"]
+  set-state --> eager-settings["eagerLoadSettings: 提前解析 --settings/--setting-sources"]
+  eager-settings --> call-run["await run()"]
+  call-run --> build-program["构建 commander program + createSortedHelpConfig"]
+  build-program --> hook-preaction["注册 preAction hook"]
+  hook-preaction --> register-options["链式注册大量 .option/.command 子命令"]
+  register-options --> parse-async["program.parseAsync(process.argv)"]
+  parse-async --> preaction-fire["preAction 钩子触发"]
+  preaction-fire --> mdm-keychain["await MDM 设置 + keychain 预取并行"]
+  mdm-keychain --> await-init["await init()"]
+  await-init --> set-title["设 process.title=claude"]
+  set-title --> init-sinks["动态 import + initSinks 挂日志/分析 sinks"]
+  init-sinks --> plugin-dir-check{"--plugin-dir 有值?"}
+  plugin-dir-check -->|是| set-inline-plugins["setInlinePlugins + clearPluginCache"]
+  plugin-dir-check -->|否| run-migrations["runMigrations()"]
+  set-inline-plugins --> run-migrations
+  run-migrations --> remote-settings["void loadRemoteManagedSettings + loadPolicyLimits 非阻塞"]
+  remote-settings --> settings-sync["void 设置同步上传(非阻塞)"]
+  settings-sync --> action-handler["进入默认 .action handler"]
+</pre>
+
+<p>注意 <code>init()</code>（在 <code>entrypoints/init.ts</code>，memoize 单次执行）才是真正"打开配置系统"的地方：它 <code>enableConfigs()</code>、应用"安全"环境变量（信任对话框之前的子集）、应用额外 CA 证书、挂优雅退出、初始化 1P 事件日志与 GrowthBook、配置 mTLS/全局 HTTP agent、preconnect Anthropic API、CCR upstreamproxy、JetBrains/GitHub 仓库检测等。配置解析错误时会区分交互/非交互分别走对话框或 stderr 退出。<code>preAction</code> 之后才真正进入具体命令的 action handler。</p>
+
+<p>第三段是默认 action handler 的前半段——这一段把用户选项解构清楚、做一堆校验、并行启动若干预取，然后调用 <code>setup()</code> 把工作目录/会话内存/git/worktree 等运行时地基铺好。这一段是"启动优化"最密集的区域：很多 IO 被并行化或延迟到首帧之后。</p>
+
+<pre class="mermaid">
+graph TD
+  action-start["action handler 开始"] --> bare-set{"--bare?"}
+  bare-set -->|是| set-simple2["设 CLAUDE_CODE_SIMPLE=1"]
+  bare-set -->|否| prompt-tidy["清理 prompt(code 视为空, 单词记事件)"]
+  set-simple2 --> prompt-tidy
+  prompt-tidy --> kairos-check{"assistant 模式 + 目录已信任?"}
+  kairos-check -->|是| kairos-on["设 brief/kairosActive + initializeAssistantTeam"]
+  kairos-check -->|否| destructure-opts["解构 debug/print/model/worktree 等选项"]
+  kairos-on --> destructure-opts
+  destructure-opts --> wt-validate{"--tmux 但无 --worktree / Windows / tmux 未装?"}
+  wt-validate -->|任一为真| wt-error["stderr 报错 + process.exit(1)"]
+  wt-validate -->|否| teammate-opts["提取 teammate 身份选项, 校验三件套齐全"]
+  teammate-opts --> session-id-validate{"--session-id 不合法/已存在?"}
+  session-id-validate -->|是| sid-error["报错 + exit(1)"]
+  session-id-validate -->|否| file-download{"--file 指定?"}
+  file-download -->|是, 无 token| file-error["报错 exit(1)"]
+  file-download -->|否| fallback-validate{"fallback==主 model?"}
+  file-download -->|是, 有 token| file-download-promise["启动 downloadSessionFiles(非阻塞, 渲染前 await)"]
+  file-download-promise --> fallback-validate
+  fallback-validate -->|相同| fb-error["报错 exit(1)"]
+  fallback-validate -->|不同| sysprompt-opts["处理 --system-prompt[-file] / --append-system-prompt[-file]"]
+  sysprompt-opts --> sp-error{"文件不存在/互斥?"}
+  sp-error -->|是| sp-error-exit["报错 exit(1)"]
+  sp-error -->|否| perm-mode["initialPermissionModeFromCLI 确定 permissionMode + 通知"]
+  perm-mode --> mcp-parse["解析 --mcp-config(JSON 串/文件路径) 合并 dynamicMcpConfig"]
+  mcp-parse --> claudeai-mcp["非交互且非 strict/企业/bare: 预取 claude.ai MCP 配置并按 policy 过滤"]
+  claudeai-mcp --> local-mcp["启动本地 MCP config 加载 promise(仅读文件)"]
+  local-mcp --> format-validate["校验 input/output format 组合 + sdkUrl/replay/partial 约束"]
+  format-validate --> fmt-error{"组合非法?"}
+  fmt-error -->|是| fmt-error-exit["报错 exit(1)"]
+  fmt-error -->|否| get-input-prompt["getInputPrompt: 读 stdin 管道(3s 超时警告)"]
+  get-input-prompt --> load-tools["getTools + 可选 coordinator 过滤 + SyntheticOutput 工具"]
+  load-tools --> kick-setup["并行: setup() 与 getCommands/getAgentDefs"]
+  kick-setup --> setup-run["setup(): setCwd→hooks 快照→worktree→后台作业→预取→bypass 沙箱校验"]
+  setup-run --> setup-done["setup() 完成"]
+  setup-done --> apply-env-print{"非交互?"}
+  apply-env-print -->|是| apply-env-full["applyConfigEnvironmentVariables + 预取 git/user/model"]
+  apply-env-print -->|否| await-commands["await getCommands + agentDefs 合并"]
+  apply-env-full --> await-commands
+  await-commands --> agent-resolve["解析主线程 agent + 合并 CLI agents + effectiveModel"]
+  agent-resolve --> next-stage["进入后段(信任屏/分支)"]
+</pre>
+
+<p>这里有个关键的并行设计：<code>setup()</code>（<code>src/setup.ts</code>）和 <code>getCommands()/getAgentDefinitionsWithOverrides()</code> 是同时 kick 出去的——因为 <code>setup()</code> 主要是 UDS socket 绑定（约 20ms）不抢磁盘 IO，而 commands 读取是文件 IO，两者天然可重叠。但 <code>--worktree</code> 会让 <code>setup()</code> 调 <code>process.chdir()</code>，所以那种情况下 commands 必须等 chdir 完成再读，于是被门控为 null、在 setup 完成后重新取。<code>setup()</code> 内部还有几道值得知道的关卡：bypassPermissions 模式会校验"不能以 root/sudo 跑、必须在无网的 Docker/沙箱里"（否则 exit），<code>tengu_started</code> 事件在 sinks 挂好后立即发出（作为发布健康监控的最早可靠"进程已启动"信号）。</p>
+
+<p>第四段是 action handler 的后半段——决定进程最终走哪条分支。先在交互模式下跑 <code>showSetupScreens()</code>（信任对话框/OAuth 登录/onboarding/resume 选择器），信任建立后才初始化 LSP、跑启动期预取、解析 MCP 配置、初始化版本化插件；然后根据 <code>--init-only</code>、<code>--print</code>、<code>options.continue</code>、<code>_pendingConnect/_pendingSSH/_pendingAssistantChat</code>、<code>options.resume</code> 等条件分到不同出口。所有交互出口最终都汇聚到 <code>launchRepl()</code>。</p>
+
+<pre class="mermaid">
+graph TD
+  next-stage["进入后段"] --> ink-root{"交互模式?"}
+  ink-root -->|是| create-root["createRoot(Ink) + 记 startup 计时事件"]
+  ink-root -->|否, 已是 print 路径| skip-screens["跳过信任屏(信任隐式)"]
+  create-root --> show-screens["showSetupScreens: 信任/OAuth/onboarding/resume picker"]
+  show-screens --> trust-rejected{"进程 exitCode 已设(信任被拒)?"}
+  trust-rejected -->|是| skip-rest["跳过后续初始化直接 return"]
+  trust-rejected -->|否| rc-gate{"--remote-control/--rc?"}
+  rc-gate -->|是| rc-resolve["getBridgeDisabledReason 决定 remoteControl 开关"]
+  rc-gate -->|否| lsp-init["initializeLspServerManager(信任后, 防插件 LSP 在未信任目录执行)"]
+  rc-resolve --> lsp-init
+  lsp-init --> settings-errors{"非交互且 settings 有非 MCP 错?"}
+  settings-errors -->|是| settings-dialog["launchInvalidSettingsDialog"]
+  settings-errors -->|否| startup-prefetch["后台预取: quota/bootstrapData/passes/fastMode/exampleCmds"]
+  settings-dialog --> startup-prefetch
+  startup-prefetch --> await-mcp["await mcpConfigPromise + 拆分 SDK/regular 配置"]
+  await-mcp --> plugin-init["版本化插件初始化(交互 fire-and-forget, 非交互 await)"]
+  plugin-init --> init-only-check{"--init-only?"}
+  init-only-check -->|是| init-only-path["applyConfigEnv + 同步跑 Setup+SessionStart hooks + gracefulShutdownSync(0) + return"]
+  init-only-check -->|否| print-check{"非交互(--print)?"}
+  print-check -->|是| print-path["构建 headlessStore + 异步校验 bypass/auto + 动态 import print.ts + void runHeadless(...) + return"]
+  print-check -->|否| build-session-config["构建 sessionConfig + resumeContext"]
+  build-session-config --> branch-continue{"options.continue?"}
+  branch-continue -->|是| continue-path["loadConversationForResume→processResumedConversation→launchRepl(loaded state)"]
+  branch-continue -->|否| branch-connect{"_pendingConnect.url(cc://)?"}
+  branch-connect -->|是| connect-path["createDirectConnectSession→launchRepl(directConnectConfig)"]
+  branch-connect -->|否| branch-ssh{"_pendingSSH.host?"}
+  branch-ssh -->|是| ssh-path["createSSHSession(或 local)→setCwd→launchRepl(SSHSession)"]
+  branch-ssh -->|否| branch-assistant{"_pendingAssistantChat?"}
+  branch-assistant -->|是| assistant-path["discoverAssistantSessions→(无则装向导/单选/多选)→鉴权→launchRepl"]
+  branch-assistant -->|否| branch-resume{"options.resume?"}
+  branch-resume -->|是| resume-path["loadConversationForResume→processResumedConversation→launchRepl"]
+  branch-resume -->|否| default-path["拼 hookMessages/deepLinkBanner→launchRepl(默认新会话)"]
+  continue-path --> repl-render
+  connect-path --> repl-render
+  ssh-path --> repl-render
+  assistant-path --> repl-render
+  resume-path --> repl-render
+  default-path --> repl-render
+  repl-render["launchRepl: 动态 import App+REPL, renderAndRun 渲染"]
+  print-path --> print-exit["runHeadless 跑完后进程退出"]
+  init-only-path --> init-exit["进程退出"]
+</pre>
+
+<p>几个值得新人知道的细节：<code>--init-only</code> 是个隐藏的"只跑 Setup + SessionStart:startup hooks 然后退出"的开关，用于环境初始化脚本；<code>--print</code> 模式信任是隐式的（帮助文本里也写明了"仅在信任目录使用"），所以它跳过信任屏但会做 <code>applyConfigEnvironmentVariables</code> 应用完整（含潜在危险）环境变量；交互模式的信任屏一旦被拒，<code>process.exitCode</code> 会被置位，后续所有可能触发代码执行的步骤（包括 apiKeyHelper）都被跳过，这是为了防止在未信任目录里执行插件代码。<code>launchRepl</code>（<code>src/replLauncher.tsx</code>）本身非常薄——动态 import <code>App</code> 和 <code>REPL</code> 组件后交给 <code>renderAndRun</code> 渲染，真正的 REPL 逻辑在 <code>screens/REPL</code> 里，不在本模块范围。</p>
+
+<p>关于辅助视角的自然观察：<strong>状态机</strong>层面最关键的状态分叉是"交互 vs 非交互"（<code>isNonInteractiveSession</code>，由 <code>-p/--init-only/--sdk-url/!stdout.isTTY</code> 决定），它决定信任是走对话框还是隐式、MCP/插件初始化是 fire-and-forget 还是 await；其下又有 continue/resume/connect/ssh/assistant/new 等会话来源子状态。<strong>权限</strong>层面，<code>permissionMode</code> 由 <code>initialPermissionModeFromCLI</code> 根据 <code>--permission-mode/--dangerously-skip-permissions</code> 解析，bypass 模式在 <code>setup()</code> 里有专门的沙箱校验关卡（root/docker/互联网），auto 模式有 GrowthBook 门控异步校验。<strong>生命周期</strong>层面，<code>tengu_started</code> 事件是"进程已启动"的最早可靠信号（sinks 挂好后立即发），<code>tengu_timer{event:'startup'}</code> 在首屏阻塞对话框渲染前记录启动耗时，会话结束时 <code>setup()</code> 还会从 projectConfig 读上一会话的 <code>tengu_exit</code> 指标并发出。</p>
+
+<ul>
+  <li>整个启动链路极度依赖"动态 import + 并行/延迟"来压首帧时间：<code>cli.tsx</code> 几乎所有分支都是 <code>await import(...)</code>，<code>--version</code> 甚至零 import；<code>main.tsx</code> action handler 里 setup/commands/agents/MCP/git/user/model 预取大量并行。</li>
+  <li><code>--bare</code>（等价 <code>CLAUDE_CODE_SIMPLE=1</code>）是一个"最小模式"总开关：跳过 UDS messaging、teammate 快照、iTerm/Terminal 备份恢复、插件预取、attribution hooks、release notes、startup prefetches 等，专为脚本化调用瘦身。</li>
+  <li>信任（trust）是一道硬边界：交互模式下 <code>showSetupScreens</code> 之前的代码刻意避免在未信任目录执行插件 LSP / apiKeyHelper；非交互模式信任隐式但要求"仅在你信任的目录使用 -p"。</li>
+  <li><code>cli.tsx</code> 里的 <code>feature('XXX')</code> 是构建期 dead-code-elimination 门控，外部构建会把这些 ant-only/实验性分支整段裁掉，所以同一份源码对外对内行为不同。</li>
+  <li>覆盖说明：本模块聚焦"敲下 claude 到 REPL 就绪"的主数据流。<code>cli/print.ts</code>（5596 行）的 <code>runHeadless</code> 内部细节、<code>bridgeMain/daemonMain/templatesMain</code> 等快速通道的内部实现、<code>screens/REPL</code> 渲染后的交互逻辑均未深读，仅在主流程中标为出口节点；main.tsx 中大量纯选项注册行（968-1005、3811-3884 的子命令/option 链）与 4395-4684 的尾部子命令 action 仅 mapped 理解职责。</li>
+</ul>
+
+<script>
+window.__sourceMap = {
+  "user-typing": { "file": "src/entrypoints/cli.tsx", "startLine": 33, "endLine": 34 },
+  "bin-entry": { "file": "src/entrypoints/cli.tsx", "startLine": 33, "endLine": 34 },
+  "top-env": { "file": "src/entrypoints/cli.tsx", "startLine": 1, "endLine": 26 },
+  "read-argv": { "file": "src/entrypoints/cli.tsx", "startLine": 34, "endLine": 34 },
+  "version-check": { "file": "src/entrypoints/cli.tsx", "startLine": 37, "endLine": 37 },
+  "print-version": { "file": "src/entrypoints/cli.tsx", "startLine": 38, "endLine": 42 },
+  "load-profiler": { "file": "src/entrypoints/cli.tsx", "startLine": 44, "endLine": 48 },
+  "dump-check": { "file": "src/entrypoints/cli.tsx", "startLine": 50, "endLine": 53 },
+  "dump-prompt": { "file": "src/entrypoints/cli.tsx", "startLine": 53, "endLine": 71 },
+  "chrome-check": { "file": "src/entrypoints/cli.tsx", "startLine": 72, "endLine": 86 },
+  "chrome-path": { "file": "src/entrypoints/cli.tsx", "startLine": 72, "endLine": 93 },
+  "daemon-worker-check": { "file": "src/entrypoints/cli.tsx", "startLine": 95, "endLine": 100 },
+  "daemon-worker-path": { "file": "src/entrypoints/cli.tsx", "startLine": 100, "endLine": 106 },
+  "bridge-check": { "file": "src/entrypoints/cli.tsx", "startLine": 108, "endLine": 112 },
+  "bridge-path": { "file": "src/entrypoints/cli.tsx", "startLine": 112, "endLine": 162 },
+  "daemon-cmd-check": { "file": "src/entrypoints/cli.tsx", "startLine": 164, "endLine": 165 },
+  "daemon-cmd-path": { "file": "src/entrypoints/cli.tsx", "startLine": 165, "endLine": 180 },
+  "bg-check": { "file": "src/entrypoints/cli.tsx", "startLine": 182, "endLine": 185 },
+  "bg-path": { "file": "src/entrypoints/cli.tsx", "startLine": 185, "endLine": 209 },
+  "templates-check": { "file": "src/entrypoints/cli.tsx", "startLine": 211, "endLine": 212 },
+  "templates-path": { "file": "src/entrypoints/cli.tsx", "startLine": 212, "endLine": 222 },
+  "runner-check": { "file": "src/entrypoints/cli.tsx", "startLine": 224, "endLine": 238 },
+  "runner-path": { "file": "src/entrypoints/cli.tsx", "startLine": 226, "endLine": 245 },
+  "tmux-wt-check": { "file": "src/entrypoints/cli.tsx", "startLine": 247, "endLine": 249 },
+  "tmux-wt-path": { "file": "src/entrypoints/cli.tsx", "startLine": 249, "endLine": 274 },
+  "tmux-result": { "file": "src/entrypoints/cli.tsx", "startLine": 263, "endLine": 267 },
+  "tmux-return": { "file": "src/entrypoints/cli.tsx", "startLine": 263, "endLine": 265 },
+  "tmux-error": { "file": "src/entrypoints/cli.tsx", "startLine": 267, "endLine": 273 },
+  "update-redirect": { "file": "src/entrypoints/cli.tsx", "startLine": 277, "endLine": 279 },
+  "rewrite-argv": { "file": "src/entrypoints/cli.tsx", "startLine": 277, "endLine": 279 },
+  "bare-flag": { "file": "src/entrypoints/cli.tsx", "startLine": 283, "endLine": 285 },
+  "set-simple": { "file": "src/entrypoints/cli.tsx", "startLine": 283, "endLine": 285 },
+  "load-full-cli": { "file": "src/entrypoints/cli.tsx", "startLine": 287, "endLine": 298 },
+  "early-input": { "file": "src/entrypoints/cli.tsx", "startLine": 288, "endLine": 292 },
+  "import-main": { "file": "src/entrypoints/cli.tsx", "startLine": 293, "endLine": 296 },
+  "call-cli-main": { "file": "src/entrypoints/cli.tsx", "startLine": 297, "endLine": 298 },
+
+  "cli-main-called": { "file": "src/main.tsx", "startLine": 585, "endLine": 586 },
+  "security-env": { "file": "src/main.tsx", "startLine": 588, "endLine": 591 },
+  "warn-handler": { "file": "src/main.tsx", "startLine": 593, "endLine": 607 },
+  "cc-url-check": { "file": "src/main.tsx", "startLine": 609, "endLine": 615 },
+  "cc-rewrite": { "file": "src/main.tsx", "startLine": 615, "endLine": 642 },
+  "uri-check": { "file": "src/main.tsx", "startLine": 644, "endLine": 677 },
+  "uri-path": { "file": "src/main.tsx", "startLine": 647, "endLine": 676 },
+  "assistant-check": { "file": "src/main.tsx", "startLine": 679, "endLine": 700 },
+  "assistant-stash": { "file": "src/main.tsx", "startLine": 685, "endLine": 699 },
+  "ssh-check": { "file": "src/main.tsx", "startLine": 702, "endLine": 795 },
+  "ssh-extract": { "file": "src/main.tsx", "startLine": 714, "endLine": 794 },
+  "mode-detect": { "file": "src/main.tsx", "startLine": 797, "endLine": 808 },
+  "set-state": { "file": "src/main.tsx", "startLine": 810, "endLine": 849 },
+  "eager-settings": { "file": "src/main.tsx", "startLine": 851, "endLine": 853 },
+  "call-run": { "file": "src/main.tsx", "startLine": 854, "endLine": 855 },
+  "build-program": { "file": "src/main.tsx", "startLine": 884, "endLine": 903 },
+  "hook-preaction": { "file": "src/main.tsx", "startLine": 907, "endLine": 967 },
+  "register-options": { "file": "src/main.tsx", "startLine": 968, "endLine": 1006 },
+  "parse-async": { "file": "src/main.tsx", "startLine": 3887, "endLine": 3888 },
+  "preaction-fire": { "file": "src/main.tsx", "startLine": 907, "endLine": 908 },
+  "mdm-keychain": { "file": "src/main.tsx", "startLine": 914, "endLine": 915 },
+  "await-init": { "file": "src/main.tsx", "startLine": 916, "endLine": 917 },
+  "set-title": { "file": "src/main.tsx", "startLine": 922, "endLine": 924 },
+  "init-sinks": { "file": "src/main.tsx", "startLine": 931, "endLine": 934 },
+  "plugin-dir-check": { "file": "src/main.tsx", "startLine": 945, "endLine": 946 },
+  "set-inline-plugins": { "file": "src/main.tsx", "startLine": 946, "endLine": 949 },
+  "run-migrations": { "file": "src/main.tsx", "startLine": 950, "endLine": 951 },
+  "remote-settings": { "file": "src/main.tsx", "startLine": 957, "endLine": 958 },
+  "settings-sync": { "file": "src/main.tsx", "startLine": 963, "endLine": 965 },
+  "action-handler": { "file": "src/main.tsx", "startLine": 1006, "endLine": 1007 },
+
+  "action-start": { "file": "src/main.tsx", "startLine": 1006, "endLine": 1016 },
+  "bare-set": { "file": "src/main.tsx", "startLine": 1012, "endLine": 1016 },
+  "set-simple2": { "file": "src/main.tsx", "startLine": 1015, "endLine": 1016 },
+  "prompt-tidy": { "file": "src/main.tsx", "startLine": 1018, "endLine": 1031 },
+  "kairos-check": { "file": "src/main.tsx", "startLine": 1048, "endLine": 1089 },
+  "kairos-on": { "file": "src/main.tsx", "startLine": 1076, "endLine": 1088 },
+  "destructure-opts": { "file": "src/main.tsx", "startLine": 1090, "endLine": 1107 },
+  "wt-validate": { "file": "src/main.tsx", "startLine": 1168, "endLine": 1182 },
+  "wt-error": { "file": "src/main.tsx", "startLine": 1171, "endLine": 1181 },
+  "teammate-opts": { "file": "src/main.tsx", "startLine": 1184, "endLine": 1218 },
+  "session-id-validate": { "file": "src/main.tsx", "startLine": 1276, "endLine": 1302 },
+  "sid-error": { "file": "src/main.tsx", "startLine": 1283, "endLine": 1300 },
+  "file-download": { "file": "src/main.tsx", "startLine": 1304, "endLine": 1331 },
+  "file-error": { "file": "src/main.tsx", "startLine": 1311, "endLine": 1314 },
+  "file-download-promise": { "file": "src/main.tsx", "startLine": 1329, "endLine": 1330 },
+  "fallback-validate": { "file": "src/main.tsx", "startLine": 1336, "endLine": 1340 },
+  "fb-error": { "file": "src/main.tsx", "startLine": 1338, "endLine": 1339 },
+  "sysprompt-opts": { "file": "src/main.tsx", "startLine": 1342, "endLine": 1388 },
+  "sp-error": { "file": "src/main.tsx", "startLine": 1345, "endLine": 1381 },
+  "sp-error-exit": { "file": "src/main.tsx", "startLine": 1346, "endLine": 1380 },
+  "perm-mode": { "file": "src/main.tsx", "startLine": 1389, "endLine": 1411 },
+  "mcp-parse": { "file": "src/main.tsx", "startLine": 1413, "endLine": 1480 },
+  "claudeai-mcp": { "file": "src/main.tsx", "startLine": 1784, "endLine": 1797 },
+  "local-mcp": { "file": "src/main.tsx", "startLine": 1799, "endLine": 1814 },
+  "format-validate": { "file": "src/main.tsx", "startLine": 1818, "endLine": 1859 },
+  "fmt-error": { "file": "src/main.tsx", "startLine": 1818, "endLine": 1858 },
+  "fmt-error-exit": { "file": "src/main.tsx", "startLine": 1821, "endLine": 1858 },
+  "get-input-prompt": { "file": "src/main.tsx", "startLine": 1860, "endLine": 1862 },
+  "load-tools": { "file": "src/main.tsx", "startLine": 1868, "endLine": 1901 },
+  "kick-setup": { "file": "src/main.tsx", "startLine": 1913, "endLine": 1933 },
+  "setup-run": { "file": "src/setup.ts", "startLine": 56, "endLine": 477 },
+  "setup-done": { "file": "src/main.tsx", "startLine": 1934, "endLine": 1936 },
+  "apply-env-print": { "file": "src/main.tsx", "startLine": 1952, "endLine": 1990 },
+  "apply-env-full": { "file": "src/main.tsx", "startLine": 1965, "endLine": 1989 },
+  "await-commands": { "file": "src/main.tsx", "startLine": 2025, "endLine": 2052 },
+  "agent-resolve": { "file": "src/main.tsx", "startLine": 2054, "endLine": 2117 },
+  "next-stage": { "file": "src/main.tsx", "startLine": 2174, "endLine": 2224 },
+
+  "ink-root": { "file": "src/main.tsx", "startLine": 2225, "endLine": 2229 },
+  "create-root": { "file": "src/main.tsx", "startLine": 2226, "endLine": 2229 },
+  "show-screens": { "file": "src/main.tsx", "startLine": 2239, "endLine": 2242 },
+  "trust-rejected": { "file": "src/main.tsx", "startLine": 2308, "endLine": 2315 },
+  "skip-rest": { "file": "src/main.tsx", "startLine": 2312, "endLine": 2315 },
+  "skip-screens": { "file": "src/main.tsx", "startLine": 2325, "endLine": 2336 },
+  "rc-gate": { "file": "src/main.tsx", "startLine": 2246, "endLine": 2255 },
+  "rc-resolve": { "file": "src/main.tsx", "startLine": 2246, "endLine": 2255 },
+  "lsp-init": { "file": "src/main.tsx", "startLine": 2317, "endLine": 2321 },
+  "settings-errors": { "file": "src/main.tsx", "startLine": 2325, "endLine": 2336 },
+  "settings-dialog": { "file": "src/main.tsx", "startLine": 2331, "endLine": 2335 },
+  "startup-prefetch": { "file": "src/main.tsx", "startLine": 2338, "endLine": 2378 },
+  "await-mcp": { "file": "src/main.tsx", "startLine": 2380, "endLine": 2430 },
+  "plugin-init": { "file": "src/main.tsx", "startLine": 2544, "endLine": 2570 },
+  "init-only-check": { "file": "src/main.tsx", "startLine": 2571, "endLine": 2572 },
+  "init-only-path": { "file": "src/main.tsx", "startLine": 2572, "endLine": 2582 },
+  "init-exit": { "file": "src/main.tsx", "startLine": 2580, "endLine": 2581 },
+  "print-check": { "file": "src/main.tsx", "startLine": 2585, "endLine": 2585 },
+  "print-path": { "file": "src/main.tsx", "startLine": 2585, "endLine": 2861 },
+  "print-exit": { "file": "src/main.tsx", "startLine": 2829, "endLine": 2860 },
+  "build-session-config": { "file": "src/main.tsx", "startLine": 3064, "endLine": 3090 },
+  "branch-continue": { "file": "src/main.tsx", "startLine": 3102, "endLine": 3102 },
+  "continue-path": { "file": "src/main.tsx", "startLine": 3102, "endLine": 3155 },
+  "branch-connect": { "file": "src/main.tsx", "startLine": 3156, "endLine": 3156 },
+  "connect-path": { "file": "src/main.tsx", "startLine": 3156, "endLine": 3192 },
+  "branch-ssh": { "file": "src/main.tsx", "startLine": 3193, "endLine": 3193 },
+  "ssh-path": { "file": "src/main.tsx", "startLine": 3193, "endLine": 3257 },
+  "branch-assistant": { "file": "src/main.tsx", "startLine": 3259, "endLine": 3260 },
+  "assistant-path": { "file": "src/main.tsx", "startLine": 3260, "endLine": 3360 },
+  "branch-resume": { "file": "src/main.tsx", "startLine": 3360, "endLine": 3487 },
+  "resume-path": { "file": "src/main.tsx", "startLine": 3487, "endLine": 3733 },
+  "default-path": { "file": "src/main.tsx", "startLine": 3733, "endLine": 3807 },
+  "repl-render": { "file": "src/replLauncher.tsx", "startLine": 14, "endLine": 23 },
+
+  "init-internal": { "file": "src/entrypoints/init.ts", "startLine": 57, "endLine": 238 },
+  "setup-internal": { "file": "src/setup.ts", "startLine": 56, "endLine": 477 },
+  "bypass-sandbox-check": { "file": "src/setup.ts", "startLine": 395, "endLine": 442 },
+  "tengu-started-beacon": { "file": "src/setup.ts", "startLine": 371, "endLine": 378 },
+  "get-system-context": { "file": "src/context.ts", "startLine": 116, "endLine": 154 },
+  "get-user-context": { "file": "src/context.ts", "startLine": 155, "endLine": 190 },
+  "get-git-status": { "file": "src/context.ts", "startLine": 36, "endLine": 115 }
+};
+</script>
+
+<aside id="source-panel"><div id="source-header"></div><div id="monaco-container"></div></aside>
+<script src="../assets/codeindex-runtime.js"></script>
+<script src="../assets/codeindex.js"></script>
+</body>
+</html>

@@ -1,0 +1,279 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Terminal UI Layer (React + Ink)</title>
+<link rel="stylesheet" href="../assets/codeindex.css">
+</head>
+<body>
+<nav class="topnav"><a href="../index.html">← Back to overview</a></nav>
+<h1>Terminal UI Layer (React + Ink)</h1>
+
+<p>Everything the user sees in the terminal—the input box, streaming replies, tool-call cards, permission popups, diff views—is rendered by this layer. It is a single-page application running inside the terminal, built with React + Ink: the user types → the input component updates local state → on submit the user message is appended to the message array → a query is started → streaming events continuously append assistant messages and tool progress → every frame Ink renders the React tree into character art and writes it to stdout. The main axis of the data flow is the "unidirectional flow of the message array": almost every state change eventually lands on the <code>messages</code> array, and the rendering layer is simply a projection of it.</p>
+
+<dl>
+  <dt>Input</dt>
+  <dd>User keyboard input (text, paste, slash commands, vim keys) + streaming events from the query engine (text deltas, tool-call blocks, thinking blocks, progress ticks)</dd>
+  <dt>Output</dt>
+  <dd>A continuously refreshed character interface on the terminal screen: a conversation transcript + an input box at the bottom, interspersed with permission popups, tool-result cards, and spinner animations</dd>
+</dl>
+
+<h2>1. From Keystroke to Submitted Query</h2>
+
+<p>The user types in the bottom <code>PromptInput</code>. The input box maintains its own buffer and cursor state (including a vim-mode state machine). When Enter is pressed, <code>PromptInput</code> invokes the <code>onSubmit</code> passed down from the REPL. <code>onSubmit</code> does not send the request directly; it does a few things first: if it is a slash command marked <code>immediate</code>, it bypasses the queue and executes immediately (e.g. /btw, /config, and other local popup commands); otherwise the input is handed to <code>handlePromptSubmit</code> for unified processing—it expands pasted references, determines whether it is a normal conversation or a slash command, and queues when necessary (when Claude is busy the input is held and submitted after the current turn ends). Finally, for inputs that need to send a request, <code>handlePromptSubmit</code> calls <code>onQuery</code>, which appends the user message to <code>messages</code> and starts the query engine.</p>
+
+<pre class="mermaid">
+graph TD
+  user-types["User types in PromptInput"] --> vim-check{"vim mode?"}
+  vim-check -->|Yes| vim-transition["vim state machine transition&lt;br/&gt;transitions.ts"]
+  vim-check -->|No| text-edit["Edit buffer directly"]
+  vim-transition --> text-edit
+  text-edit --> enter-pressed{"Enter pressed?"}
+  enter-pressed -->|No| local-render["Update input box local rendering"]
+  enter-pressed -->|Yes| on-submit["REPL.onSubmit takes over"]
+  on-submit --> slash-check{"Is it a / command and immediate?"}
+  slash-check -->|Yes| immediate-cmd["Bypass queue and execute immediately&lt;br/&gt;setToolJSX renders popup"]
+  slash-check -->|No| handle-submit["handlePromptSubmit unified entry"]
+  handle-submit --> loading-check{"Claude busy?"}
+  loading-check -->|Yes| enqueue["Input enqueued, waits for turn to end"]
+  loading-check -->|No| build-msg["Build user message + onQuery"]
+  enqueue --> build-msg
+  build-msg --> on-query["onQuery: queryGuard.tryStart"]
+</pre>
+
+<h2>2. Rendering Streaming Replies</h2>
+
+<p>Once the query engine starts returning streaming events, each delta goes through <code>onQueryEvent</code> into <code>handleMessageFromStream</code>. This function translates raw events into mutations on the <code>messages</code> array: a normal delta is appended; a compact boundary message replaces the whole array (keeping a small amount of history for scrollback); a progress tick replaces the previous tick of the same tool in place (so sleep/bash ticks do not bloat the array to tens of thousands of entries per second). <code>setMessages</code> is a special wrapper: it synchronously updates <code>messagesRef</code> (so downstream logic reads the latest value immediately, without waiting for React batching), then hands the computed value to React's real setState. The <code>Messages</code> component receives the new array and uses <code>VirtualMessageList</code> to virtual-scroll and render only the rows in the viewport, then Ink reconciler → yoga layout → paint to the Screen buffer → write to stdout.</p>
+
+<pre class="mermaid">
+graph TD
+  stream-evt["Query engine streaming event"] --> on-query-evt["onQueryEvent"]
+  on-query-evt --> handle-msg["handleMessageFromStream translates event"]
+  handle-msg --> evt-type{"Event type?"}
+  evt-type -->|Normal delta| append-msg["append to messages"]
+  evt-type -->|Compact boundary| replace-msg["Replace entire messages array"]
+  evt-type -->|Progress tick| replace-tick["Replace previous tick in place"]
+  evt-type -->|Tombstone| filter-msg["Filter out retracted message"]
+  append-msg --> set-msg["setMessages wrapper"]
+  replace-msg --> set-msg
+  replace-tick --> set-msg
+  filter-msg --> set-msg
+  set-msg --> sync-ref["Synchronously update messagesRef"]
+  sync-ref --> react-set["rawSetMessages handed to React"]
+  react-set --> messages-comp["Messages component re-renders"]
+  messages-comp --> vml["VirtualMessageList virtual scroll"]
+  vml --> ink-render["Ink reconciler + yoga layout"]
+  ink-render --> paint["Paint to Screen buffer"]
+  paint --> stdout["Write to stdout"]
+</pre>
+
+<h2>3. Tool Permission Popups</h2>
+
+<p>When the model wants to invoke a tool that requires confirmation, the query engine calls <code>canUseTool</code> (provided by <code>useCanUseTool</code>). It first runs <code>hasPermissionsToUseTool</code> to see whether the configuration already allows/denies it; if the result is allow it is let through directly, if deny it is rejected directly. Only when the result is ask does a popup become necessary: first the coordinator auto-check, swarm worker agent, and bash classifier speculative decision (2-second race) are tried; if none of those yield a conclusion, it falls through to <code>handleInteractivePermission</code>, which pushes a <code>ToolUseConfirm</code> into <code>toolUseConfirmQueue</code>. The REPL rendering layer sees the non-empty queue and mounts the <code>PermissionRequest</code> component in the <code>focusedInputDialog === 'tool-permission'</code> branch. After the user chooses, <code>onDone</code> dequeues the front item, resolves the pending Promise, and the query engine continues or aborts.</p>
+
+<pre class="mermaid">
+graph TD
+  tool-call["Model requests tool invocation"] --> can-use-tool["useCanUseTool.canUseTool"]
+  can-use-tool --> perm-check["hasPermissionsToUseTool checks config"]
+  perm-check --> behavior{"Decision behavior?"}
+  behavior -->|allow| allow-tool["Allow directly"]
+  behavior -->|deny| deny-tool["Deny directly"]
+  behavior -->|ask| coord-check["Coordinator auto-check"]
+  coord-check --> coord-ok{"Has conclusion?"}
+  coord-ok -->|Yes| resolve-coord["resolve"]
+  coord-ok -->|No| swarm-check["Swarm worker agent check"]
+  swarm-check --> swarm-ok{"Has conclusion?"}
+  swarm-ok -->|Yes| resolve-swarm["resolve"]
+  swarm-ok -->|No| classifier-race["bash classifier 2s race"]
+  classifier-race --> classifier-ok{"High-confidence hit?"}
+  classifier-ok -->|Yes| allow-classifier["Classifier allows"]
+  classifier-ok -->|No| interactive["handleInteractivePermission"]
+  interactive --> push-queue["Push into toolUseConfirmQueue"]
+  push-queue --> render-perm["REPL renders PermissionRequest popup"]
+  render-perm --> user-choice{"User choice?"}
+  user-choice -->|Allow| on-allow["onAllow + dequeue"]
+  user-choice -->|Deny| on-deny["onReject + dequeue"]
+  user-choice -->|Abort| on-abort["onAbort + abort tool"]
+  on-allow --> resolve["Resolve pending Promise"]
+  on-deny --> resolve
+  on-abort --> resolve
+  allow-tool --> resolve
+  deny-tool --> resolve
+  allow-classifier --> resolve
+  resolve-coord --> resolve
+  resolve-swarm --> resolve
+  resolve --> continue-query["Query engine continues"]
+</pre>
+
+<h2>4. Turn Lifecycle and State Machine</h2>
+
+<p>A turn's loading state is driven by <code>queryGuard</code> (a tiny state machine: idle → running). <code>isLoading</code> is no longer a simple React state; it is derived from the queryGuard external store so that the "currently processing" fact is not delayed by React batching. When <code>onQuery</code> enters, <code>tryStart()</code> atomically flips idle to running and returns a generation number; if it is already running, it rejects and enqueues the input. In the finally block, <code>queryGuard.end(thisGeneration)</code> atomically checks the generation and flips back to idle, then <code>resetLoadingState</code> cleans up temporary state and the <code>onTurnComplete</code> callback notifies the outside. If the user cancels midway with Esc, <code>forceEnd</code> forcibly ends the turn and, when conditions are met, automatically rolls back the user message and restores the input box content.</p>
+
+<pre class="mermaid">
+graph TD
+  submit["User submits"] --> try-start["queryGuard.tryStart atomically flips idle→running"]
+  try-start --> started{"Generation number?"}
+  started -->|null=already running| reject-enqueue["Reject + enqueue input"]
+  started -->|valid| append-msg["Append user message to messages"]
+  append-msg --> run-impl["onQueryImpl executes query"]
+  run-impl --> streaming["Streaming events keep arriving"]
+  streaming --> turn-done{"Turn done?"}
+  turn-done -->|No| streaming
+  turn-done -->|Yes| finally["finally block"]
+  reject-enqueue --> wait-idle["Wait for current turn to become idle"]
+  wait-idle --> dequeue["Dequeue and resubmit"]
+  finally --> guard-end["queryGuard.end checks generation"]
+  guard-end --> gen-ok{"Generation matches?"}
+  gen-ok -->|Yes| reset["resetLoadingState cleanup"]
+  gen-ok -->|No| stale["A newer query took over, exit silently"]
+  reset --> turn-cb["onTurnComplete callback"]
+  turn-cb --> bridge-notify["Notify bridge client that turn ended"]
+  bridge-notify --> idle-state["Back to idle, waiting for next turn"]
+  streaming --> esc-press["User presses Esc"]
+  esc-press --> force-end["queryGuard.forceEnd forcibly ends"]
+  force-end --> auto-restore{"No new query + input empty?"}
+  auto-restore -->|Yes| rewind["Roll back user message + restore input"]
+  auto-restore -->|No| keep["Keep current state"]
+</pre>
+
+<h2>5. Global State and Re-rendering</h2>
+
+<p>Global state lives in a minimal Zustand-style store (<code>createStore</code>, under 35 lines): <code>getState</code>, <code>setState</code>, <code>subscribe</code>. <code>setState</code> uses <code>Object.is</code> to skip no-op changes, then calls <code>onChangeAppState</code> for side effects (syncing the permission mode to CCR, persisting verbose/expandedView to global config, clearing auth cache), and finally notifies all subscribers. Components subscribe to slices via <code>useAppState(selector)</code> and only re-render when the selector's return value changes. This prevents the giant REPL component from re-computing on unrelated field changes. The <code>messages</code> array itself is local React state in REPL (not the global store), but it is synchronously mirrored via <code>messagesRef</code> so closures like <code>onQuery</code> and <code>getToolUseContext</code> can read the latest value immediately.</p>
+
+<pre class="mermaid">
+graph TD
+  set-state["store.setState(updater)"] --> is-same{"Object.is comparison"}
+  is-same -->|Same| skip["Skip, do not notify"]
+  is-same -->|Different| update["Update internal state"]
+  update --> on-change["onChangeAppState side effects"]
+  on-change --> sync-mode["Sync permission mode to CCR/SDK"]
+  on-change --> persist["Persist verbose/expandedView"]
+  on-change --> clear-auth["Clear auth cache"]
+  sync-mode --> notify["Notify all subscribers"]
+  persist --> notify
+  clear-auth --> notify
+  notify --> use-app-state["Components using useAppState(selector)"]
+  use-app-state --> sel-changed{"Selector return value changed?"}
+  sel-changed -->|No| no-rerender["Do not re-render"]
+  sel-changed -->|Yes| rerender["Trigger component re-render"]
+  rerender --> repl-read["REPL reads slices from store"]
+  repl-read --> messages-local["messages is REPL local state"]
+  messages-local --> msg-ref["messagesRef synchronous mirror"]
+  msg-ref --> closures["onQuery/getToolUseContext read latest value"]
+</pre>
+
+<ul>
+  <li><b>setMessages is the source of truth</b>: it first writes <code>messagesRef</code> synchronously, then passes the computed value to React. This bypasses React batching latency—after <code>setMessages</code> in <code>onQuery</code>, reading <code>messagesRef.current</code> immediately returns the freshly appended user message without waiting for commit. Comments explicitly call this the Zustand pattern: the ref is the truth, React state is the projection.</li>
+  <li><b>Progress ticks are replaced in place</b>: sleep/bash emit one tick per second; blindly appending would make the messages array grow to 13k entries and the transcript file 120MB. <code>onQueryEvent</code> detects a tick of the same kind and replaces the last one, and <code>useLogMessages</code> also skips disk writes when the length has not changed.</li>
+  <li><b>Virtual scrolling is the watershed</b>: in transcript mode, when virtual scrolling is enabled (default fullscreen), <code>FullscreenLayout</code> + <code>AlternateScreen</code> wraps the UI and <code>VirtualMessageList</code> only mounts rows inside the viewport; when disabled it falls back to a 30-row cap + native terminal scrollback. Both modes share the same <code>scrollRef</code> and are mutually exclusive, so two ScrollBoxes are never mounted at the same time.</li>
+  <li><b>Immediate commands bypass the queue</b>: slash commands marked <code>immediate: true</code> (/btw, /model, /mcp) execute immediately even while Claude is busy, rendered as a fixed overlay at the bottom rather than content in the scrollback—so they do not get pushed around by the main conversation's streaming refreshes.</li>
+  <li><b>Permission mode sync single throat</b>: <code>onChangeAppState</code> is the only synchronization point for permission mode changes. Previously more than 8 places changed the mode but only 2 notified CCR; now the hook is on the diff, so any path that changes the mode automatically syncs to CCR and the SDK state stream.</li>
+  <li><b>vim is an independent state machine</b>: <code>useVimInput</code> hands keystrokes to <code>transition()</code> in <code>vim/transitions.ts</code>, which decides the next state and action based on the current state (idle/count/operator/find, etc.) and the input—a small independent machine beside the main data-flow axis.</li>
+  <li><b>Rendering pipeline</b>: Ink rendering goes through React reconciler → yoga layout computes dimensions → <code>renderNodeToOutput</code> draws nodes into the <code>Screen</code> character grid → diffs against the previous frame's output and writes the delta to stdout. <code>renderToScreen</code> also provides an isolated rendering entry point for single messages, used by the search feature—rendering one message and scanning character positions takes about 1–3ms.</li>
+</ul>
+
+<script>
+window.__sourceMap = {
+  "user-types": { "file": "src/components/PromptInput/PromptInput.tsx", "startLine": 194, "endLine": 230 },
+  "vim-check": { "file": "src/hooks/useVimInput.ts", "startLine": 34, "endLine": 60 },
+  "vim-transition": { "file": "src/vim/transitions.ts", "startLine": 59, "endLine": 97 },
+  "text-edit": { "file": "src/hooks/useTextInput.ts", "startLine": 73, "endLine": 130 },
+  "enter-pressed": { "file": "src/components/PromptInput/PromptInput.tsx", "startLine": 984, "endLine": 1105 },
+  "local-render": { "file": "src/screens/REPL.tsx", "startLine": 4903, "endLine": 4905 },
+  "on-submit": { "file": "src/screens/REPL.tsx", "startLine": 3142, "endLine": 3160 },
+  "slash-check": { "file": "src/screens/REPL.tsx", "startLine": 3161, "endLine": 3185 },
+  "immediate-cmd": { "file": "src/screens/REPL.tsx", "startLine": 3185, "endLine": 3260 },
+  "handle-submit": { "file": "src/screens/REPL.tsx", "startLine": 3490, "endLine": 3519 },
+  "loading-check": { "file": "src/utils/handlePromptSubmit.ts", "startLine": 1, "endLine": 1 },
+  "enqueue": { "file": "src/hooks/useCommandQueue.ts", "startLine": 1, "endLine": 1 },
+  "build-msg": { "file": "src/screens/REPL.tsx", "startLine": 3490, "endLine": 3519 },
+  "on-query": { "file": "src/screens/REPL.tsx", "startLine": 2855, "endLine": 2886 },
+  "stream-evt": { "file": "src/screens/REPL.tsx", "startLine": 2584, "endLine": 2584 },
+  "on-query-evt": { "file": "src/screens/REPL.tsx", "startLine": 2584, "endLine": 2660 },
+  "handle-msg": { "file": "src/utils/messages.ts", "startLine": 1, "endLine": 1 },
+  "evt-type": { "file": "src/screens/REPL.tsx", "startLine": 2586, "endLine": 2630 },
+  "append-msg": { "file": "src/screens/REPL.tsx", "startLine": 2628, "endLine": 2630 },
+  "replace-msg": { "file": "src/screens/REPL.tsx", "startLine": 2586, "endLine": 2603 },
+  "replace-tick": { "file": "src/screens/REPL.tsx", "startLine": 2608, "endLine": 2627 },
+  "filter-msg": { "file": "src/screens/REPL.tsx", "startLine": 2646, "endLine": 2649 },
+  "set-msg": { "file": "src/screens/REPL.tsx", "startLine": 1198, "endLine": 1222 },
+  "sync-ref": { "file": "src/screens/REPL.tsx", "startLine": 1198, "endLine": 1201 },
+  "react-set": { "file": "src/screens/REPL.tsx", "startLine": 1221, "endLine": 1221 },
+  "messages-comp": { "file": "src/components/Messages.tsx", "startLine": 341, "endLine": 740 },
+  "vml": { "file": "src/components/Messages.tsx", "startLine": 700, "endLine": 700 },
+  "ink-render": { "file": "src/ink/reconciler.ts", "startLine": 1, "endLine": 50 },
+  "paint": { "file": "src/ink/render-node-to-output.ts", "startLine": 1, "endLine": 1 },
+  "stdout": { "file": "src/ink/render-to-screen.ts", "startLine": 59, "endLine": 130 },
+  "tool-call": { "file": "src/hooks/useCanUseTool.tsx", "startLine": 28, "endLine": 36 },
+  "can-use-tool": { "file": "src/hooks/useCanUseTool.tsx", "startLine": 32, "endLine": 37 },
+  "perm-check": { "file": "src/hooks/useCanUseTool.tsx", "startLine": 37, "endLine": 37 },
+  "behavior": { "file": "src/hooks/useCanUseTool.tsx", "startLine": 38, "endLine": 64 },
+  "allow-tool": { "file": "src/hooks/useCanUseTool.tsx", "startLine": 39, "endLine": 53 },
+  "deny-tool": { "file": "src/hooks/useCanUseTool.tsx", "startLine": 65, "endLine": 92 },
+  "coord-check": { "file": "src/hooks/useCanUseTool.tsx", "startLine": 95, "endLine": 109 },
+  "coord-ok": { "file": "src/hooks/useCanUseTool.tsx", "startLine": 105, "endLine": 108 },
+  "resolve-coord": { "file": "src/hooks/useCanUseTool.tsx", "startLine": 106, "endLine": 107 },
+  "swarm-check": { "file": "src/hooks/useCanUseTool.tsx", "startLine": 113, "endLine": 125 },
+  "swarm-ok": { "file": "src/hooks/useCanUseTool.tsx", "startLine": 122, "endLine": 124 },
+  "resolve-swarm": { "file": "src/hooks/useCanUseTool.tsx", "startLine": 123, "endLine": 124 },
+  "classifier-race": { "file": "src/hooks/useCanUseTool.tsx", "startLine": 126, "endLine": 159 },
+  "classifier-ok": { "file": "src/hooks/useCanUseTool.tsx", "startLine": 135, "endLine": 157 },
+  "allow-classifier": { "file": "src/hooks/useCanUseTool.tsx", "startLine": 136, "endLine": 156 },
+  "interactive": { "file": "src/hooks/useCanUseTool.tsx", "startLine": 160, "endLine": 168 },
+  "push-queue": { "file": "src/screens/REPL.tsx", "startLine": 1101, "endLine": 1101 },
+  "render-perm": { "file": "src/screens/REPL.tsx", "startLine": 4519, "endLine": 4519 },
+  "user-choice": { "file": "src/components/permissions/PermissionRequest.tsx", "startLine": 146, "endLine": 217 },
+  "on-allow": { "file": "src/screens/REPL.tsx", "startLine": 4519, "endLine": 4519 },
+  "on-deny": { "file": "src/screens/REPL.tsx", "startLine": 4519, "endLine": 4519 },
+  "on-abort": { "file": "src/screens/REPL.tsx", "startLine": 2139, "endLine": 2140 },
+  "resolve": { "file": "src/hooks/useCanUseTool.tsx", "startLine": 50, "endLine": 53 },
+  "continue-query": { "file": "src/hooks/useCanUseTool.tsx", "startLine": 32, "endLine": 37 },
+  "submit": { "file": "src/screens/REPL.tsx", "startLine": 3142, "endLine": 3151 },
+  "try-start": { "file": "src/screens/REPL.tsx", "startLine": 2869, "endLine": 2869 },
+  "started": { "file": "src/screens/REPL.tsx", "startLine": 2870, "endLine": 2870 },
+  "reject-enqueue": { "file": "src/screens/REPL.tsx", "startLine": 2876, "endLine": 2884 },
+  "append-msg": { "file": "src/screens/REPL.tsx", "startLine": 2891, "endLine": 2891 },
+  "run-impl": { "file": "src/screens/REPL.tsx", "startLine": 2918, "endLine": 2918 },
+  "streaming": { "file": "src/screens/REPL.tsx", "startLine": 2584, "endLine": 2660 },
+  "turn-done": { "file": "src/screens/REPL.tsx", "startLine": 2919, "endLine": 2919 },
+  "finally": { "file": "src/screens/REPL.tsx", "startLine": 2919, "endLine": 3023 },
+  "wait-idle": { "file": "src/screens/REPL.tsx", "startLine": 2870, "endLine": 2885 },
+  "dequeue": { "file": "src/hooks/useCommandQueue.ts", "startLine": 1, "endLine": 1 },
+  "guard-end": { "file": "src/screens/REPL.tsx", "startLine": 2923, "endLine": 2923 },
+  "gen-ok": { "file": "src/screens/REPL.tsx", "startLine": 2923, "endLine": 2923 },
+  "reset": { "file": "src/screens/REPL.tsx", "startLine": 1567, "endLine": 1572 },
+  "stale": { "file": "src/screens/REPL.tsx", "startLine": 2922, "endLine": 2922 },
+  "turn-cb": { "file": "src/screens/REPL.tsx", "startLine": 2930, "endLine": 2930 },
+  "bridge-notify": { "file": "src/screens/REPL.tsx", "startLine": 2934, "endLine": 2934 },
+  "idle-state": { "file": "src/screens/REPL.tsx", "startLine": 2993, "endLine": 2993 },
+  "esc-press": { "file": "src/screens/REPL.tsx", "startLine": 2118, "endLine": 2118 },
+  "force-end": { "file": "src/screens/REPL.tsx", "startLine": 2118, "endLine": 2118 },
+  "auto-restore": { "file": "src/screens/REPL.tsx", "startLine": 3010, "endLine": 3010 },
+  "rewind": { "file": "src/screens/REPL.tsx", "startLine": 3012, "endLine": 3020 },
+  "keep": { "file": "src/screens/REPL.tsx", "startLine": 3010, "endLine": 3010 },
+  "set-state": { "file": "src/state/store.ts", "startLine": 20, "endLine": 27 },
+  "is-same": { "file": "src/state/store.ts", "startLine": 23, "endLine": 23 },
+  "skip": { "file": "src/state/store.ts", "startLine": 23, "endLine": 23 },
+  "update": { "file": "src/state/store.ts", "startLine": 24, "endLine": 24 },
+  "on-change": { "file": "src/state/store.ts", "startLine": 25, "endLine": 25 },
+  "sync-mode": { "file": "src/state/onChangeAppState.ts", "startLine": 65, "endLine": 92 },
+  "persist": { "file": "src/state/onChangeAppState.ts", "startLine": 114, "endLine": 152 },
+  "clear-auth": { "file": "src/state/onChangeAppState.ts", "startLine": 156, "endLine": 170 },
+  "notify": { "file": "src/state/store.ts", "startLine": 26, "endLine": 26 },
+  "use-app-state": { "file": "src/state/AppState.tsx", "startLine": 1, "endLine": 200 },
+  "sel-changed": { "file": "src/state/AppState.tsx", "startLine": 1, "endLine": 200 },
+  "no-rerender": { "file": "src/state/AppState.tsx", "startLine": 1, "endLine": 200 },
+  "rerender": { "file": "src/state/AppState.tsx", "startLine": 1, "endLine": 200 },
+  "repl-read": { "file": "src/screens/REPL.tsx", "startLine": 618, "endLine": 640 },
+  "messages-local": { "file": "src/screens/REPL.tsx", "startLine": 1198, "endLine": 1222 },
+  "msg-ref": { "file": "src/screens/REPL.tsx", "startLine": 1198, "endLine": 1201 },
+  "closures": { "file": "src/screens/REPL.tsx", "startLine": 2906, "endLine": 2906 }
+};
+</script>
+
+<aside id="source-panel"><div id="source-header"></div><div id="monaco-container"></div></aside>
+<script src="../assets/codeindex-runtime.js"></script>
+<script src="../assets/codeindex.js"></script>
+</body>
+</html>

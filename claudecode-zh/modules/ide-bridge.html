@@ -1,0 +1,418 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>IDE Bridge（IDE 集成）</title>
+<link rel="stylesheet" href="../assets/codeindex.css">
+</head>
+<body>
+<nav class="topnav"><a href="../index.html">← 返回总览</a></nav>
+<h1>IDE Bridge（IDE 集成）</h1>
+
+<p>当用户在 VS Code 或 JetBrains 里装了 Claude Code 扩展后，扩展需要连上本地的 CLI 后端来真正干活。这个模块就是 CLI 以 "bridge 模式" 启动后的整套通信骨架：它让 CLI 变成一个长驻进程，和 IDE 之间通过 WebSocket 建立双向通道，用 JWT 做鉴权，把 IDE 里点的各种操作（改文件、看 diff、权限确认、发起会话）路由到 CLI 核心，再把结果回流给 IDE 展示。</p>
+
+<p>从用户视角看：你在 IDE 里打开 Claude Code 面板、敲一句话、点一个"应用编辑"按钮——这些动作并不是 IDE 扩展自己执行的，而是通过这条 bridge 通道递交给本地 CLI，CLI 跑完再把改动、diff、待确认权限推回 IDE。本模块讲的就是这条通道怎么建立、怎么鉴权、消息怎么来回跑、会话怎么跑起来又怎么收尾。</p>
+
+<dl>
+  <dt>输入</dt>
+  <dd>IDE 扩展发起的连接请求（含 JWT token）+ 后续一系列操作指令（发起会话、发送用户消息、确认/拒绝权限、查看 diff 等）</dd>
+  <dt>输出</dt>
+  <dd>一个持久双向通道：IDE 提交的每个动作都被 CLI 执行，结果（流式文本、文件改动、权限询问、错误）实时回流到 IDE 面板</dd>
+</dl>
+
+<h2>一、Bridge 模式启动：从敲下命令到通道就绪</h2>
+
+<p>用户在终端敲 <code>claude remote-control</code>（或在 IDE 扩展里点"连接 Remote Control"），CLI 不进交互式 REPL，而是走 <code>bridgeMain</code> 这条分支。它要做的事可以拆成几步：先确认你这台机器有资格跑 bridge（已登录、工作区已信任、多会话灰度放行），再向服务端注册一个"环境（environment）"，拿到一对 environmentId + secret，然后进入一个长轮询循环，等服务端把"工作项（work item）"派下来。</p>
+
+<p>注意 <code>BRIDGE_MODE</code> 是个 feature flag（GrowthBook 灰度），关掉时整个 bridge 命令直接退出，连注册都不做——所以这套能力是按账号/灰度逐步开放的。</p>
+
+<pre class="mermaid">
+graph TD
+  start["用户执行 remote-control"] --> parseArgs["解析参数&lt;br/&gt;--spawn/--capacity/--session-id 等"]
+  parseArgs --> checkGate{"BRIDGE_MODE +&lt;br/&gt;多会话灰度放行?"}
+  checkGate -->|否| denyExit["打印未开放/参数错误&lt;br/&gt;退出"]
+  checkGate -->|是| checkTrust{"工作区已信任?"}
+  checkTrust -->|否| trustFail["提示先跑 claude 接受信任对话&lt;br/&gt;退出"]
+  checkTrust -->|是| checkOAuth{"有 OAuth token?"}
+  checkOAuth -->|否| loginFail["提示 /login&lt;br/&gt;退出"]
+  checkOAuth -->|是| remoteDialog{"首次见到&lt;br/&gt;Remote Control?"}
+  remoteDialog -->|是| askConsent["终端问询&lt;br/&gt;是否启用"]
+  askConsent -->|拒绝| exit0["退出"]
+  askConsent -->|同意| saveSeen["记下 remoteDialogSeen"]
+  remoteDialog -->|否| resolveSpawn["确定 spawn 模式&lt;br/&gt;(resume &gt; flag &gt; 项目配置 &gt; 默认)"]
+  saveSeen --> resolveSpawn
+  resolveSpawn --> register["POST /v1/environments/bridge&lt;br/&gt;注册环境拿 envId+secret"]
+  register --> registerFail{"注册失败?"}
+  registerFail -->|是| regErrExit["打印错误&lt;br/&gt;退出"]
+  registerFail -->|否| preCreate["可选: 预创建一个空会话&lt;br/&gt;让用户立刻有地方输入"]
+  preCreate --> enterLoop["进入 runBridgeLoop 轮询"]
+</pre>
+
+<ul>
+  <li>BRIDGE_MODE 是总开关；多会话（--spawn/--capacity）另有一个 <code>tengu_ccr_bridge_multi_session</code> 灰度，没放行却用了这些参数会直接退出。</li>
+  <li>信任检查（checkHasTrustDialogAccepted）是因为 bridge 绕过了主 init 流程，没人替它弹信任对话框，所以只能要求用户之前正常跑过一次 <code>claude</code>。</li>
+  <li>预创建会话（createBridgeSession）是非阻塞的——失败也不挡启动，只是用户得等服务端派下来第一条 work 才能开始。</li>
+</ul>
+
+<h2>二、鉴权：两套 token，各管一段</h2>
+
+<p>这是这个模块最容易绕晕的地方，但它有清晰分层。Bridge 一共涉及两种凭证：</p>
+
+<ul>
+  <li><b>OAuth 访问令牌</b>：你 <code>/login</code> 拿到的那个，用于 bridge 自己直接调服务端管理类接口（注册环境、轮询 work、停 work、归档会话、注销环境）。这套走 <code>withOAuthRetry</code>：遇 401 先尝试刷新一次 OAuth，刷新成功就重试一次请求，再 401 才当致命错误。</li>
+  <li><b>会话 ingress JWT</b>（<code>session_ingress_token</code>）：服务端在派发每个 work item 时，把一个短寿命 JWT 塞进 work secret（base64url 编码的 JSON）一起发下来。这个 JWT 才是用来在 <i>会话通信通道</i>（WebSocket / SSE 读流 + POST 写流）上证明"我是这个会话的合法 worker"的。它会过期（约 5 小时），过期后服务端重新派发一次 work，bridge 拿到新 JWT 重连。</li>
+</ul>
+
+<p>另外还有一层 <b>可信设备令牌（trusted device token）</b>：当 <code>tengu_sessions_elevated_auth_enforcement</code> 灰度开着，bridge 调注册接口时会在 <code>X-Trusted-Device-Token</code> 头里带上它，服务端借此要求"高权限会话必须来自已登记的可信设备"。这个 token 在 <code>/login</code> 时通过 <code>POST /auth/trusted_devices</code> 登记，存在系统钥匙串，90 天滚动有效。</p>
+
+<pre class="mermaid">
+graph TD
+  login["/login 登录"] --> enrollDevice["POST /auth/trusted_devices&lt;br/&gt;登记可信设备 → 钥匙串"]
+  login --> oauthToken["拿到 OAuth access token&lt;br/&gt;(~8h 有效)"]
+  oauthToken --> bridgeApi["bridge 自己调管理接口&lt;br/&gt;注册/轮询/停 work/归档"]
+  bridgeApi --> on401{"401?"}
+  on401 -->|是| refresh["handleOAuth401Error&lt;br/&gt;刷新 OAuth"]
+  refresh --> refreshOk{"刷新成功?"}
+  refreshOk -->|是| retryOnce["用新 token 重试一次"]
+  refreshOk -->|否| fatalAuth["抛 BridgeFatalError&lt;br/&gt;致命退出"]
+  on401 -->|否| ok["正常返回"]
+
+  server["服务端派发 work item"] --> workSecret["work.secret&lt;br/&gt;base64url JSON"]
+  workSecret --> decode["decodeWorkSecret"]
+  decode --> jwt["取出 session_ingress_token&lt;br/&gt;(JWT, ~5h)"]
+  jwt --> ackHeartbeat["ack/heartbeat 用 JWT&lt;br/&gt;证明持有本会话"]
+  jwt --> childSpawn["随 spawn 传给子 CLI&lt;br/&gt;作通信通道凭证"]
+  jwt --> refreshJwt["createTokenRefreshScheduler&lt;br/&gt;到期前 5min 主动刷新"]
+  refreshJwt --> jwtExpired{"到期?"}
+  jwtExpired -->|v2| reconnect["reconnectSession 触发&lt;br/&gt;服务端重派 work"]
+  jwtExpired -->|v1| pushOauth["把新 OAuth 推给子进程&lt;br/&gt;(stdin update_env_var)"]
+  reconnect --> server
+</pre>
+
+<ul>
+  <li>JWT 不验签，只 base64url 解 payload 读 <code>exp</code> 来排刷新定时器（jwtUtils.ts: decodeJwtExpiry）。验签是服务端的事。</li>
+  <li>v1（Session-Ingress）通道可以吃 OAuth 也可以吃 JWT，bridge 偏好 OAuth 因为有标准刷新流程；v2（CCR /worker/*）必须吃 JWT，因为 register_worker 校验 JWT 里的 session_id claim，OAuth 没有。</li>
+  <li>遇到 401/403（且不是可抑制的 cosmetic 403）bridge 直接致命退出，不重试——认证不会自己好。404/410 当作环境/会话已过期。</li>
+  <li>URL 安全校验：非 localhost 的 base URL 必须是 HTTPS，防凭证明文外泄。</li>
+</ul>
+
+<h2>三、消息双向流：IDE 点的按钮怎么到 CLI，CLI 的输出怎么回 IDE</h2>
+
+<p>这是这个模块的核心。整个通道其实不是 IDE 直连 CLI，而是双方都连服务端中转：</p>
+
+<p><b>上行（CLI → 服务端 → IDE）</b>：子 CLI 进程以 <code>--print --output-format stream-json</code> 跑，每产生一条 NDJSON 行（assistant 文本、tool_use、result 等），bridge 父进程读它的 stdout，解析出活动摘要（"Editing src/foo.ts"）更新状态行；同时这些 SDK 消息通过 transport 的 <code>writeBatch</code> POST 到 session-ingress，服务端再分发给订阅了该会话的 IDE/Web 客户端。</p>
+
+<p><b>下行（IDE → 服务端 → CLI）</b>：用户在 IDE 里敲一句话、点"应用编辑"、批准一个权限——这些动作被 IDE 扩展发到服务端，服务端把"有活干"封装成一个 work item 投到这个 environment 的队列。bridge 的轮询循环 <code>pollForWork</code> 拉到 work，解码出 JWT，ack 确认，然后连上 ingress 通道（v1 WebSocket 或 v2 SSE）。之后服务端通过这条通道把 user 消息、control_request（interrupt、set_model、can_use_tool 权限询问）推下来，bridge 转发给子进程或本地权限回调处理。</p>
+
+<pre class="mermaid">
+graph TD
+  ide["IDE 扩展&lt;br/&gt;(VS Code/JetBrains)"] -->|"用户敲字/点按钮"| server["服务端&lt;br/&gt;(environments API)"]
+  server -->|"work item 入队"| poll["bridge: pollForWork 轮询"]
+  poll --> decode["decodeWorkSecret 拿 JWT"]
+  decode --> ack["acknowledgeWork 确认"]
+  ack --> connect["连 ingress 通道&lt;br/&gt;v1=HybridTransport(WS+POST)&lt;br/&gt;v2=SSETransport+CCRClient"]
+  connect --> pushDown["服务端推下行消息&lt;br/&gt;user 消息/control_request"]
+  pushDown --> route["handleIngressMessage 路由"]
+  route --> isCtrl{"control_request?"}
+  isCtrl -->|是| ctrlReq["handleServerControlRequest&lt;br/&gt;initialize/set_model/interrupt/&lt;br/&gt;set_permission_mode"]
+  isCtrl -->|否| isPermResp{"control_response?"}
+  isPermResp -->|是| permResp["onPermissionResponse&lt;br/&gt;权限答复分发"]
+  isPermResp -->|否| isUser{"user 消息?"}
+  isUser -->|是| inbound["onInboundMessage&lt;br/&gt;+ 解析附件 file_uuid"]
+  isUser -->|否| drop["忽略&lt;br/&gt;(echo/重投/非 user)"]
+  inbound --> childStdin["写入子进程 stdin&lt;br/&gt;--input-format stream-json"]
+  ctrlReq --> childStdin
+  permResp --> childStdin
+
+  childCli["子 CLI 进程&lt;br/&gt;(claude --print --sdk-url ...)"] -->|"stdout NDJSON"| parse["sessionRunner 解析行"]
+  parse --> activity["更新活动摘要&lt;br/&gt;状态行显示"]
+  parse --> ctrlReqOut["检测 control_request&lt;br/&gt;(can_use_tool 权限询问)"]
+  parse --> sdkMsg["提取 SDK 消息"]
+  ctrlReqOut --> forwardPerm["转发给服务端&lt;br/&gt;→ IDE 弹权限框"]
+  forwardPerm --> permResp
+  sdkMsg --> writeBatch["transport.writeBatch&lt;br/&gt;POST 到 ingress"]
+  writeBatch --> server
+  server --> ide
+</pre>
+
+<ul>
+  <li>echo 去重很关键：bridge 自己 POST 上去的消息，服务端会回推过来。<code>BoundedUUIDSet</code>（环形缓冲，容量 2000）记最近发过的 UUID，回推的当 echo 丢掉。</li>
+  <li>重投去重：服务端在传输切换/序列号协商失败时会重投历史 prompt，<code>recentInboundUUIDs</code> 兜底过滤。</li>
+  <li>权限是个双向环：子 CLI 想用某工具 → 发 control_request(can_use_tool) → bridge 转发给服务端 → IDE 弹框 → 用户选择 → control_response 回来 → bridge 转回子 CLI stdin。</li>
+  <li>附件处理：Web 端上传文件拿到 file_uuid，随消息发下来；bridge 用 OAuth 调 <code>/api/oauth/files/{uuid}/content</code> 下载，写到 <code>~/.claude/uploads/{sessionId}/</code>，把 <code>@"path"</code> 前缀拼到消息内容前，子 CLI 的 Read 工具就能读到。</li>
+  <li>v1/v2 选择是服务端按会话决定的（work secret 里 <code>use_code_sessions</code>），不是 bridge 自己选；<code>CLAUDE_BRIDGE_USE_CCR_V2</code> 是 ant 内部强制开关。</li>
+</ul>
+
+<h2>四、连接断了 / 会话过期 / 系统休眠：恢复路径</h2>
+
+<p>长连接难免会断。这个模块的恢复策略分几层，关键是不丢用户消息、不无限重试、能区分"短暂网络抖动"和"环境已死"。</p>
+
+<pre class="mermaid">
+graph TD
+  pollErr["轮询 pollForWork 抛错"] --> isAborted{"signal 已 abort?"}
+  isAborted -->|是| break["退出循环"]
+  isAborted -->|否| isFatal{"BridgeFatalError?"}
+  isFatal -->|是| classifyFatal{"401/403 认证?"}
+  classifyFatal -->|是| fatalExit["致命退出&lt;br/&gt;不重试"]
+  classifyFatal -->|404/410 过期| fatalExit
+  isFatal -->|否| isConn{"连接错误?&lt;br/&gt;(ECONNRESET/ETIMEDOUT...)"} 
+  isConn -->|是| sleepDetect{"间隔远大于&lt;br/&gt;最大退避?&lt;br/&gt;(系统休眠)"}
+  sleepDetect -->|是| resetBudget["重置错误预算&lt;br/&gt;fresh 重试"]
+  sleepDetect -->|否| connBackoff["指数退避 2s→120s&lt;br/&gt;最多 10min 放弃"]
+  connBackoff --> heartbeatDuring["退避期间仍心跳&lt;br/&gt;保 300s 租约"]
+  isConn -->|否| generalBackoff["通用错误退避&lt;br/&gt;最多 10min 放弃"]
+  connBackoff --> reconnectedOk{"恢复?"}
+  reconnectedOk -->|是| logReconnect["打印 Reconnected"]
+  reconnectedOk -->|否| giveUp["超 10min 放弃&lt;br/&gt;致命退出"]
+
+  wsClose["ingress 通道 onClose"] --> closeCode{"关闭码"}
+  closeCode -->|正常 1000| teardown["走 teardown"]
+  closeCode -->|异常| wakePoll["唤醒轮询循环&lt;br/&gt;快速重拉 work"]
+  wakePoll --> freshWork["服务端重派 work&lt;br/&gt;带新 JWT"]
+  freshWork --> reconnect["onWorkReceived&lt;br/&gt;用新 token 重连通道"]
+
+  env404["poll 返回 404&lt;br/&gt;(环境被删)"] --> envLost["onEnvironmentLost"]
+  envLost --> strategy1{"策略1:&lt;br/&gt;同 envId 重注册&lt;br/&gt;+ reconnectSession"}
+  strategy1 -->|成功| sameSession["保留原会话&lt;br/&gt;URL 仍有效"]
+  strategy1 -->|失败| strategy2["策略2:&lt;br/&gt;归档旧会话&lt;br/&gt;新 env 上建新会话"]
+  strategy2 --> freshSession["currentSessionId 更新&lt;br/&gt;重置序列号/去重集"]
+  strategy2 --> retryLimit{"重建超 3 次?"}
+  retryLimit -->|是| failed["状态 → failed&lt;br/&gt;触发 onFatalError"]
+  retryLimit -->|否| continue["继续轮询"]
+</pre>
+
+<ul>
+  <li>系统休眠检测：如果两次轮询错误的间隔远大于最大退避上限（默认 240s），判定机器睡了，重置错误预算，否则醒来会立刻因"已超 10min"被放弃。</li>
+  <li>心跳保租约：work item 有 300s 租约 TTL，即使通道在退避重连，<code>heartbeatActiveWorkItems</code> 也会继续打 heartbeat，防止租约到期被服务端回收。</li>
+  <li>JWT 过期 → 心跳会收到 401/403 → bridge 不当作致命错误，而是调 <code>reconnectSession</code> 让服务端把这条 work 重新入队，下一轮 poll 拿到带新 JWT 的同一条 work，<code>onWorkReceived</code> 用新 token 重连通道（existingHandle 路径）。</li>
+  <li>环境重建有 3 次上限，防止死循环；成功后重置计数，所以几小时后另一次失败不会因为历史累计而被误杀。</li>
+  <li>perpetual 模式（daemon）teardown 是"本地退、服务端留"——不归档、不停 work，靠服务端 300s 租约自然回 pending，下次启动读指针 <code>reconnectSession</code> 接上。</li>
+</ul>
+
+<h2>五、会话生命周期：从派发到收尾</h2>
+
+<p>一个会话从被派发到结束，bridge 要管它的目录、超时、标题、worktree 清理、向服务端报停。这是 Lifecycle 视角的补充。</p>
+
+<pre class="mermaid">
+graph TD
+  workReceived["work item 到达&lt;br/&gt;type=session"] --> existing{"该 sessionId&lt;br/&gt;已在跑?"}
+  existing -->|是| updateToken["更新 ingress token&lt;br/&gt;重排刷新定时器&lt;br/&gt;子进程 stdin 推新 token"]
+  existing -->|否| atCap{"已达容量上限?"}
+  atCap -->|是| skipSpawn["不派生&lt;br/&gt;等容量"]
+  atCap -->|否| spawn["safeSpawn 启子 CLI&lt;br/&gt;--print --sdk-url ..."]
+  spawn --> spawnFail{"spawn 抛错?"}
+  spawnFail -->|是| stopWorkFail["stopWork 报停&lt;br/&gt;清理 worktree"]
+  spawnFail -->|否| register["记入 activeSessions&lt;br/&gt;设开始时间/超时/刷新定时器"]
+  register --> timeout["设 24h 超时看门狗"]
+  register --> title["异步拉会话标题&lt;br/&gt;首条用户消息时推导标题"]
+  register --> status["开始状态行实时刷新&lt;br/&gt;(工具轨迹/耗时)"]
+  status --> running["会话运行中"]
+  running -->|"子进程 close"| done["onSessionDone"]
+  done --> status2{"退出状态"}
+  status2 -->|completed| logComplete["打印完成"]
+  status2 -->|failed| logFail["打印失败&lt;br/&gt;(非关停导致)"]
+  status2 -->|interrupted| skipLog["跳过报停&lt;br/&gt;(服务端发起或关停)"]
+  logComplete --> stopWork["stopWorkWithRetry 报停"]
+  logFail --> stopWork
+  stopWork --> worktree["清理 worktree&lt;br/&gt;(worktree 模式)"]
+  worktree --> mode{"spawn 模式?"}
+  mode -->|single-session| archiveExit["归档会话&lt;br/&gt;abort 循环 → 退出"]
+  mode -->|多会话| archiveIdle["归档会话&lt;br/&gt;回到 idle 接新 work"]
+</pre>
+
+<ul>
+  <li>spawn 模式三选一：<code>single-session</code>（一条会话跑完即退）、<code>same-dir</code>（多会话共享 cwd）、<code>worktree</code>（每会话独立 git worktree，互不踩文件）。运行中按 <code>w</code> 可在 same-dir/worktree 间切。</li>
+  <li>标题策略：服务端设过名（--name/Web 改名）优先；否则等首条真实用户消息，deriveSessionTitle 截 80 字符，PATCH 回服务端，让 IDE 列表里能显示。</li>
+  <li>24h 超时看门狗：到点 SIGKILL 子进程，标记 timedOut，onSessionDone 据此把 interrupted 改记为 failed，照常报停+清理。</li>
+  <li>优雅关停顺序：SIGTERM → 等 30s 宽限 → 仍不死就 SIGKILL → 停所有 work → 清 worktree → 归档会话 → 注销环境 → 清崩溃指针。single-session 且非致命退出时，故意留会话和环境活着，打印 <code>claude remote-control --continue</code> 让用户能恢复。</li>
+  <li>崩溃恢复指针（bridgePointer）：spawn 后立刻写到 <code>.claude/bridge_pointer</code>，每小时刷新 mtime；正常 teardown 清掉，崩溃则留下，下次 <code>--continue</code> 读它恢复。</li>
+</ul>
+
+<h2>六、REPL bridge：交互式会话里的另一种接法</h2>
+
+<p>上面讲的是 <code>claude remote-control</code> 独立进程模式。还有一种形态：用户已经在跑正常交互式 <code>claude</code> REPL，又想顺手从 Web/手机控制同一条会话——这时走 <code>initReplBridge</code> / <code>initBridgeCore</code>。它和独立模式共用 bridgeApi、workSecret、bridgeMessaging、jwtUtils，但区别是：transport 在本进程内（HybridTransport/SSETransport），不 spawn 子进程；环境/会话生命周期和 REPL 进程绑定；多了一套环境丢失后原地重建（reconnect-in-place）逻辑。</p>
+
+<pre class="mermaid">
+graph TD
+  replStart["REPL 启动 / /remote-control"] --> initRepl["initReplBridge"]
+  initRepl --> gateCheck{"BRIDGE_MODE + OAuth +&lt;br/&gt;组织策略放行?"}
+  gateCheck -->|否| skip["静默跳过"]
+  gateCheck -->|是| registerEnv["注册环境"]
+  registerEnv --> createSess["创建/恢复会话&lt;br/&gt;写崩溃指针"]
+  createSess --> startPoll["启动 startWorkPollLoop"]
+  startPoll --> pollWait["轮询等 work"]
+  pollWait --> workArrived["work 到达"]
+  workArrived --> sameSess{"workSessionId&lt;br/&gt;匹配当前会话?"}
+  sameSess -->|否| rejectForeign["拒绝外来会话"]
+  sameSess -->|是| closeOld["关旧 transport&lt;br/&gt;带过 SSE 序列号"]
+  closeOld --> pickV{"v1 还是 v2?"}
+  pickV -->|v1| hybrid["HybridTransport&lt;br/&gt;WS 读 + POST 写&lt;br/&gt;用 OAuth"]
+  pickV -->|v2| sse["createV2ReplTransport&lt;br/&gt;SSE 读 + CCRClient 写&lt;br/&gt;用 JWT, registerWorker"]
+  hybrid --> wire["wireTransport&lt;br/&gt;挂 onConnect/onData/onClose"]
+  sse --> wire
+  wire --> flush["onConnect: 首次刷历史消息&lt;br/&gt;cap 200 条"]
+  flush --> ready["onStateChange connected&lt;br/&gt;通道就绪"]
+  ready --> twoWay["双向消息流&lt;br/&gt;(同图三)"]
+  twoWay --> envLost2{"poll 404?"}
+  envLost2 -->|是| reconnect["doReconnect&lt;br/&gt;策略1原地 / 策略2新建"]
+  reconnect --> startPoll
+  twoWay --> teardown2["teardown: 发 result → stopWork → 归档 → 注销"]
+</pre>
+
+<ul>
+  <li>SSE 序列号携带（<code>lastTransportSequenceNum</code>）是关键细节：换 transport 时把旧的高水位带上，新 SSE 首次连接发 <code>from_sequence_num</code>，否则服务端会把整段会话历史从 0 重放一遍——每条历史 prompt 都当新消息再砸一遍。</li>
+  <li>初始历史刷写有 flushGate：刷历史期间新消息排队，避免和历史的 POST 交错到达服务端导致顺序乱。</li>
+  <li>perpetual 模式（daemon）teardown 不发 result、不停 work、不关 transport——本地退、服务端留，靠 300s 租约回 pending，下次 <code>--continue</code> 读指针 <code>reconnectSession</code> 接上。</li>
+  <li>outbound-only 模式：只 POST 上行、不收下行 control_request，对 mutable 请求（interrupt/set_model）回错——用于"我只许你看我本地跑的结果，不许从外面操控我"的场景。</li>
+</ul>
+
+<script>
+window.__sourceMap = {
+  "start": { "file": "src/bridge/bridgeMain.ts", "startLine": 1980, "endLine": 2035 },
+  "parseArgs": { "file": "src/bridge/bridgeMain.ts", "startLine": 1737, "endLine": 1887 },
+  "checkGate": { "file": "src/bridge/bridgeMain.ts", "startLine": 2050, "endLine": 2076 },
+  "denyExit": { "file": "src/bridge/bridgeMain.ts", "startLine": 2070, "endLine": 2076 },
+  "checkTrust": { "file": "src/bridge/bridgeMain.ts", "startLine": 2084, "endLine": 2093 },
+  "trustFail": { "file": "src/bridge/bridgeMain.ts", "startLine": 2086, "endLine": 2093 },
+  "checkOAuth": { "file": "src/bridge/bridgeMain.ts", "startLine": 2095, "endLine": 2108 },
+  "loginFail": { "file": "src/bridge/bridgeMain.ts", "startLine": 2102, "endLine": 2108 },
+  "remoteDialog": { "file": "src/bridge/bridgeMain.ts", "startLine": 2110, "endLine": 2139 },
+  "askConsent": { "file": "src/bridge/bridgeMain.ts", "startLine": 2118, "endLine": 2138 },
+  "exit0": { "file": "src/bridge/bridgeMain.ts", "startLine": 2135, "endLine": 2138 },
+  "saveSeen": { "file": "src/bridge/bridgeMain.ts", "startLine": 2131, "endLine": 2134 },
+  "resolveSpawn": { "file": "src/bridge/bridgeMain.ts", "startLine": 2278, "endLine": 2306 },
+  "register": { "file": "src/bridge/bridgeApi.ts", "startLine": 142, "endLine": 197 },
+  "registerFail": { "file": "src/bridge/bridgeMain.ts", "startLine": 2450, "endLine": 2467 },
+  "regErrExit": { "file": "src/bridge/bridgeMain.ts", "startLine": 2454, "endLine": 2467 },
+  "preCreate": { "file": "src/bridge/bridgeMain.ts", "startLine": 2670, "endLine": 2698 },
+  "enterLoop": { "file": "src/bridge/bridgeMain.ts", "startLine": 2731, "endLine": 2751 },
+
+  "login": { "file": "src/bridge/trustedDevice.ts", "startLine": 98, "endLine": 210 },
+  "enrollDevice": { "file": "src/bridge/trustedDevice.ts", "startLine": 142, "endLine": 206 },
+  "oauthToken": { "file": "src/bridge/bridgeConfig.ts", "startLine": 38, "endLine": 40 },
+  "bridgeApi": { "file": "src/bridge/bridgeApi.ts", "startLine": 68, "endLine": 452 },
+  "on401": { "file": "src/bridge/bridgeApi.ts", "startLine": 106, "endLine": 139 },
+  "refresh": { "file": "src/bridge/bridgeApi.ts", "startLine": 122, "endLine": 135 },
+  "refreshOk": { "file": "src/bridge/bridgeApi.ts", "startLine": 124, "endLine": 135 },
+  "retryOnce": { "file": "src/bridge/bridgeApi.ts", "startLine": 125, "endLine": 131 },
+  "fatalAuth": { "file": "src/bridge/bridgeApi.ts", "startLine": 454, "endLine": 500 },
+  "ok": { "file": "src/bridge/bridgeApi.ts", "startLine": 113, "endLine": 115 },
+  "server": { "file": "src/bridge/bridgeApi.ts", "startLine": 199, "endLine": 247 },
+  "workSecret": { "file": "src/bridge/types.ts", "startLine": 33, "endLine": 51 },
+  "decode": { "file": "src/bridge/workSecret.ts", "startLine": 6, "endLine": 32 },
+  "jwt": { "file": "src/bridge/workSecret.ts", "startLine": 6, "endLine": 32 },
+  "ackHeartbeat": { "file": "src/bridge/bridgeApi.ts", "startLine": 249, "endLine": 417 },
+  "childSpawn": { "file": "src/bridge/sessionRunner.ts", "startLine": 248, "endLine": 344 },
+  "refreshJwt": { "file": "src/bridge/jwtUtils.ts", "startLine": 72, "endLine": 256 },
+  "jwtExpired": { "file": "src/bridge/jwtUtils.ts", "startLine": 165, "endLine": 230 },
+  "reconnect": { "file": "src/bridge/bridgeApi.ts", "startLine": 358, "endLine": 385 },
+  "pushOauth": { "file": "src/bridge/sessionRunner.ts", "startLine": 527, "endLine": 543 },
+
+  "ide": { "file": "src/commands/bridge/bridge.tsx", "startLine": 1, "endLine": 511 },
+  "poll": { "file": "src/bridge/bridgeMain.ts", "startLine": 600, "endLine": 646 },
+  "ack": { "file": "src/bridge/bridgeMain.ts", "startLine": 837, "endLine": 850 },
+  "connect": { "file": "src/bridge/replBridge.ts", "startLine": 1208, "endLine": 1371 },
+  "pushDown": { "file": "src/bridge/bridgeMessaging.ts", "startLine": 132, "endLine": 208 },
+  "route": { "file": "src/bridge/bridgeMessaging.ts", "startLine": 132, "endLine": 208 },
+  "isCtrl": { "file": "src/bridge/bridgeMessaging.ts", "startLine": 152, "endLine": 158 },
+  "ctrlReq": { "file": "src/bridge/bridgeMessaging.ts", "startLine": 243, "endLine": 391 },
+  "isPermResp": { "file": "src/bridge/bridgeMessaging.ts", "startLine": 144, "endLine": 148 },
+  "permResp": { "file": "src/bridge/replBridge.ts", "startLine": 1792, "endLine": 1802 },
+  "isUser": { "file": "src/bridge/bridgeMessaging.ts", "startLine": 191, "endLine": 202 },
+  "inbound": { "file": "src/bridge/inboundMessages.ts", "startLine": 21, "endLine": 40 },
+  "drop": { "file": "src/bridge/bridgeMessaging.ts", "startLine": 168, "endLine": 185 },
+  "childStdin": { "file": "src/bridge/sessionRunner.ts", "startLine": 519, "endLine": 526 },
+  "childCli": { "file": "src/bridge/sessionRunner.ts", "startLine": 335, "endLine": 446 },
+  "parse": { "file": "src/bridge/sessionRunner.ts", "startLine": 369, "endLine": 445 },
+  "activity": { "file": "src/bridge/sessionRunner.ts", "startLine": 107, "endLine": 200 },
+  "ctrlReqOut": { "file": "src/bridge/sessionRunner.ts", "startLine": 417, "endLine": 430 },
+  "sdkMsg": { "file": "src/bridge/sessionRunner.ts", "startLine": 107, "endLine": 200 },
+  "forwardPerm": { "file": "src/bridge/sessionRunner.ts", "startLine": 424, "endLine": 429 },
+  "writeBatch": { "file": "src/bridge/replBridge.ts", "startLine": 1748, "endLine": 1778 },
+
+  "pollErr": { "file": "src/bridge/bridgeMain.ts", "startLine": 1236, "endLine": 1401 },
+  "isAborted": { "file": "src/bridge/bridgeMain.ts", "startLine": 1237, "endLine": 1239 },
+  "isFatal": { "file": "src/bridge/bridgeMain.ts", "startLine": 1242, "endLine": 1266 },
+  "classifyFatal": { "file": "src/bridge/bridgeApi.ts", "startLine": 464, "endLine": 500 },
+  "fatalExit": { "file": "src/bridge/bridgeMain.ts", "startLine": 1242, "endLine": 1266 },
+  "isConn": { "file": "src/bridge/bridgeMain.ts", "startLine": 1270, "endLine": 1337 },
+  "sleepDetect": { "file": "src/bridge/bridgeMain.ts", "startLine": 1276, "endLine": 1290 },
+  "resetBudget": { "file": "src/bridge/bridgeMain.ts", "startLine": 1286, "endLine": 1289 },
+  "connBackoff": { "file": "src/bridge/bridgeMain.ts", "startLine": 1293, "endLine": 1337 },
+  "heartbeatDuring": { "file": "src/bridge/bridgeMain.ts", "startLine": 1334, "endLine": 1336 },
+  "generalBackoff": { "file": "src/bridge/bridgeMain.ts", "startLine": 1338, "endLine": 1399 },
+  "reconnectedOk": { "file": "src/bridge/bridgeMain.ts", "startLine": 614, "endLine": 633 },
+  "logReconnect": { "file": "src/bridge/bridgeMain.ts", "startLine": 617, "endLine": 627 },
+  "giveUp": { "file": "src/bridge/bridgeMain.ts", "startLine": 1297, "endLine": 1312 },
+  "wsClose": { "file": "src/bridge/replBridge.ts", "startLine": 1350, "endLine": 1354 },
+  "closeCode": { "file": "src/bridge/replBridge.ts", "startLine": 1350, "endLine": 1354 },
+  "teardown": { "file": "src/bridge/replBridge.ts", "startLine": 1553, "endLine": 1668 },
+  "wakePoll": { "file": "src/bridge/replBridge.ts", "startLine": 1488, "endLine": 1495 },
+  "freshWork": { "file": "src/bridge/replBridge.ts", "startLine": 2180, "endLine": 2185 },
+  "reconnect": { "file": "src/bridge/replBridge.ts", "startLine": 1077, "endLine": 1501 },
+  "env404": { "file": "src/bridge/replBridge.ts", "startLine": 2201, "endLine": 2270 },
+  "envLost": { "file": "src/bridge/replBridge.ts", "startLine": 1070, "endLine": 1076 },
+  "strategy1": { "file": "src/bridge/replBridge.ts", "startLine": 684, "endLine": 736 },
+  "sameSession": { "file": "src/bridge/replBridge.ts", "startLine": 732, "endLine": 736 },
+  "strategy2": { "file": "src/bridge/replBridge.ts", "startLine": 743, "endLine": 836 },
+  "freshSession": { "file": "src/bridge/replBridge.ts", "startLine": 788, "endLine": 836 },
+  "retryLimit": { "file": "src/bridge/replBridge.ts", "startLine": 627, "endLine": 632 },
+  "failed": { "file": "src/bridge/replBridge.ts", "startLine": 2264, "endLine": 2269 },
+  "continue": { "file": "src/bridge/replBridge.ts", "startLine": 2247, "endLine": 2262 },
+
+  "workReceived": { "file": "src/bridge/bridgeMain.ts", "startLine": 859, "endLine": 1204 },
+  "existing": { "file": "src/bridge/bridgeMain.ts", "startLine": 873, "endLine": 886 },
+  "updateToken": { "file": "src/bridge/bridgeMain.ts", "startLine": 875, "endLine": 885 },
+  "atCap": { "file": "src/bridge/bridgeMain.ts", "startLine": 891, "endLine": 896 },
+  "skipSpawn": { "file": "src/bridge/bridgeMain.ts", "startLine": 891, "endLine": 896 },
+  "spawn": { "file": "src/bridge/bridgeMain.ts", "startLine": 1026, "endLine": 1061 },
+  "spawnFail": { "file": "src/bridge/bridgeMain.ts", "startLine": 1062, "endLine": 1093 },
+  "stopWorkFail": { "file": "src/bridge/bridgeMain.ts", "startLine": 1083, "endLine": 1093 },
+  "register": { "file": "src/bridge/bridgeMain.ts", "startLine": 1114, "endLine": 1202 },
+  "timeout": { "file": "src/bridge/bridgeMain.ts", "startLine": 1180, "endLine": 1193 },
+  "title": { "file": "src/bridge/bridgeMain.ts", "startLine": 1158, "endLine": 1177 },
+  "status": { "file": "src/bridge/bridgeMain.ts", "startLine": 1154, "endLine": 1156 },
+  "running": { "file": "src/bridge/bridgeMain.ts", "startLine": 1114, "endLine": 1203 },
+  "done": { "file": "src/bridge/bridgeMain.ts", "startLine": 442, "endLine": 591 },
+  "status2": { "file": "src/bridge/bridgeMain.ts", "startLine": 499, "endLine": 517 },
+  "logComplete": { "file": "src/bridge/bridgeMain.ts", "startLine": 500, "endLine": 502 },
+  "logFail": { "file": "src/bridge/bridgeMain.ts", "startLine": 503, "endLine": 513 },
+  "skipLog": { "file": "src/bridge/bridgeMain.ts", "startLine": 514, "endLine": 521 },
+  "stopWork": { "file": "src/bridge/bridgeMain.ts", "startLine": 522, "endLine": 533 },
+  "worktree": { "file": "src/bridge/bridgeMain.ts", "startLine": 535, "endLine": 551 },
+  "mode": { "file": "src/bridge/bridgeMain.ts", "startLine": 556, "endLine": 585 },
+  "archiveExit": { "file": "src/bridge/bridgeMain.ts", "startLine": 577, "endLine": 584 },
+  "archiveIdle": { "file": "src/bridge/bridgeMain.ts", "startLine": 556, "endLine": 573 },
+
+  "replStart": { "file": "src/bridge/initReplBridge.ts", "startLine": 110, "endLine": 162 },
+  "initRepl": { "file": "src/bridge/initReplBridge.ts", "startLine": 110, "endLine": 555 },
+  "gateCheck": { "file": "src/bridge/initReplBridge.ts", "startLine": 134, "endLine": 162 },
+  "skip": { "file": "src/bridge/initReplBridge.ts", "startLine": 135, "endLine": 138 },
+  "registerEnv": { "file": "src/bridge/replBridge.ts", "startLine": 349, "endLine": 367 },
+  "createSess": { "file": "src/bridge/replBridge.ts", "startLine": 432, "endLine": 489 },
+  "startPoll": { "file": "src/bridge/replBridge.ts", "startLine": 1851, "endLine": 2400 },
+  "pollWait": { "file": "src/bridge/replBridge.ts", "startLine": 2050, "endLine": 2136 },
+  "workArrived": { "file": "src/bridge/replBridge.ts", "startLine": 2169, "endLine": 2185 },
+  "sameSess": { "file": "src/bridge/replBridge.ts", "startLine": 1120, "endLine": 1125 },
+  "rejectForeign": { "file": "src/bridge/replBridge.ts", "startLine": 1120, "endLine": 1125 },
+  "closeOld": { "file": "src/bridge/replBridge.ts", "startLine": 1171, "endLine": 1183 },
+  "pickV": { "file": "src/bridge/replBridge.ts", "startLine": 1139, "endLine": 1140 },
+  "hybrid": { "file": "src/bridge/replBridgeTransport.ts", "startLine": 78, "endLine": 103 },
+  "sse": { "file": "src/bridge/replBridgeTransport.ts", "startLine": 119, "endLine": 370 },
+  "wire": { "file": "src/bridge/replBridge.ts", "startLine": 1208, "endLine": 1371 },
+  "flush": { "file": "src/bridge/replBridge.ts", "startLine": 1241, "endLine": 1329 },
+  "ready": { "file": "src/bridge/replBridge.ts", "startLine": 1312, "endLine": 1329 },
+  "twoWay": { "file": "src/bridge/replBridge.ts", "startLine": 1332, "endLine": 1500 },
+  "envLost2": { "file": "src/bridge/replBridge.ts", "startLine": 2201, "endLine": 2270 },
+  "reconnect": { "file": "src/bridge/replBridge.ts", "startLine": 605, "endLine": 836 },
+  "teardown2": { "file": "src/bridge/replBridge.ts", "startLine": 1553, "endLine": 1668 },
+  "break": { "file": "src/bridge/bridgeMain.ts", "startLine": 1240, "endLine": 1241 }
+};
+</script>
+
+<aside id="source-panel"><div id="source-header"></div><div id="monaco-container"></div></aside>
+<script src="../assets/codeindex-runtime.js"></script>
+<script src="../assets/codeindex.js"></script>
+</body>
+</html>

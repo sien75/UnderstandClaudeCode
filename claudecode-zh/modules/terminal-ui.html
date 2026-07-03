@@ -1,0 +1,279 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>终端 UI 层（React + Ink）</title>
+<link rel="stylesheet" href="../assets/codeindex.css">
+</head>
+<body>
+<nav class="topnav"><a href="../index.html">← 返回总览</a></nav>
+<h1>终端 UI 层（React + Ink）</h1>
+
+<p>用户在终端里看到的一切——输入框、流式回复、工具调用卡片、权限弹窗、diff 展示——都由这一层渲染。它是一个用 React + Ink 跑在终端里的单页应用：用户敲键 → 输入框组件更新本地状态 → 提交后把用户消息塞进消息数组 → 发起一次查询 → 流式事件不断追加助理消息和工具进度 → 每一帧 Ink 把 React 树渲染成字符画写到 stdout。整条数据流的主轴是"消息数组的单向流动"：几乎所有状态变更最终都落在 <code>messages</code> 这个数组上，渲染层只是它的一个投影。</p>
+
+<dl>
+  <dt>输入</dt>
+  <dd>用户的键盘输入（文本、粘贴、斜杠命令、vim 按键）+ 来自查询引擎的流式事件（文字增量、工具调用块、思考块、进度 tick）</dd>
+  <dt>输出</dt>
+  <dd>终端屏幕上持续刷新的字符界面：一段对话转录 + 底部输入框，中间穿插权限弹窗、工具结果卡片、spinner 动画</dd>
+</dl>
+
+<h2>一、从用户敲键到提交查询</h2>
+
+<p>用户在底部 <code>PromptInput</code> 里打字。输入框内部维护着自己的 buffer 和光标状态（含 vim 模式状态机）。按下回车后，<code>PromptInput</code> 调用 REPL 传下来的 <code>onSubmit</code>。<code>onSubmit</code> 不是直接发请求，而是先做几件事：如果是斜杠命令且标记为 <code>immediate</code>，就绕过队列立即执行（例如 /btw、/config 这类本地弹窗命令）；否则把输入交给 <code>handlePromptSubmit</code> 统一处理——它会展开粘贴引用、判断是普通对话还是斜杠命令、必要时排队（当 Claude 正忙时输入会被暂存，等当前回合结束再提交）。最终，对于需要发请求的输入，<code>handlePromptSubmit</code> 调 <code>onQuery</code>，由它把用户消息追加进 <code>messages</code> 并启动查询引擎。</p>
+
+<pre class="mermaid">
+graph TD
+  user-types["用户在 PromptInput 打字"] --> vim-check{"vim 模式?"}
+  vim-check -->|是| vim-transition["vim 状态机转移&lt;br/&gt;transitions.ts"]
+  vim-check -->|否| text-edit["直接编辑 buffer"]
+  vim-transition --> text-edit
+  text-edit --> enter-pressed{"回车?"}
+  enter-pressed -->|否| local-render["更新输入框局部渲染"]
+  enter-pressed -->|是| on-submit["REPL.onSubmit 接管"]
+  on-submit --> slash-check{"是 / 命令且 immediate?"}
+  slash-check -->|是| immediate-cmd["绕过队列立即执行&lt;br/&gt;setToolJSX 渲染弹窗"]
+  slash-check -->|否| handle-submit["handlePromptSubmit 统一入口"]
+  handle-submit --> loading-check{"Claude 正忙?"}
+  loading-check -->|是| enqueue["输入入队，等回合结束"]
+  loading-check -->|否| build-msg["构造用户消息 + onQuery"]
+  enqueue --> build-msg
+  build-msg --> on-query["onQuery: queryGuard.tryStart"]
+</pre>
+
+<h2>二、流式回复的渲染</h2>
+
+<p>查询引擎开始返回流式事件后，每一段增量都会经过 <code>onQueryEvent</code> 进入 <code>handleMessageFromStream</code>。这个函数把原始事件翻译成对 <code>messages</code> 数组的变更操作：普通增量就 append；压缩边界消息会替换整个数组（保留少量历史做滚动回看）；进度 tick 会原地替换上一条同工具的 tick（避免 sleep/bash 每秒一条把数组撑到上万条）。<code>setMessages</code> 是一个特殊包装：它同步更新 <code>messagesRef</code>（让后续逻辑立刻读到最新值，不等 React 批处理），再交给 React 真正 setState。<code>Messages</code> 组件拿到新数组后，用 <code>VirtualMessageList</code> 做虚拟滚动只渲染视口内的行，由 Ink reconciler → yoga 布局 → paint 到 Screen buffer → 写到 stdout。</p>
+
+<pre class="mermaid">
+graph TD
+  stream-evt["查询引擎流式事件"] --> on-query-evt["onQueryEvent"]
+  on-query-evt --> handle-msg["handleMessageFromStream 翻译事件"]
+  handle-msg --> evt-type{"事件类型?"}
+  evt-type -->|普通增量| append-msg["append 到 messages"]
+  evt-type -->|压缩边界| replace-msg["替换整个 messages 数组"]
+  evt-type -->|进度 tick| replace-tick["原地替换上一条 tick"]
+  evt-type -->|删除墓碑| filter-msg["过滤掉被撤回的消息"]
+  append-msg --> set-msg["setMessages 包装器"]
+  replace-msg --> set-msg
+  replace-tick --> set-msg
+  filter-msg --> set-msg
+  set-msg --> sync-ref["同步更新 messagesRef"]
+  sync-ref --> react-set["rawSetMessages 交给 React"]
+  react-set --> messages-comp["Messages 组件重渲染"]
+  messages-comp --> vml["VirtualMessageList 虚拟滚动"]
+  vml --> ink-render["Ink reconciler + yoga 布局"]
+  ink-render --> paint["paint 到 Screen buffer"]
+  paint --> stdout["写入 stdout"]
+</pre>
+
+<h2>三、工具权限弹窗</h2>
+
+<p>当模型要调用一个需要确认的工具时，查询引擎调用 <code>canUseTool</code>（由 <code>useCanUseTool</code> 提供）。它先跑 <code>hasPermissionsToUseTool</code> 看配置里是否已经允许/拒绝；如果结果是 allow 就直接放行，deny 就直接拒绝。只有结果是 ask 时才需要弹窗：先尝试协调器自动检查、swarm worker 代理、bash 分类器投机判定（2 秒竞速），这些都拿不到结论才走到 <code>handleInteractivePermission</code>，它把一个 <code>ToolUseConfirm</code> 推进 <code>toolUseConfirmQueue</code>。REPL 渲染层看到队列非空，就在 <code>focusedInputDialog === 'tool-permission'</code> 分支挂载 <code>PermissionRequest</code> 组件。用户选择后，<code>onDone</code> 把队首出队，resolve 那个挂起的 Promise，查询引擎继续或中止。</p>
+
+<pre class="mermaid">
+graph TD
+  tool-call["模型请求调用工具"] --> can-use-tool["useCanUseTool.canUseTool"]
+  can-use-tool --> perm-check["hasPermissionsToUseTool 查配置"]
+  perm-check --> behavior{"决策 behavior?"}
+  behavior -->|allow| allow-tool["直接放行"]
+  behavior -->|deny| deny-tool["直接拒绝"]
+  behavior -->|ask| coord-check["协调器自动检查"]
+  coord-check --> coord-ok{"有结论?"}
+  coord-ok -->|是| resolve-coord["resolve"]
+  coord-ok -->|否| swarm-check["swarm worker 代理检查"]
+  swarm-check --> swarm-ok{"有结论?"}
+  swarm-ok -->|是| resolve-swarm["resolve"]
+  swarm-ok -->|否| classifier-race["bash 分类器 2s 竞速"]
+  classifier-race --> classifier-ok{"高置信命中?"}
+  classifier-ok -->|是| allow-classifier["分类器放行"]
+  classifier-ok -->|否| interactive["handleInteractivePermission"]
+  interactive --> push-queue["推入 toolUseConfirmQueue"]
+  push-queue --> render-perm["REPL 渲染 PermissionRequest 弹窗"]
+  render-perm --> user-choice{"用户选择?"}
+  user-choice -->|允许| on-allow["onAllow + 出队"]
+  user-choice -->|拒绝| on-deny["onReject + 出队"]
+  user-choice -->|中止| on-abort["onAbort + 中止工具"]
+  on-allow --> resolve["resolve 挂起的 Promise"]
+  on-deny --> resolve
+  on-abort --> resolve
+  allow-tool --> resolve
+  deny-tool --> resolve
+  allow-classifier --> resolve
+  resolve-coord --> resolve
+  resolve-swarm --> resolve
+  resolve --> continue-query["查询引擎继续"]
+</pre>
+
+<h2>四、回合生命周期与状态机</h2>
+
+<p>一个回合的加载状态由 <code>queryGuard</code>（一个简易状态机：idle → running）驱动。<code>isLoading</code> 不再是简单的 React state，而是从 queryGuard 的外部 store 派生而来，保证"正在处理"这个事实不会被 React 批处理延迟。<code>onQuery</code> 进入时 <code>tryStart()</code> 原子地把 idle 翻成 running 并返回一个 generation 号；如果已经在跑，就拒绝并把输入入队。finally 块里 <code>queryGuard.end(thisGeneration)</code> 原子地核对 generation 后翻回 idle，随后 <code>resetLoadingState</code> 清理临时状态、<code>onTurnComplete</code> 回调通知外部。如果用户中途 Esc 取消，<code>forceEnd</code> 强制结束并在满足条件时自动回退用户消息、恢复输入框内容。</p>
+
+<pre class="mermaid">
+graph TD
+  submit["用户提交"] --> try-start["queryGuard.tryStart 原子翻转 idle→running"]
+  try-start --> started{"generation 号?"}
+  started -->|null=已在跑| reject-enqueue["拒绝 + 输入入队"]
+  started -->|有效| append-msg["追加用户消息到 messages"]
+  append-msg --> run-impl["onQueryImpl 执行查询"]
+  run-impl --> streaming["流式事件持续到达"]
+  streaming --> turn-done{"回合结束?"}
+  turn-done -->|否| streaming
+  turn-done -->|是| finally["finally 块"]
+  reject-enqueue --> wait-idle["等当前回合 idle"]
+  wait-idle --> dequeue["出队重新提交"]
+  finally --> guard-end["queryGuard.end 核对 generation"]
+  guard-end --> gen-ok{"generation 匹配?"}
+  gen-ok -->|是| reset["resetLoadingState 清理"]
+  gen-ok -->|否| stale["说明有更新查询接管，静默退出"]
+  reset --> turn-cb["onTurnComplete 回调"]
+  turn-cb --> bridge-notify["通知 bridge 客户端回合结束"]
+  bridge-notify --> idle-state["回到 idle 等待下一轮"]
+  streaming --> esc-press["用户按 Esc"]
+  esc-press --> force-end["queryGuard.forceEnd 强制结束"]
+  force-end --> auto-restore{"无新查询 + 输入空?"}
+  auto-restore -->|是| rewind["回退用户消息 + 恢复输入"]
+  auto-restore -->|否| keep["保持现状"]
+</pre>
+
+<h2>五、全局状态与重渲染</h2>
+
+<p>全局状态放在一个极简的 Zustand 风格 store 里（<code>createStore</code>，不到 35 行）：<code>getState</code>、<code>setState</code>、<code>subscribe</code>。<code>setState</code> 用 <code>Object.is</code> 判等跳过无变更，然后调 <code>onChangeAppState</code> 做副作用（同步权限模式到 CCR、持久化 verbose/expandedView 到全局配置、清认证缓存），最后通知所有订阅者。组件通过 <code>useAppState(selector)</code> 订阅切片，selector 返回值变了才重渲染。这样 REPL 这个巨型组件不会因为无关字段变动而无谓重算。<code>messages</code> 数组本身是 REPL 的本地 React state（不是全局 store），但通过 <code>messagesRef</code> 同步镜像，让 <code>onQuery</code>、<code>getToolUseContext</code> 等闭包能立刻读到最新值。</p>
+
+<pre class="mermaid">
+graph TD
+  set-state["store.setState(updater)"] --> is-same{"Object.is 判等"}
+  is-same -->|相同| skip["跳过，不通知"]
+  is-same -->|不同| update["更新内部 state"]
+  update --> on-change["onChangeAppState 副作用"]
+  on-change --> sync-mode["同步权限模式到 CCR/SDK"]
+  on-change --> persist["持久化 verbose/expandedView"]
+  on-change --> clear-auth["清认证缓存"]
+  sync-mode --> notify["通知所有订阅 listener"]
+  persist --> notify
+  clear-auth --> notify
+  notify --> use-app-state["useAppState(selector) 的组件"]
+  use-app-state --> sel-changed{"selector 返回值变?"}
+  sel-changed -->|否| no-rerender["不重渲染"]
+  sel-changed -->|是| rerender["触发组件重渲染"]
+  rerender --> repl-read["REPL 从 store 读切片"]
+  repl-read --> messages-local["messages 是 REPL 本地 state"]
+  messages-local --> msg-ref["messagesRef 同步镜像"]
+  msg-ref --> closures["onQuery/getToolUseContext 读最新值"]
+</pre>
+
+<ul>
+  <li><b>setMessages 是真相源</b>：它先同步写 <code>messagesRef</code>，再把计算好的值交给 React。这是为了绕过 React 批处理延迟——<code>onQuery</code> 里 <code>setMessages</code> 之后立刻读 <code>messagesRef.current</code> 能拿到刚追加的用户消息，不用等 commit。注释里明说这是 Zustand 模式：ref 是真相，React state 是投影。</li>
+  <li><b>进度 tick 原地替换</b>：sleep/bash 每秒发一个 tick，如果无脑 append 会让 messages 数组涨到 1.3 万条、transcript 文件 120MB。<code>onQueryEvent</code> 检测到同类 tick 就替换最后一条，<code>useLogMessages</code> 还会因长度不变而跳过磁盘写入。</li>
+  <li><b>虚拟滚动是分水岭</b>：transcript 模式下若开了虚拟滚动（默认全屏），用 <code>FullscreenLayout</code> + <code>AlternateScreen</code> 包裹，<code>VirtualMessageList</code> 只挂载视口内行；没开就退化为 30 条上限 + 原生终端回滚。两种模式共用同一个 <code>scrollRef</code>，互斥不会同时挂载两个 ScrollBox。</li>
+  <li><b>即时命令绕过队列</b>：斜杠命令标了 <code>immediate: true</code> 的（/btw、/model、/mcp）即使 Claude 正忙也立即执行，渲染成底部固定浮层而非滚动区里的内容——避免主对话流式刷新时把它们挤得乱跳。</li>
+  <li><b>权限模式同步单一咽喉</b>：<code>onChangeAppState</code> 是权限模式变更的唯一同步点。以前 8+ 个改模式的地方只有 2 个会通知 CCR，现在 hook 在 diff 上，任何路径改了模式都会自动同步到 CCR 和 SDK 状态流。</li>
+  <li><b>vim 是独立状态机</b>：<code>useVimInput</code> 把按键交给 <code>vim/transitions.ts</code> 的 <code>transition()</code>，按当前状态（idle/count/operator/find 等）和输入决定下一状态和要执行的动作，是数据流主轴旁的一个独立小机器。</li>
+  <li><b>渲染管线</b>：Ink 的渲染走 React reconciler → yoga 布局算尺寸 → <code>renderNodeToOutput</code> 把节点画到 <code>Screen</code> 字符格 → diff 上一帧输出增量 → 写 stdout。<code>renderToScreen</code> 还提供了一个隔离渲染单条消息的入口，专给搜索功能用——渲染一条消息扫字符位置，约 1-3ms。</li>
+</ul>
+
+<script>
+window.__sourceMap = {
+  "user-types": { "file": "src/components/PromptInput/PromptInput.tsx", "startLine": 194, "endLine": 230 },
+  "vim-check": { "file": "src/hooks/useVimInput.ts", "startLine": 34, "endLine": 60 },
+  "vim-transition": { "file": "src/vim/transitions.ts", "startLine": 59, "endLine": 97 },
+  "text-edit": { "file": "src/hooks/useTextInput.ts", "startLine": 73, "endLine": 130 },
+  "enter-pressed": { "file": "src/components/PromptInput/PromptInput.tsx", "startLine": 984, "endLine": 1105 },
+  "local-render": { "file": "src/screens/REPL.tsx", "startLine": 4903, "endLine": 4905 },
+  "on-submit": { "file": "src/screens/REPL.tsx", "startLine": 3142, "endLine": 3160 },
+  "slash-check": { "file": "src/screens/REPL.tsx", "startLine": 3161, "endLine": 3185 },
+  "immediate-cmd": { "file": "src/screens/REPL.tsx", "startLine": 3185, "endLine": 3260 },
+  "handle-submit": { "file": "src/screens/REPL.tsx", "startLine": 3490, "endLine": 3519 },
+  "loading-check": { "file": "src/utils/handlePromptSubmit.ts", "startLine": 1, "endLine": 1 },
+  "enqueue": { "file": "src/hooks/useCommandQueue.ts", "startLine": 1, "endLine": 1 },
+  "build-msg": { "file": "src/screens/REPL.tsx", "startLine": 3490, "endLine": 3519 },
+  "on-query": { "file": "src/screens/REPL.tsx", "startLine": 2855, "endLine": 2886 },
+  "stream-evt": { "file": "src/screens/REPL.tsx", "startLine": 2584, "endLine": 2584 },
+  "on-query-evt": { "file": "src/screens/REPL.tsx", "startLine": 2584, "endLine": 2660 },
+  "handle-msg": { "file": "src/utils/messages.ts", "startLine": 1, "endLine": 1 },
+  "evt-type": { "file": "src/screens/REPL.tsx", "startLine": 2586, "endLine": 2630 },
+  "append-msg": { "file": "src/screens/REPL.tsx", "startLine": 2628, "endLine": 2630 },
+  "replace-msg": { "file": "src/screens/REPL.tsx", "startLine": 2586, "endLine": 2603 },
+  "replace-tick": { "file": "src/screens/REPL.tsx", "startLine": 2608, "endLine": 2627 },
+  "filter-msg": { "file": "src/screens/REPL.tsx", "startLine": 2646, "endLine": 2649 },
+  "set-msg": { "file": "src/screens/REPL.tsx", "startLine": 1198, "endLine": 1222 },
+  "sync-ref": { "file": "src/screens/REPL.tsx", "startLine": 1198, "endLine": 1201 },
+  "react-set": { "file": "src/screens/REPL.tsx", "startLine": 1221, "endLine": 1221 },
+  "messages-comp": { "file": "src/components/Messages.tsx", "startLine": 341, "endLine": 740 },
+  "vml": { "file": "src/components/Messages.tsx", "startLine": 700, "endLine": 700 },
+  "ink-render": { "file": "src/ink/reconciler.ts", "startLine": 1, "endLine": 50 },
+  "paint": { "file": "src/ink/render-node-to-output.ts", "startLine": 1, "endLine": 1 },
+  "stdout": { "file": "src/ink/render-to-screen.ts", "startLine": 59, "endLine": 130 },
+  "tool-call": { "file": "src/hooks/useCanUseTool.tsx", "startLine": 28, "endLine": 36 },
+  "can-use-tool": { "file": "src/hooks/useCanUseTool.tsx", "startLine": 32, "endLine": 37 },
+  "perm-check": { "file": "src/hooks/useCanUseTool.tsx", "startLine": 37, "endLine": 37 },
+  "behavior": { "file": "src/hooks/useCanUseTool.tsx", "startLine": 38, "endLine": 64 },
+  "allow-tool": { "file": "src/hooks/useCanUseTool.tsx", "startLine": 39, "endLine": 53 },
+  "deny-tool": { "file": "src/hooks/useCanUseTool.tsx", "startLine": 65, "endLine": 92 },
+  "coord-check": { "file": "src/hooks/useCanUseTool.tsx", "startLine": 95, "endLine": 109 },
+  "coord-ok": { "file": "src/hooks/useCanUseTool.tsx", "startLine": 105, "endLine": 108 },
+  "resolve-coord": { "file": "src/hooks/useCanUseTool.tsx", "startLine": 106, "endLine": 107 },
+  "swarm-check": { "file": "src/hooks/useCanUseTool.tsx", "startLine": 113, "endLine": 125 },
+  "swarm-ok": { "file": "src/hooks/useCanUseTool.tsx", "startLine": 122, "endLine": 124 },
+  "resolve-swarm": { "file": "src/hooks/useCanUseTool.tsx", "startLine": 123, "endLine": 124 },
+  "classifier-race": { "file": "src/hooks/useCanUseTool.tsx", "startLine": 126, "endLine": 159 },
+  "classifier-ok": { "file": "src/hooks/useCanUseTool.tsx", "startLine": 135, "endLine": 157 },
+  "allow-classifier": { "file": "src/hooks/useCanUseTool.tsx", "startLine": 136, "endLine": 156 },
+  "interactive": { "file": "src/hooks/useCanUseTool.tsx", "startLine": 160, "endLine": 168 },
+  "push-queue": { "file": "src/screens/REPL.tsx", "startLine": 1101, "endLine": 1101 },
+  "render-perm": { "file": "src/screens/REPL.tsx", "startLine": 4519, "endLine": 4519 },
+  "user-choice": { "file": "src/components/permissions/PermissionRequest.tsx", "startLine": 146, "endLine": 217 },
+  "on-allow": { "file": "src/screens/REPL.tsx", "startLine": 4519, "endLine": 4519 },
+  "on-deny": { "file": "src/screens/REPL.tsx", "startLine": 4519, "endLine": 4519 },
+  "on-abort": { "file": "src/screens/REPL.tsx", "startLine": 2139, "endLine": 2140 },
+  "resolve": { "file": "src/hooks/useCanUseTool.tsx", "startLine": 50, "endLine": 53 },
+  "continue-query": { "file": "src/hooks/useCanUseTool.tsx", "startLine": 32, "endLine": 37 },
+  "submit": { "file": "src/screens/REPL.tsx", "startLine": 3142, "endLine": 3151 },
+  "try-start": { "file": "src/screens/REPL.tsx", "startLine": 2869, "endLine": 2869 },
+  "started": { "file": "src/screens/REPL.tsx", "startLine": 2870, "endLine": 2870 },
+  "reject-enqueue": { "file": "src/screens/REPL.tsx", "startLine": 2876, "endLine": 2884 },
+  "append-msg": { "file": "src/screens/REPL.tsx", "startLine": 2891, "endLine": 2891 },
+  "run-impl": { "file": "src/screens/REPL.tsx", "startLine": 2918, "endLine": 2918 },
+  "streaming": { "file": "src/screens/REPL.tsx", "startLine": 2584, "endLine": 2660 },
+  "turn-done": { "file": "src/screens/REPL.tsx", "startLine": 2919, "endLine": 2919 },
+  "finally": { "file": "src/screens/REPL.tsx", "startLine": 2919, "endLine": 3023 },
+  "wait-idle": { "file": "src/screens/REPL.tsx", "startLine": 2870, "endLine": 2885 },
+  "dequeue": { "file": "src/hooks/useCommandQueue.ts", "startLine": 1, "endLine": 1 },
+  "guard-end": { "file": "src/screens/REPL.tsx", "startLine": 2923, "endLine": 2923 },
+  "gen-ok": { "file": "src/screens/REPL.tsx", "startLine": 2923, "endLine": 2923 },
+  "reset": { "file": "src/screens/REPL.tsx", "startLine": 1567, "endLine": 1572 },
+  "stale": { "file": "src/screens/REPL.tsx", "startLine": 2922, "endLine": 2922 },
+  "turn-cb": { "file": "src/screens/REPL.tsx", "startLine": 2930, "endLine": 2930 },
+  "bridge-notify": { "file": "src/screens/REPL.tsx", "startLine": 2934, "endLine": 2934 },
+  "idle-state": { "file": "src/screens/REPL.tsx", "startLine": 2993, "endLine": 2993 },
+  "esc-press": { "file": "src/screens/REPL.tsx", "startLine": 2118, "endLine": 2118 },
+  "force-end": { "file": "src/screens/REPL.tsx", "startLine": 2118, "endLine": 2118 },
+  "auto-restore": { "file": "src/screens/REPL.tsx", "startLine": 3010, "endLine": 3010 },
+  "rewind": { "file": "src/screens/REPL.tsx", "startLine": 3012, "endLine": 3020 },
+  "keep": { "file": "src/screens/REPL.tsx", "startLine": 3010, "endLine": 3010 },
+  "set-state": { "file": "src/state/store.ts", "startLine": 20, "endLine": 27 },
+  "is-same": { "file": "src/state/store.ts", "startLine": 23, "endLine": 23 },
+  "skip": { "file": "src/state/store.ts", "startLine": 23, "endLine": 23 },
+  "update": { "file": "src/state/store.ts", "startLine": 24, "endLine": 24 },
+  "on-change": { "file": "src/state/store.ts", "startLine": 25, "endLine": 25 },
+  "sync-mode": { "file": "src/state/onChangeAppState.ts", "startLine": 65, "endLine": 92 },
+  "persist": { "file": "src/state/onChangeAppState.ts", "startLine": 114, "endLine": 152 },
+  "clear-auth": { "file": "src/state/onChangeAppState.ts", "startLine": 156, "endLine": 170 },
+  "notify": { "file": "src/state/store.ts", "startLine": 26, "endLine": 26 },
+  "use-app-state": { "file": "src/state/AppState.tsx", "startLine": 1, "endLine": 200 },
+  "sel-changed": { "file": "src/state/AppState.tsx", "startLine": 1, "endLine": 200 },
+  "no-rerender": { "file": "src/state/AppState.tsx", "startLine": 1, "endLine": 200 },
+  "rerender": { "file": "src/state/AppState.tsx", "startLine": 1, "endLine": 200 },
+  "repl-read": { "file": "src/screens/REPL.tsx", "startLine": 618, "endLine": 640 },
+  "messages-local": { "file": "src/screens/REPL.tsx", "startLine": 1198, "endLine": 1222 },
+  "msg-ref": { "file": "src/screens/REPL.tsx", "startLine": 1198, "endLine": 1201 },
+  "closures": { "file": "src/screens/REPL.tsx", "startLine": 2906, "endLine": 2906 }
+};
+</script>
+
+<aside id="source-panel"><div id="source-header"></div><div id="monaco-container"></div></aside>
+<script src="../assets/codeindex-runtime.js"></script>
+<script src="../assets/codeindex.js"></script>
+</body>
+</html>
