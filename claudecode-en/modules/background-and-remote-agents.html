@@ -1,0 +1,384 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Background Forked Sub-Agents and Remote Agent Execution</title><link rel="stylesheet" href="../assets/codeindex.css"></head><body>
+<nav class="topnav"><a href="../index.html">← Back to Overview</a></nav>
+<h1>Background Forked Sub-Agents and Remote Agent Execution</h1>
+
+<p>This module covers two things. First, after each round of the Claude Code main conversation, the system "forks" several sub-agents in the background — they reuse the main thread's prompt cache and quietly do non-intrusive work, such as consolidating memory, generating next-sentence suggestions, maintaining Magic Doc, writing progress summaries for coordinator sub-agents. Second, when the session runs inside a remote CCR container, the local CLI subscribes to remote session events over WebSocket, forwards permission requests, tunnels outbound curl/gh traffic via CONNECT-over-WebSocket to the CCR ingress, where the server performs MITM TLS and injects credentials. The common thread of both parts is "data flow": the core of forked sub-agents is the <em>cache-hit</em> data flow, while the core of remote execution is the bidirectional flow of <em>messages and bytes</em> among the CLI, WebSocket, and CCR container.</p>
+
+<dl>
+  <dt>Input</dt>
+  <dd>After each round of the main conversation, the REPLHookContext (containing systemPrompt, tools, messages, toolUseContext) — all background fork sub-agents draw from this; on the remote side, it is the SDK message stream pushed by the CCR server, plus local CONNECT requests from curl/gh etc. to the 127.0.0.1 tunnel port.</dd>
+  <dt>Output</dt>
+  <dd>Background side: consolidated memory files, Magic Doc updates, session memory markdown, prompt-suggestion text, coordinator summaries — all written back to disk or AppState without blocking the main conversation. Remote side: local REPL renders the remote agent's streaming messages; permission requests are decided locally and sent back to CCR; child-process traffic is transparently proxied to the real upstream.</dd>
+</dl>
+
+<ul>
+  <li>The essence of "forked": initiate a new query with a system/tools/messages prefix identical to the main thread's, so Anthropic API's prompt cache hits, making background work almost a "pay only for output tokens" cheap operation.</li>
+  <li>All background fork sub-agents share a common pattern: tool definitions remain in the request (to keep the cache key consistent), but are allowed or denied on demand via the canUseTool callback — read-only tools are all denied, and only tools that need to modify specific files are allowed.</li>
+  <li>The remote side is fail-open across the board: if the WebSocket disconnects there is a reconnection budget, and if reconnection fails it degrades to "session ended"; if any step of upstreamproxy fails, the proxy is disabled and the session is never dragged down.</li>
+</ul>
+
+<h2>I. Fork Mechanism Core: runForkedAgent + CacheSafeParams</h2>
+
+<p>After each round of the main conversation, <code>handleStopHooks</code> stores the current round's CacheSafeParams into a module-level <code>lastCacheSafeParams</code> slot. Background fork sub-agents (promptSuggestion, postTurnSummary, /btw, etc.) read from this slot directly, without each penetrating parameters — this is the first guarantee of cache hit. CacheSafeParams carries five fields that affect the cache key: systemPrompt, userContext, systemContext, toolUseContext (containing tools/model/options), and forkContextMessages (message prefix).</p>
+
+<p>thinking config is also part of the cache key, so the <code>maxOutputTokens</code> parameter is specially warned: in claude.ts it clamps budget_tokens, which changes thinking config and breaks the cache. It is only allowed in scenarios that "do not need to share the parent's cache" (such as compact summaries).</p>
+
+<pre class="mermaid">
+graph TD
+  stop-hooks["handleStopHooks after each round"] --> save-csp["saveCacheSafeParams into module slot"]
+  save-csp --> fork-call["Background service calls runForkedAgent"]
+  fork-call --> create-ctx["createSubagentContext isolates mutable state"]
+  create-ctx --> clone-state["Clone readFileState/contentReplacementState"]
+  create-ctx --> new-abort["New child AbortController (chained to parent)"]
+  create-ctx --> no-op-cbs["setAppState and other mutation callbacks set to no-op"]
+  clone-state --> build-msgs["initialMessages = forkContextMessages + promptMessages"]
+  build-msgs --> query-loop["Enter query() loop"]
+  query-loop --> stream-ev{"Message type?"}
+  stream-ev -->|stream_event message_delta| acc-usage["Accumulate totalUsage"]
+  stream-ev -->|assistant/user/progress| record-tx["recordSidechainTranscript record sidechain"]
+  stream-ev -->|Other| push-msg["outputMessages.push + onMessage callback"]
+  acc-usage --> push-msg
+  record-tx --> push-msg
+  push-msg --> query-loop
+  query-loop -->|Loop ends| clear-cache["finally: clear readFileState, clear initialMessages"]
+  clear-cache --> log-event["logForkAgentQueryEvent emit tengu_fork_agent_query"]
+  log-event --> return-result["Return messages + totalUsage"]
+</pre>
+
+<p>Several business-critical details: <code>createSubagentContext</code> by default isolates <em>all</em> mutable state — readFileState is cloned, abortController is newly created (but chained to the parent so parent abort propagates), and all mutation callbacks are set to no-op. This way fork file writes do not pollute the parent thread's file-state view. The exception is <code>setAppStateForTasks</code>: it must penetrate to the root store, otherwise background bash tasks would never register or be killable, becoming PPID=1 zombies. <code>contentReplacementState</code> is cloned rather than newly created by default — when the fork processes tool_use_ids carried in parent messages, a fresh state would treat them as unseen, make different replacement decisions, and the wire prefix would differ, causing a cache miss; cloning makes the same decisions and hits the cache.</p>
+
+<h2>II. autoDream: Time + Session Count Dual Gate for Memory Consolidation</h2>
+
+<p>User perspective: nothing to do. After each round of conversation, autoDream secretly checks "how long since the last memory consolidation" and "how many sessions have accumulated during that time." When both thresholds are crossed, it forks a sub-agent running the /dream prompt to read the session transcript and merge/revise/trim memory files. This lets Claude orient quickly in new sessions by precipitating recent learning into persistent memory.</p>
+
+<p>Gate order is "cheapest check first": first a stat reads the lock file mtime (=lastConsolidatedAt); after passing the time gate it scans the session directory, and after passing the session-count gate it finally tries to acquire the lock. Each gate failure returns directly, avoiding wasted downstream cost.</p>
+
+<pre class="mermaid">
+graph TD
+  turn-end["Each round stopHooks calls executeAutoDream"] --> gate-check{"isGateOpen?&lt;br/&gt;KAIROS/remote/not enabled → No"}
+  gate-check -->|No| skip["return"]
+  gate-check -->|Yes| read-last["readLastConsolidatedAt read lock file mtime"]
+  read-last --> time-gate{"hoursSince &gt;= minHours?&lt;br/&gt;Default 24h"}
+  time-gate -->|No| skip
+  time-gate -->|Yes| scan-throttle{"Less than 10min since last scan?"}
+  scan-throttle -->|Yes| skip-throttle["return (prevent rescanning every round)"]
+  scan-throttle -->|No| list-sessions["listSessionsTouchedSince scan transcript directory"]
+  list-sessions --> filter-current["Exclude current session"]
+  filter-current --> session-gate{"Count &gt;= minSessions?&lt;br/&gt;Default 5"}
+  session-gate -->|No| skip
+  session-gate -->|Yes| acquire-lock["tryAcquireConsolidationLock write PID"]
+  acquire-lock --> lock-ok{"Acquired lock?"}
+  lock-ok -->|No (held by live PID)| skip
+  lock-ok -->|Yes| register-task["registerDreamTask register background task"]
+  register-task --> build-prompt["buildConsolidationPrompt&lt;br/&gt;+ tool constraints + session list"]
+  build-prompt --> fork["runForkedAgent&lt;br/&gt;canUseTool=createAutoMemCanUseTool&lt;br/&gt;Bash read-only only, Edit/Write limited to memory directory"]
+  fork --> on-msg["onMessage=makeDreamProgressWatcher&lt;br/&gt;Collect text/Edit/Write paths → DreamTask state"]
+  fork --> fork-ok{"Fork succeeded?"}
+  fork-ok -->|Yes| complete["completeDreamTask + appendSystemMessage 'Improved'"]
+  fork-ok -->|No/abort| fail-check{"Was it a user kill?"}
+  fail-check -->|Yes| return-no-rollback["return (kill already rolled back lock)"]
+  fail-check -->|No| fail["failDreamTask + rollbackConsolidationLock revert mtime"]
+</pre>
+
+<p>The lock design is careful: the lock file <em>is</em> lastConsolidatedAt — its mtime is the last consolidation time, and its body is the holder PID. Acquiring the lock means overwriting it with your own PID, then re-reading to verify "what I wrote is still my PID" (when two reclaims race, the last writer wins and the loser bails). On failure the mtime is rolled back to the pre-lock value so the time gate can pass next time. HOLDER_STALE_MS=1h guards against PID reuse: even if the PID is alive, after 1h it is considered stale and can be preempted. Crash scenario: mtime is stuck and the PID is dead; the next process sees a dead PID and reclaims directly.</p>
+
+<h2>III. Background Fork Service Cluster (AgentSummary / PromptSuggestion / MagicDocs / SessionMemory)</h2>
+
+<p>These four services share the same runForkedAgent pattern, but each does different work. Commonalities: all use CacheSafeParams to share the parent's cache, all use canUseTool callbacks to control permissions, all skipTranscript or record as needed. Differences lie in "when to fork, what the fork does, and to what extent tools are allowed."</p>
+
+<pre class="mermaid">
+graph TD
+  turn-end["Main conversation each round ends (postSamplingHook)"] --> branch{Which service?}
+  branch -->|AgentSummary| as-timer["Triggered every 30s by setTimeout"]
+  branch -->|PromptSuggestion| ps-hook["executePromptSuggestion synchronous fork"]
+  branch -->|MagicDocs| md-idle["Conversation idle (no tool call) sequential serial"]
+  branch -->|SessionMemory| sm-thresh["Token + tool-call dual threshold crossed"]
+
+  as-timer --> as-read["getAgentTranscript read coordinator sub-agent latest messages"]
+  as-read --> as-fork["fork + canUseTool deny all&lt;br/&gt;Generate 3-5 word progress summary"]
+  as-fork --> as-update["updateAgentSummary write AgentProgress"]
+
+  ps-hook --> ps-guard["Early session/error/cold cache/permission/throttling → suppress"]
+  ps-guard --> ps-gen["generateSuggestion fork&lt;br/&gt;canUseTool deny all, skipCacheWrite"]
+  ps-gen --> ps-filter["shouldFilterSuggestion 12 filters"]
+  ps-filter --> ps-state["Write promptSuggestion to AppState"]
+  ps-state --> spec-check{"Speculation enabled?"}
+  spec-check -->|Yes| spec-start["startSpeculation pre-run likely user input"]
+
+  md-idle --> md-read["FileReadTool re-read doc (clear cache entry)"]
+  md-read --> md-detect["detectMagicDocHeader still tracked?"]
+  md-detect -->|No| md-untrack["Remove tracking"]
+  md-detect -->|Yes| md-fork["runAgent (not runForkedAgent)&lt;br/&gt;canUseTool only allows Edit of that file"]
+  md-fork --> md-update["Sub-agent updates magic doc content"]
+
+  sm-thresh --> sm-setup["setupSessionMemoryFile create 0600 file + read current content"]
+  sm-setup --> sm-fork["runForkedAgent&lt;br/&gt;canUseTool only allows Edit of memory file"]
+  sm-fork --> sm-record["recordExtractionTokenCount record baseline"]
+</pre>
+
+<p>PromptSuggestion is the heaviest logic in this set. It first performs a bunch of suppression checks (aborted, early session with fewer than 2 rounds, last message was an API error, parent cache cold start with more than 10k uncached tokens, permission pending, elicitation queue, plan mode, external user throttling); any hit suppresses and logs. After the fork, it goes through 12 content filters — done/meta_text/parentheses-wrapped/API error prefix/single-character too short/too long/multiple sentences/formatted/evaluative phrasing/Claude-voice ("Let me...") — filtering out "things the model might say wrong" so only text that genuinely looks like what the user would type is delivered.</p>
+
+<p>speculation is the advanced version of PromptSuggestion: the fork doesn't just generate text, it <em>pre-runs</em> the likely next user input — using an overlay filesystem for copy-on-write isolation of writes, allowing only read-only tools and read-only bash, and aborting + recording boundary when it hits file edits / non-read-only bash / unknown tools. When the user accepts the speculation, changes in the overlay are copied back to the main directory and the speculated messages are injected into the main conversation. Key constraints: the fork uses createChildAbortController (chained to parent), so parent abort propagates; onMessage accumulates toolUseCount as messages arrive, and forces abort after more than 100 messages or 20 rounds.</p>
+
+<p>AgentSummary is the progress summary under coordinator mode: every 30s it forks once using the main thread's CacheSafeParams, pulls the latest messages from the transcript, denies all tools, and generates a 3-5 word present-continuous summary like "Reading runAgent.ts". It deliberately does not pass forkContextMessages into the closure — each tick re-reads from getAgentTranscript, preventing the original fork messages from being pinned forever by the timer.</p>
+
+<p>MagicDocs is the only one that does not use runForkedAgent — it uses runAgent (because it needs its own agent definition and restricted toolset). In the FileReadTool listener it detects the <code># MAGIC DOC: [title]</code> header and the following italic instruction line, registers tracking; when the conversation is idle (no tool call in the previous round) it sequentially updates each tracked doc. canUseTool only allows Edit and file_path must exactly equal that doc's path.</p>
+
+<p>SessionMemory maintains a session-level markdown note. The trigger condition is "token threshold <em>and</em> tool-call threshold" or "token threshold <em>and</em> no tool call in the previous round" — the token threshold is hard to prevent over-extraction. The fork is only allowed to Edit that one memory file.</p>
+
+<h2>IV. Remote Agent Execution: Message Flow and Permission Bridging</h2>
+
+<p>User perspective: connect to a remote CCR session in the local <code>claude</code> CLI, and what you see is the remote agent's conversation — typing, streaming output, and y/n on permission requests. Behind the scenes, RemoteSessionManager coordinates one WebSocket subscription plus one HTTP POST upstream channel.</p>
+
+<p>Data flow has three message categories: SDKMessage (assistant/user/stream_event/system/result/tool_progress and other rendering messages), control_request (CCR asks "can this tool be used"), and control_response (CLI answers "yes/no"). SDKMessages are converted by sdkMessageAdapter into REPL internal Message types for rendering; control_request is routed by RemoteSessionManager to the onPermissionRequest callback and ultimately fed to the local permission UI as a synthetic AssistantMessage by remotePermissionBridge.</p>
+
+<pre class="mermaid">
+graph TD
+  ccr["CCR server (where the remote agent actually runs)"] -->|WebSocket push| ws["SessionsWebSocket"]
+  ws -->|onMessage| rsm["RemoteSessionManager.handleMessage"]
+  rsm --> msg-type{"Message type?"}
+  msg-type -->|SDKMessage| adapter["sdkMessageAdapter.convertSDKMessage"]
+  adapter --> render["Convert to REPL Message and render"]
+  msg-type -->|control_request can_use_tool| perm-req["Store pendingPermissionRequests + onPermissionRequest"]
+  msg-type -->|control_cancel_request| perm-cancel["Delete pending + onPermissionCancelled"]
+  msg-type -->|control_response| ack["Ack only, no action"]
+  perm-req --> bridge["remotePermissionBridge.createSyntheticAssistantMessage"]
+  bridge --> local-ui["Local permission UI popup"]
+  local-ui --> user-decision{"User decision?"}
+  user-decision -->|allow| resp-allow["respondToPermissionRequest behavior=allow + updatedInput"]
+  user-decision -->|deny| resp-deny["behavior=deny + message"]
+  resp-allow --> ws-send["SessionsWebSocket.sendControlResponse"]
+  resp-deny --> ws-send
+  ws-send -->|WebSocket back to| ccr
+  user-input["User inputs message locally"] -->|HTTP POST| rsm-send["RemoteSessionManager.sendMessage"]
+  rsm-send -->|sendEventToRemoteSession| ccr
+  user-interrupt["Ctrl+C / Escape"] -->|control_request interrupt| ccr
+</pre>
+
+<p>The SDK message adapter handles a subtlety: remote user messages may be tool results (content contains tool_result blocks). In direct-connect mode (convertToolResults=true) these must be converted to UserMessage to fold-render like local tool results; in CCR live mode they are ignored — because the local REPL has already added the user message itself. parent_tool_use_id is unreliable (the agent side normalizeMessage hardcodes it to null), so judgment relies on content shape. Success-type result messages are treated as noise and ignored (isLoading=false is enough), only error ones are displayed.</p>
+
+<p>The key to permission bridging: the tool is not running locally at all (it runs in the CCR container), so the AssistantMessage required by ToolUseConfirm is synthetic — the request's tool_use_id/name/input are used to forge an assistant message. If CCR has a tool that the local CLI doesn't know (such as an MCP tool), createToolStub builds a minimal Tool stub and routes it to FallbackPermissionRequest.</p>
+
+<h2>V. SessionsWebSocket: Reconnection State Machine</h2>
+
+<p>This WebSocket is the lifeline of the remote session. The close code determines the next behavior — permanently give up, reconnect with budget, or reconnect instantly.</p>
+
+<pre class="mermaid">
+graph TD
+  conn["connect() to wss://api.../v1/sessions/ws/{id}/subscribe"] --> open{"onopen?"}
+  open -->|Yes| connected["state=connected, reset counters, start 30s ping"]
+  open -->|No/error| closed["onclose with code"]
+  connected --> msg["onmessage → jsonParse → isSessionsMessage → onMessage callback"]
+  connected --> close-ev{"onclose code?"}
+  close-ev -->|4003 unauthorized| permanent["Close permanently, onClose"]
+  close-ev -->|4001 session not found| snf{"4001 retry count &lt;= 3?"}
+  snf -->|Yes| recon-4001["scheduleReconnect 2s*attempt, onReconnecting"]
+  snf -->|No| permanent
+  close-ev -->|Other transient| recon-norm{"reconnectAttempts &lt; 5?"}
+  recon-norm -->|Yes| recon-2s["scheduleReconnect 2s, onReconnecting"]
+  recon-norm -->|No| permanent
+  recon-4001 -->|Reconnect| conn
+  recon-2s -->|Reconnect| conn
+  permanent --> onclose-cb["onClose → RemoteSessionManager.onDisconnected"]
+</pre>
+
+<p>Key points: authentication uses HTTP header (Authorization: Bearer + anthropic-version), not an in-flight auth message — so onopen immediately means connected state. 4001 (session not found) is handled separately because CCR may briefly consider a session stale during compaction; 3 retry budgets are given to avoid false death. isSessionsMessage deliberately only checks "has a string type field" rather than whitelisting — when the backend sends a new message type the client won't silently drop it; downstream decides how to handle it. Bun uses globalThis.WebSocket, Node uses the ws package, and the two event styles are unified (addEventListener vs .on).</p>
+
+<h2>VI. upstreamproxy: CONNECT-over-WebSocket Relay</h2>
+
+<p>User perspective: when the remote CCR container's agent runs curl/gh/kubectl, the HTTPS traffic of these child processes is transparently proxied — through a local 127.0.0.1 CONNECT relay, over the WebSocket tunnel to the CCR server, where the server MITM's TLS and injects organizational credentials (such as DD-API-KEY), then forwards to the real upstream. The agent in the container sees an HTTPS_PROXY env var pointing to this local relay.</p>
+
+<p>Why WebSocket instead of raw CONNECT: the CCR ingress is GKE L7 path-prefix routing, with no connect_matcher; sessions/tunnel already uses this pattern. Byte streams are encapsulated in UpstreamProxyChunk protobuf (single bytes field), compatible with the server's gateway.NewWebSocketStreamAdapter.</p>
+
+<pre class="mermaid">
+graph TD
+  init["initUpstreamProxy (at init.ts startup)"] --> env-check{"CLAUDE_CODE_REMOTE + CCR_UPSTREAM_PROXY_ENABLED?"}
+  env-check -->|No| disabled["state.enabled=false, do nothing"]
+  env-check -->|Yes| read-token["readToken /run/ccr/session_token"]
+  read-token --> token-ok{"Token exists?"}
+  token-ok -->|No| disabled
+  token-ok -->|Yes| prctl["setNonDumpable: prctl PR_SET_DUMPABLE=0 prevent ptrace heap dump"]
+  prctl --> dl-ca["downloadCaBundle fetch /v1/code/upstreamproxy/ca-cert"]
+  dl-ca --> ca-ok{"CA download succeeded?"}
+  ca-ok -->|No| disabled
+  ca-ok -->|Yes| start-relay["startUpstreamProxyRelay listen 127.0.0.1:0"]
+  start-relay --> relay-ok{"Listen succeeded?"}
+  relay-ok -->|No| disabled-relay["Log warn, proxy disabled, token file kept for retry"]
+  relay-ok -->|Yes| unlink["unlink token file → token only in heap"]
+  unlink --> set-state["state.enabled=true, expose HTTPS_PROXY/SSL_CERT_FILE etc. env vars to child processes"]
+</pre>
+
+<p>The relay's own two-phase state machine (Phase 1 parse CONNECT, Phase 2 forward bytes):</p>
+
+<pre class="mermaid">
+graph TD
+  client["curl/gh connects to 127.0.0.1:port"] --> data["socket.data callback"]
+  data --> phase{"ws established?"}
+  phase -->|No phase1| accum["connectBuf accumulate until CRLFCRLF"]
+  accum --> header-too-big{"buffer &gt; 8KB still no CRLFCRLF?"}
+  header-too-big -->|Yes| bad-400["Return 400 Bad Request and disconnect"]
+  header-too-big -->|No| has-header{"Found CONNECT header?"}
+  has-header -->|No| bad-405["Return 405 Method Not Allowed"]
+  has-header -->|Yes| stash-pending["Store bytes after CRLFCRLF as pending"]
+  stash-pending --> open-tunnel["openTunnel build WebSocket to CCR"]
+  open-tunnel --> ws-open{"ws.onopen?"}
+  ws-open -->|Yes| send-head["First chunk sends CONNECT line + Proxy-Authorization + flush pending"]
+  ws-open -->|No wait| buf-pending["Subsequent data goes to pending"]
+  send-head --> phase2["Phase 2: forwarding mode"]
+  buf-pending --> send-head
+  phase2 --> from-client["Client bytes → encodeChunk → ws.send (512KB chunks)"]
+  phase2 --> from-server["ws.onmessage → decodeChunk → sock.write"]
+  from-server --> established{"First byte arrives → established=true"}
+  established --> tunnel["Bidirectional TLS tunnel established"]
+  tunnel --> ws-err{"ws.onerror?"}
+  ws-err -->|Yes not established| send-502["Return 502 Bad Gateway"]
+  ws-err -->|Yes already established| just-close["Close directly (must not pollute TLS stream)"]
+  tunnel --> ws-close{"ws.onclose?"}
+  ws-close --> cleanup["cleanupConn: clear pinger, close ws"]
+</pre>
+
+<p>There is a pile of engineering detail for adversarial edge cases: Bun's sock.write() is partial-write; when the kernel buffer is full it silently drops bytes, so the Bun relay maintains a writeBuf tail queue itself and drains callbacks to flush. Node's net.Socket buffers unconditionally and needs no tail queue. TCP may combine the CONNECT header and ClientHello into one packet, so the pending buffer must catch "bytes after CRLFCRLF"; if socket.data fires again before ws.onopen, those bytes also go to pending. Once the established flag is set true (server's first byte received), plaintext 502 can never be written again — it would pollute the client's TLS stream, so only direct close is allowed. The closed flag prevents ws.onerror followed by ws.onclose from sock.end() twice.</p>
+
+<p>Security design is also worth highlighting: <code>prctl(PR_SET_DUMPABLE, 0)</code> is called via libc FFI to prevent same-UID ptrace heap capture — this blocks prompt-injected <code>gdb -p $PPID</code> from stealing the session token. The token file is unlinked <em>after</em> the relay is up, so if CA download or listen fails the supervisor restart can still retry. The NO_PROXY list excludes Anthropic API, GitHub, and various package registries — MITM would break non-Bun runtimes (Python httpx/certifi doesn't trust the forged CA). Child process env inheritance has a branch: if the parent already set HTTPS_PROXY+SSL_CERT_FILE (meaning the parent is running a relay), the child CLI inherits them directly, because the token file has already been unlinked by the parent and the child cannot re-init a relay.</p>
+
+<p>The entire upstreamproxy is a fail-open exemplar: env not set → disabled, token gone → disabled, CA download failed → disabled, relay listen failed → disabled; each step only logs at logForDebugging warn level, never throws, never drags down the session.</p>
+
+<h2>VII. Remote Session History Pagination</h2>
+
+<p>sessionHistory.ts provides paginated event history for remote sessions — for "view older messages." It uses HTTP GET /v1/sessions/{id}/events, axios with OAuth header + anthropic-beta: ccr-byoc-2025-07-29 + x-organization-uuid. Two cursor modes: fetchLatestEvents uses anchor_to_latest=true to get the latest page; fetchOlderEvents uses before_id to get the older page before a specified cursor. Each page has 100 items; has_more indicates older items exist. validateStatus: () => true + .catch(() => null) downgrades any HTTP error to a null return, leaving handling to the caller — also fail-open style. createHistoryAuthCtx prepares auth headers once and reuses them, avoiding prepareApiRequest per page.</p>
+
+<script>
+window.__sourceMap = {
+  "stop-hooks": { "file": "src/utils/forkedAgent.ts", "startLine": 70, "endLine": 82 },
+  "save-csp": { "file": "src/utils/forkedAgent.ts", "startLine": 75, "endLine": 77 },
+  "fork-call": { "file": "src/utils/forkedAgent.ts", "startLine": 489, "endLine": 518 },
+  "create-ctx": { "file": "src/utils/forkedAgent.ts", "startLine": 345, "endLine": 462 },
+  "clone-state": { "file": "src/utils/forkedAgent.ts", "startLine": 379, "endLine": 403 },
+  "new-abort": { "file": "src/utils/forkedAgent.ts", "startLine": 349, "endLine": 355 },
+  "no-op-cbs": { "file": "src/utils/forkedAgent.ts", "startLine": 410, "endLine": 436 },
+  "build-msgs": { "file": "src/utils/forkedAgent.ts", "startLine": 514, "endLine": 541 },
+  "query-loop": { "file": "src/utils/forkedAgent.ts", "startLine": 544, "endLine": 598 },
+  "stream-ev": { "file": "src/utils/forkedAgent.ts", "startLine": 558, "endLine": 575 },
+  "acc-usage": { "file": "src/utils/forkedAgent.ts", "startLine": 558, "endLine": 568 },
+  "record-tx": { "file": "src/utils/forkedAgent.ts", "startLine": 580, "endLine": 597 },
+  "push-msg": { "file": "src/utils/forkedAgent.ts", "startLine": 577, "endLine": 578 },
+  "clear-cache": { "file": "src/utils/forkedAgent.ts", "startLine": 599, "endLine": 604 },
+  "log-event": { "file": "src/utils/forkedAgent.ts", "startLine": 631, "endLine": 689 },
+  "return-result": { "file": "src/utils/forkedAgent.ts", "startLine": 622, "endLine": 626 },
+  "turn-end": { "file": "src/services/autoDream/autoDream.ts", "startLine": 319, "endLine": 324 },
+  "gate-check": { "file": "src/services/autoDream/autoDream.ts", "startLine": 95, "endLine": 100 },
+  "skip": { "file": "src/services/autoDream/autoDream.ts", "startLine": 128, "endLine": 129 },
+  "read-last": { "file": "src/services/autoDream/autoDream.ts", "startLine": 131, "endLine": 139 },
+  "time-gate": { "file": "src/services/autoDream/autoDream.ts", "startLine": 140, "endLine": 141 },
+  "scan-throttle": { "file": "src/services/autoDream/autoDream.ts", "startLine": 143, "endLine": 151 },
+  "skip-throttle": { "file": "src/services/autoDream/autoDream.ts", "startLine": 145, "endLine": 150 },
+  "list-sessions": { "file": "src/services/autoDream/autoDream.ts", "startLine": 153, "endLine": 162 },
+  "filter-current": { "file": "src/services/autoDream/autoDream.ts", "startLine": 164, "endLine": 165 },
+  "session-gate": { "file": "src/services/autoDream/autoDream.ts", "startLine": 166, "endLine": 171 },
+  "acquire-lock": { "file": "src/services/autoDream/autoDream.ts", "startLine": 173, "endLine": 190 },
+  "lock-ok": { "file": "src/services/autoDream/autoDream.ts", "startLine": 189, "endLine": 190 },
+  "register-task": { "file": "src/services/autoDream/autoDream.ts", "startLine": 200, "endLine": 208 },
+  "build-prompt": { "file": "src/services/autoDream/autoDream.ts", "startLine": 210, "endLine": 223 },
+  "fork": { "file": "src/services/autoDream/autoDream.ts", "startLine": 224, "endLine": 233 },
+  "on-msg": { "file": "src/services/autoDream/autoDream.ts", "startLine": 281, "endLine": 313 },
+  "fork-ok": { "file": "src/services/autoDream/autoDream.ts", "startLine": 234, "endLine": 257 },
+  "complete": { "file": "src/services/autoDream/autoDream.ts", "startLine": 235, "endLine": 248 },
+  "fail-check": { "file": "src/services/autoDream/autoDream.ts", "startLine": 258, "endLine": 271 },
+  "return-no-rollback": { "file": "src/services/autoDream/autoDream.ts", "startLine": 262, "endLine": 265 },
+  "fail": { "file": "src/services/autoDream/autoDream.ts", "startLine": 266, "endLine": 270 },
+  "branch": { "file": "src/utils/hooks/postSamplingHooks.ts", "startLine": 45, "endLine": 70 },
+  "as-timer": { "file": "src/services/AgentSummary/agentSummary.ts", "startLine": 26, "endLine": 26 },
+  "as-read": { "file": "src/services/AgentSummary/agentSummary.ts", "startLine": 67, "endLine": 78 },
+  "as-fork": { "file": "src/services/AgentSummary/agentSummary.ts", "startLine": 109, "endLine": 119 },
+  "as-update": { "file": "src/services/AgentSummary/agentSummary.ts", "startLine": 124, "endLine": 143 },
+  "ps-hook": { "file": "src/services/PromptSuggestion/promptSuggestion.ts", "startLine": 184, "endLine": 237 },
+  "ps-guard": { "file": "src/services/PromptSuggestion/promptSuggestion.ts", "startLine": 136, "endLine": 163 },
+  "ps-gen": { "file": "src/services/PromptSuggestion/promptSuggestion.ts", "startLine": 294, "endLine": 352 },
+  "ps-filter": { "file": "src/services/PromptSuggestion/promptSuggestion.ts", "startLine": 354, "endLine": 456 },
+  "ps-state": { "file": "src/services/PromptSuggestion/promptSuggestion.ts", "startLine": 203, "endLine": 212 },
+  "spec-check": { "file": "src/services/PromptSuggestion/promptSuggestion.ts", "startLine": 214, "endLine": 222 },
+  "spec-start": { "file": "src/services/PromptSuggestion/speculation.ts", "startLine": 402, "endLine": 715 },
+  "md-idle": { "file": "src/services/MagicDocs/magicDocs.ts", "startLine": 217, "endLine": 240 },
+  "md-read": { "file": "src/services/MagicDocs/magicDocs.ts", "startLine": 132, "endLine": 153 },
+  "md-detect": { "file": "src/services/MagicDocs/magicDocs.ts", "startLine": 52, "endLine": 81 },
+  "md-untrack": { "file": "src/services/MagicDocs/magicDocs.ts", "startLine": 156, "endLine": 161 },
+  "md-fork": { "file": "src/services/MagicDocs/magicDocs.ts", "startLine": 194, "endLine": 212 },
+  "md-update": { "file": "src/services/MagicDocs/magicDocs.ts", "startLine": 114, "endLine": 212 },
+  "sm-thresh": { "file": "src/services/SessionMemory/sessionMemory.ts", "startLine": 134, "endLine": 181 },
+  "sm-setup": { "file": "src/services/SessionMemory/sessionMemory.ts", "startLine": 183, "endLine": 233 },
+  "sm-fork": { "file": "src/services/SessionMemory/sessionMemory.ts", "startLine": 318, "endLine": 325 },
+  "sm-record": { "file": "src/services/SessionMemory/sessionMemory.ts", "startLine": 327, "endLine": 349 },
+  "ccr": { "file": "src/remote/RemoteSessionManager.ts", "startLine": 87, "endLine": 95 },
+  "ws": { "file": "src/remote/SessionsWebSocket.ts", "startLine": 82, "endLine": 95 },
+  "rsm": { "file": "src/remote/RemoteSessionManager.ts", "startLine": 146, "endLine": 184 },
+  "msg-type": { "file": "src/remote/RemoteSessionManager.ts", "startLine": 152, "endLine": 184 },
+  "adapter": { "file": "src/remote/sdkMessageAdapter.ts", "startLine": 168, "endLine": 278 },
+  "render": { "file": "src/remote/sdkMessageAdapter.ts", "startLine": 145, "endLine": 148 },
+  "perm-req": { "file": "src/remote/RemoteSessionManager.ts", "startLine": 189, "endLine": 214 },
+  "perm-cancel": { "file": "src/remote/RemoteSessionManager.ts", "startLine": 159, "endLine": 172 },
+  "ack": { "file": "src/remote/RemoteSessionManager.ts", "startLine": 175, "endLine": 178 },
+  "bridge": { "file": "src/remote/remotePermissionBridge.ts", "startLine": 12, "endLine": 46 },
+  "local-ui": { "file": "src/remote/remotePermissionBridge.ts", "startLine": 53, "endLine": 78 },
+  "user-decision": { "file": "src/remote/RemoteSessionManager.ts", "startLine": 247, "endLine": 282 },
+  "resp-allow": { "file": "src/remote/RemoteSessionManager.ts", "startLine": 263, "endLine": 275 },
+  "resp-deny": { "file": "src/remote/RemoteSessionManager.ts", "startLine": 263, "endLine": 275 },
+  "ws-send": { "file": "src/remote/SessionsWebSocket.ts", "startLine": 328, "endLine": 336 },
+  "user-input": { "file": "src/remote/RemoteSessionManager.ts", "startLine": 219, "endLine": 242 },
+  "rsm-send": { "file": "src/remote/RemoteSessionManager.ts", "startLine": 219, "endLine": 242 },
+  "user-interrupt": { "file": "src/remote/RemoteSessionManager.ts", "startLine": 294, "endLine": 297 },
+  "conn": { "file": "src/remote/SessionsWebSocket.ts", "startLine": 100, "endLine": 205 },
+  "open": { "file": "src/remote/SessionsWebSocket.ts", "startLine": 130, "endLine": 139 },
+  "connected": { "file": "src/remote/SessionsWebSocket.ts", "startLine": 134, "endLine": 138 },
+  "closed": { "file": "src/remote/SessionsWebSocket.ts", "startLine": 234, "endLine": 288 },
+  "msg": { "file": "src/remote/SessionsWebSocket.ts", "startLine": 210, "endLine": 229 },
+  "close-ev": { "file": "src/remote/SessionsWebSocket.ts", "startLine": 234, "endLine": 288 },
+  "permanent": { "file": "src/remote/SessionsWebSocket.ts", "startLine": 247, "endLine": 253 },
+  "snf": { "file": "src/remote/SessionsWebSocket.ts", "startLine": 258, "endLine": 272 },
+  "recon-4001": { "file": "src/remote/SessionsWebSocket.ts", "startLine": 267, "endLine": 271 },
+  "recon-norm": { "file": "src/remote/SessionsWebSocket.ts", "startLine": 275, "endLine": 283 },
+  "recon-2s": { "file": "src/remote/SessionsWebSocket.ts", "startLine": 279, "endLine": 283 },
+  "onclose-cb": { "file": "src/remote/SessionsWebSocket.ts", "startLine": 251, "endLine": 252 },
+  "init": { "file": "src/upstreamproxy/upstreamproxy.ts", "startLine": 79, "endLine": 153 },
+  "env-check": { "file": "src/upstreamproxy/upstreamproxy.ts", "startLine": 85, "endLine": 94 },
+  "disabled": { "file": "src/upstreamproxy/upstreamproxy.ts", "startLine": 86, "endLine": 87 },
+  "read-token": { "file": "src/upstreamproxy/upstreamproxy.ts", "startLine": 105, "endLine": 110 },
+  "token-ok": { "file": "src/upstreamproxy/upstreamproxy.ts", "startLine": 107, "endLine": 110 },
+  "prctl": { "file": "src/upstreamproxy/upstreamproxy.ts", "startLine": 225, "endLine": 252 },
+  "dl-ca": { "file": "src/upstreamproxy/upstreamproxy.ts", "startLine": 254, "endLine": 285 },
+  "ca-ok": { "file": "src/upstreamproxy/upstreamproxy.ts", "startLine": 125, "endLine": 130 },
+  "start-relay": { "file": "src/upstreamproxy/upstreamproxy.ts", "startLine": 132, "endLine": 135 },
+  "relay-ok": { "file": "src/upstreamproxy/upstreamproxy.ts", "startLine": 145, "endLine": 150 },
+  "disabled-relay": { "file": "src/upstreamproxy/upstreamproxy.ts", "startLine": 146, "endLine": 149 },
+  "unlink": { "file": "src/upstreamproxy/upstreamproxy.ts", "startLine": 140, "endLine": 144 },
+  "set-state": { "file": "src/upstreamproxy/upstreamproxy.ts", "startLine": 160, "endLine": 199 },
+  "client": { "file": "src/upstreamproxy/relay.ts", "startLine": 155, "endLine": 174 },
+  "data": { "file": "src/upstreamproxy/relay.ts", "startLine": 295, "endLine": 342 },
+  "phase": { "file": "src/upstreamproxy/relay.ts", "startLine": 306, "endLine": 307 },
+  "accum": { "file": "src/upstreamproxy/relay.ts", "startLine": 307, "endLine": 316 },
+  "header-too-big": { "file": "src/upstreamproxy/relay.ts", "startLine": 311, "endLine": 314 },
+  "bad-400": { "file": "src/upstreamproxy/relay.ts", "startLine": 312, "endLine": 313 },
+  "has-header": { "file": "src/upstreamproxy/relay.ts", "startLine": 319, "endLine": 324 },
+  "bad-405": { "file": "src/upstreamproxy/relay.ts", "startLine": 321, "endLine": 323 },
+  "stash-pending": { "file": "src/upstreamproxy/relay.ts", "startLine": 326, "endLine": 330 },
+  "open-tunnel": { "file": "src/upstreamproxy/relay.ts", "startLine": 344, "endLine": 428 },
+  "ws-open": { "file": "src/upstreamproxy/relay.ts", "startLine": 378, "endLine": 396 },
+  "send-head": { "file": "src/upstreamproxy/relay.ts", "startLine": 378, "endLine": 396 },
+  "buf-pending": { "file": "src/upstreamproxy/relay.ts", "startLine": 337, "endLine": 340 },
+  "phase2": { "file": "src/upstreamproxy/relay.ts", "startLine": 336, "endLine": 342 },
+  "from-client": { "file": "src/upstreamproxy/relay.ts", "startLine": 436, "endLine": 442 },
+  "from-server": { "file": "src/upstreamproxy/relay.ts", "startLine": 398, "endLine": 408 },
+  "established": { "file": "src/upstreamproxy/relay.ts", "startLine": 404, "endLine": 406 },
+  "tunnel": { "file": "src/upstreamproxy/relay.ts", "startLine": 404, "endLine": 408 },
+  "ws-err": { "file": "src/upstreamproxy/relay.ts", "startLine": 410, "endLine": 420 },
+  "send-502": { "file": "src/upstreamproxy/relay.ts", "startLine": 415, "endLine": 417 },
+  "just-close": { "file": "src/upstreamproxy/relay.ts", "startLine": 415, "endLine": 418 },
+  "ws-close": { "file": "src/upstreamproxy/relay.ts", "startLine": 422, "endLine": 427 },
+  "cleanup": { "file": "src/upstreamproxy/relay.ts", "startLine": 444, "endLine": 455 }
+};
+</script>
+
+<aside id="source-panel"><div id="source-header"></div><div id="monaco-container"></div></aside>
+<script src="../assets/codeindex-runtime.js"></script>
+<script src="../assets/codeindex.js"></script>
+</body></html>

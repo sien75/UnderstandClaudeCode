@@ -1,106 +1,99 @@
 <!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Slash Command System</title>
-<link rel="stylesheet" href="../assets/codeindex.css">
-</head>
-<body>
-<nav class="topnav"><a href="../index.html">← Back to overview</a></nav>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Slash Command System</title><link rel="stylesheet" href="../assets/codeindex.css"></head><body>
+<nav class="topnav"><a href="../index.html">← Back to Overview</a></nav>
 <h1>Slash Command System</h1>
 
-<p>When the user types text starting with a slash in the REPL input box, like <code>/commit</code>, <code>/review</code>, or <code>/compact</code>, a command is triggered. That command may run local code directly (e.g. compress conversation history), pop up an interactive panel (e.g. a settings UI), or simply stuff a pre-written prompt into the conversation for the model to act on (e.g. asking the model to write a git commit message). This module is responsible for parsing the typed line into "command name + arguments," finding the matching command among all available ones, dispatching to a different execution path based on its type, and returning the result as messages back into the conversation flow.</p>
+<p>When the user types <code>/commit</code>, <code>/review</code>, <code>/compact</code>, or any other slash-prefixed text in the REPL input box, a command is triggered. That command may run local code (e.g., compact conversation history), pop an interactive panel (e.g., a settings UI), or simply inject a prepared prompt for the model to act on (e.g., ask the model to write a git commit). This module is responsible for parsing the typed line into "command name + arguments," finding the matching command among all available ones, dispatching by its type down different execution paths, and returning the result as messages back into the conversation stream.</p>
 
 <dl>
   <dt>Input</dt>
-  <dd>A line typed by the user in the REPL, e.g. <code>/compact please keep test-related content</code> — the first word after the slash is the command name, the rest are arguments</dd>
+  <dd>A line of text typed in the REPL, such as <code>/compact please keep test-related content</code>—the first word after the slash is the command name, the rest is arguments</dd>
   <dt>Output</dt>
-  <dd>A set of messages fed back into the conversation flow: prompt content for the model (triggering a new model call), local execution results shown directly to the user, or a React/Ink UI waiting to be rendered</dd>
+  <dd>A set of messages fed back into the conversation stream: may be prompt content for the model (triggering a new model call), locally-executed result shown directly to the user, or a React/Ink UI to render</dd>
 </dl>
 
 <pre class="mermaid">
 graph TD
-  user-input["User types /xxx args in REPL"] --> parse["Parse slash command&lt;br/&gt;split command name and arguments"]
+  user-input["User types /xxx args in REPL"] --> parse["Parse slash command<br/>split command name and args"]
   parse --> is-slash{"Starts with /?"}
-  is-slash -->|No| as-prompt["Treat as ordinary prompt&lt;br/&gt;send directly to model"]
-  is-slash -->|Yes| has-cmd{"Command name exists in&lt;br/&gt;loaded command table?"}
-  has-cmd -->|No| looks-cmd{"Looks like a command name&lt;br/&gt;rather than a file path?"}
-  looks-cmd -->|Like command name| unknown["Prompt: Unknown skill&lt;br/&gt;keep arguments for user to resend"]
+  is-slash -->|No| as-prompt["Treat as ordinary prompt<br/>send directly to model"]
+  is-slash -->|Yes| has-cmd{"Command name exists in<br/>loaded command table?"}
+  has-cmd -->|No| looks-cmd{"Looks like a command name<br/>rather than a file path?"}
+  looks-cmd -->|Like command name| unknown["Prompt Unknown skill<br/>and keep args for user to resend"]
   looks-cmd -->|File path etc.| as-prompt
-  has-cmd -->|Yes| user-invocable{"User directly invocable?&lt;br/&gt;(userInvocable)"}
-  user-invocable -->|No, model-only| only-model["Prompt: ask Claude&lt;br/&gt;to invoke this skill for you"]
+  has-cmd -->|Yes| user-invocable{"Allowed for direct user invocation?<br/>(userInvocable)"}
+  user-invocable -->|No, model-only| only-model["Prompt: ask Claude<br/>to invoke this skill for you"]
   user-invocable -->|Yes| dispatch{"Dispatch by command.type"}
-  dispatch -->|local-jsx| jsx-path["Load implementation module → render Ink UI&lt;br/&gt;wait for user to finish in panel, callback onDone"]
-  dispatch -->|local| local-path["Load implementation module → sync call() execute&lt;br/&gt;return text/compact/skip"]
-  dispatch -->|prompt| prompt-path["Get prompt content&lt;br/&gt;stuff into conversation flow to trigger model"]
+  dispatch -->|local-jsx| jsx-path["Load implementation module → render Ink UI<br/>wait for user action in panel, then callback onDone"]
+  dispatch -->|local| local-path["Load implementation module → sync execute call()<br/>return text/compact/skip"]
+  dispatch -->|prompt| prompt-path["Take prompt content<br/>inject into conversation stream to trigger model"]
   jsx-path --> result
-  local-path --> result["Wrap result as messages back into conversation flow"]
+  local-path --> result["Result wrapped as message and fed back into conversation stream"]
   prompt-path --> result
 </pre>
 
 <ul>
-  <li>The command table is not a hardcoded list; it is built from built-in commands + skill-directory commands + plugin commands + workflow commands + dynamically discovered skills. Every <code>getCommands()</code> call re-filters availability and enabled status.</li>
+  <li>The command table is not a hardcoded list; it is built from built-in commands + skill-directory commands + plugin commands + workflow commands + dynamically discovered skills. Every <code>getCommands()</code> call re-filters availability and enabled state.</li>
   <li>Command-name lookup matches <code>name</code>, <code>userFacingName()</code>, and <code>aliases</code>, so <code>/settings</code> can find the <code>config</code> command (which has an alias).</li>
-  <li>When a command name is not found, the system checks whether it is a file path (e.g. <code>/tmp/xxx</code>) — if it is a path, it is treated as ordinary input to the model to avoid false warnings.</li>
+  <li>When the command name is not found, the system checks whether it is a file path (e.g., <code>/tmp/xxx</code>)—if it is a path, the input is treated as ordinary prompt text to avoid false warnings.</li>
 </ul>
 
-<h2>How the Three Command Types Execute</h2>
+<h2>How Each of the Three Command Types Executes</h2>
 
-<p>Each command object's <code>type</code> field determines its execution path. The essential difference among the three types is "how the result is presented to the user/model": prompt-type stuffs content into the model to trigger a new conversation round; local-type runs code directly and shows the result as <code>&lt;local-command-stdout&gt;</code> without sending it to the model; local-JSX-type pops up an Ink-rendered interactive panel, and after the user operates inside it, the <code>onDone</code> callback wraps up.</p>
+<p>Each command object's <code>type</code> field determines its execution path. The essential difference among the three types is "how the result is presented to the user/model": prompt-type injects content to trigger a new conversation turn; local-type runs code directly and displays the result as <code>&lt;local-command-stdout&gt;</code> without sending it to the model; local-JSX-type pops an Ink-rendered interactive panel, and after the user acts in the panel it cleans up via the <code>onDone</code> callback.</p>
 
 <pre class="mermaid">
 graph TD
-  subgraph prompt-type["PromptCommand: prompt type"]
+  subgraph prompt-type["PromptCommand (prompt type)"]
     p-check-fork{"context === fork?"}
-    p-check-fork -->|Yes| p-fork["Run in child agent&lt;br/&gt;runAgent independent context"]
-    p-check-fork -->|No inline| p-getprompt["Call command.getPromptForCommand()&lt;br/&gt;get content blocks"]
-    p-getprompt --> p-hooks{"Command has hooks&lt;br/&gt;and trusted source?"}
+    p-check-fork -->|Yes| p-fork["Run in child agent<br/>runAgent independent context"]
+    p-check-fork -->|No inline| p-getprompt["Call command.getPromptForCommand()<br/>get content blocks"]
+    p-getprompt --> p-hooks{"Command has hooks<br/>and source is trusted?"}
     p-hooks -->|Yes| p-reg-hooks["Register skill hooks"]
     p-hooks -->|No| p-attach
-    p-reg-hooks --> p-attach["Attach allowedTools/model&lt;br/&gt;wrap as isMeta message"]
-    p-attach --> p-query["shouldQuery=true&lt;br/&gt;trigger new model round"]
+    p-reg-hooks --> p-attach["Attach allowedTools/model<br/>wrap as isMeta message"]
+    p-attach --> p-query["shouldQuery=true<br/>trigger new model turn"]
   end
-  subgraph local-type["LocalCommand: local type"]
+  subgraph local-type["LocalCommand (local type)"]
     l-load["await command.load()"] --> l-call["mod.call(args, context)"]
     l-call --> l-res{"Return type"}
     l-res -->|skip| l-skip["Produce no message"]
     l-res -->|text| l-text["Wrap as local-command-stdout"]
-    l-res -->|compact| l-compact["Go through compact post-processing&lt;br/&gt;rebuild conversation messages"]
+    l-res -->|compact| l-compact["Go through compact post-processing<br/>rebuild conversation messages"]
     l-call --> l-err["call throws → wrap as local-command-stderr"]
   end
-  subgraph jsx-type["LocalJSXCommand: local-JSX type"]
+  subgraph jsx-type["LocalJSXCommand (local-JSX type)"]
     j-load["command.load()→mod.call(onDone,ctx,args)"] --> j-jsx{"Returns JSX?"}
-    j-jsx -->|Yes| j-render["setToolJSX renders full-screen panel&lt;br/&gt;hide input box"]
-    j-jsx -->|Empty and onDone not called| j-wait["Wait for user to operate inside panel"]
-    j-render --> j-done["User finishes → onDone callback"]
+    j-jsx -->|Yes| j-render["setToolJSX render full-screen panel<br/>hide input box"]
+    j-jsx -->|Empty and onDone not called| j-wait["Wait for user action inside panel"]
+    j-render --> j-done["User action done → callback onDone"]
     j-done --> j-disp{"display option"}
     j-disp -->|skip| j-skip["Add no message"]
-    j-disp -->|system| j-sys["Command input + stdout as system message"]
+    j-disp -->|system| j-sys["Command input+stdout as system message"]
     j-disp -->|default user| j-user["Shown as user message"]
-    j-load --> j-err["load/call throws → clear panel&lt;br/&gt;avoid queue deadlock"]
+    j-load --> j-err["load/call throws → clear panel<br/>avoid queue deadlock"]
   end
 </pre>
 
 <ul>
-  <li>Prompt-type can fork further: <code>context: 'fork'</code> skills run in a child agent with its own context and token budget, and the result returns to the main conversation as <code>&lt;local-command-stdout&gt;</code>; <code>inline</code> (default) stuffs the content directly into the current conversation.</li>
-  <li>Local-type's <code>compact</code> is one of the few commands that rewrites the entire conversation history — it compresses old messages into a summary and replaces them, so it goes through a dedicated <code>buildPostCompactMessages</code> to rebuild the message stream rather than simply appending.</li>
-  <li>Local-JSX-type's <code>onDone</code> callback is the key: if the command implementation neither calls <code>onDone</code> nor returns JSX, the outer Promise hangs forever and deadlocks the input queue, so the dispatch logic has a fallback cleanup for <code>load/call</code> errors.</li>
-  <li>All three types support lazy loading: <code>load()</code> returns <code>import('./xxx.js')</code>, deferring heavy dependencies until the command is actually invoked, avoiding pulling every command's dependencies at startup.</li>
+  <li>Prompt-type can further fork: <code>context: 'fork'</code> skills run in a child agent (with their own context and token budget), and the result returns to the main conversation as <code>&lt;local-command-stdout&gt;</code>; <code>inline</code> (default) injects content directly into the current conversation.</li>
+  <li>Local-type <code>compact</code> is one of the few commands that rewrites the entire conversation history—it compresses old messages into a summary and replaces them, so it goes through dedicated <code>buildPostCompactMessages</code> to rebuild the message stream rather than simply appending.</li>
+  <li>Local-JSX-type's <code>onDone</code> callback is key: if the command implementation neither calls <code>onDone</code> nor returns JSX, the outer Promise hangs forever and deadlocks the input queue, so the dispatch logic has a fallback cleanup for <code>load/call</code> errors.</li>
+  <li>All three types support lazy loading: <code>load()</code> returns <code>import('./xxx.js')</code>, deferring heavy dependencies until the command is actually invoked, avoiding pulling in every command's dependencies at startup.</li>
 </ul>
 
 <h2>Where Commands Come From: Registration and Loading</h2>
 
-<p>The commands available to the user come from several sources; the system aggregates them into one table in <code>getCommands(cwd)</code>. Built-in commands are a hardcoded array; skill-directory commands come from SKILL.md files scanned under <code>.claude/skills/</code> and similar directories; plugin commands come from enabled plugins; workflow commands come from workflow scripts. After aggregation, two gates are applied in sequence: <code>meetsAvailabilityRequirement</code> (filters by account type, e.g. some commands are visible only to claude.ai subscribers) and <code>isCommandEnabled</code> (filters by feature flags/environment variables).</p>
+<p>The commands the user can type come from several sources; the system aggregates them into one table in <code>getCommands(cwd)</code>. Built-in commands are a hardcoded array; skill-directory commands come from SKILL.md files scanned under <code>.claude/skills/</code> and similar directories; plugin commands come from enabled plugins; workflow commands come from workflow scripts. After aggregation they pass through two gates: <code>meetsAvailabilityRequirement</code> (filter by account type, e.g., some commands are visible only to claude.ai subscribers) and <code>isCommandEnabled</code> (filter by feature flag/environment variable).</p>
 
 <pre class="mermaid">
 graph TD
-  loadall["loadAllCommands(cwd)&lt;br/&gt;load all sources in parallel"] --> src-skills["Skill-directory commands&lt;br/&gt;getSkillDirCommands"]
-  loadall --> src-plugin["Plugin commands&lt;br/&gt;getPluginCommands"]
-  loadall --> src-workflow["Workflow commands&lt;br/&gt;getWorkflowCommands"]
-  loadall --> src-bundled["Bundled skills&lt;br/&gt;getBundledSkills"]
+  loadall["loadAllCommands(cwd)<br/>load all sources in parallel"] --> src-skills["Skill-directory commands<br/>getSkillDirCommands"]
+  loadall --> src-plugin["Plugin commands<br/>getPluginCommands"]
+  loadall --> src-workflow["Workflow commands<br/>getWorkflowCommands"]
+  loadall --> src-bundled["Bundled skills<br/>getBundledSkills"]
   loadall --> src-builtin-plugin["Built-in plugin skills"]
-  loadall --> src-plugin-skills["Plugin skills&lt;br/&gt;getPluginSkills"]
+  loadall --> src-plugin-skills["Plugin skills<br/>getPluginSkills"]
   loadall --> src-commands["Built-in command array COMMANDS()"]
   src-skills --> merge["Merge into one table"]
   src-plugin --> merge
@@ -109,31 +102,31 @@ graph TD
   src-builtin-plugin --> merge
   src-plugin-skills --> merge
   src-commands --> merge
-  merge --> dyn["Overlay runtime dynamically discovered skills&lt;br/&gt;getDynamicSkills()"]
-  dyn --> avail{"meetsAvailabilityRequirement&lt;br/&gt;account type matches?"}
+  merge --> dyn["Overlay runtime dynamically discovered skills<br/>getDynamicSkills()"]
+  dyn --> avail{"meetsAvailabilityRequirement<br/>account type matches?"}
   avail -->|No| drop["Drop"]
-  avail -->|Yes| enabled{"isCommandEnabled&lt;br/&gt;feature flag enabled?"}
+  avail -->|Yes| enabled{"isCommandEnabled<br/>feature flag enabled?"}
   enabled -->|No| drop
   enabled -->|Yes| final["Return final available command table"]
 </pre>
 
 <ul>
-  <li>The loading process is memoized (by cwd), because scanning directories and dynamic imports are expensive; but availability and enabled checks are rerun every time, so the command list updates immediately after a user switches accounts with <code>/login</code>.</li>
-  <li>The built-in command array also contains "conditionally loaded" commands, gated by <code>feature('XXX')</code> flags deciding whether to <code>require</code> them — e.g. <code>bridge</code>, <code>voice</code>, <code>ultraplan</code>; external builds dead-code-eliminate these.</li>
-  <li>There is also a set of <code>INTERNAL_ONLY_COMMANDS</code> (commit, bughunter, version, etc.), merged only when <code>USER_TYPE === 'ant'</code> and not in demo mode, invisible to external users.</li>
-  <li>The same name may come from multiple sources; dynamic skills deduplicate: they are inserted only if the base table does not already have that name, and inserted before built-in commands.</li>
+  <li>The loading process is memoized by cwd, because scanning directories and dynamic imports are expensive; but availability and enabled checks are re-run every time, so the command list updates immediately after the user switches accounts with <code>/login</code>.</li>
+  <li>The built-in command array also contains a batch of "conditionally loaded" commands, gated by <code>feature('XXX')</code> flags deciding whether to <code>require</code> them in—e.g., <code>bridge</code>, <code>voice</code>, <code>ultraplan</code>; these branches are dead-code-eliminated in external builds.</li>
+  <li>Another set, <code>INTERNAL_ONLY_COMMANDS</code> (commit, bughunter, version, etc.), is merged into the command table only when <code>USER_TYPE === 'ant'</code> and not in demo mode; invisible to external users.</li>
+  <li>The same name may come from multiple sources; dynamic skills dedupe: they're only inserted when the base table doesn't already have that name, and inserted before built-in commands.</li>
 </ul>
 
 <h2>Permissions and Availability: Who Can Use, When</h2>
 
-<p>Command objects have two independent dimensions of switches. <code>availability</code> describes "who is eligible to see this command" — a static account-type requirement (claude.ai subscriber / Console API key user); if not met, the command never appears in the table. <code>isEnabled()</code> describes "whether this command is currently on" — it reads feature flags, environment variables, and other dynamic state. In addition, there are <code>userInvocable</code> (can the user type it directly, or only the model invoke it on their behalf), <code>isHidden</code> (hidden from typeahead/help), <code>disableModelInvocation</code> (forbids the model from invoking via the Skill tool), and other control bits.</p>
+<p>Command objects have two independent dimension switches. <code>availability</code> describes "who is eligible to see this command"—a static account-type requirement (claude.ai subscriber / Console API key user); if not met, the command doesn't appear in the table at all. <code>isEnabled()</code> describes "whether this command is currently on"—it reads feature flags, environment variables, and other dynamic state. In addition there are <code>userInvocable</code> (can the user type it directly, or can only the model invoke it on their behalf), <code>isHidden</code> (hide from typeahead/help), <code>disableModelInvocation</code> (forbid the model from invoking via the Skill tool), and other control bits.</p>
 
-<p>Remote mode (<code>--remote</code>) and bridge mode (phone/web clients) have extra safety allowlists: <code>REMOTE_SAFE_COMMANDS</code> only allows commands that affect local TUI state and do not depend on the local filesystem; <code>BRIDGE_SAFE_COMMANDS</code> controls which <code>local</code>-type commands can be triggered from a phone, while <code>local-jsx</code>-type commands are disabled entirely because they would pop an Ink full-screen panel.</p>
+<p>Remote mode (<code>--remote</code>) and bridge mode (mobile/web clients) have extra safety allowlists: <code>REMOTE_SAFE_COMMANDS</code> only permits commands that affect local TUI state and don't depend on the local filesystem; <code>BRIDGE_SAFE_COMMANDS</code> controls which <code>local</code>-type commands can be triggered from a mobile device, while <code>local-jsx</code>-type commands are disabled wholesale because they pop a full-screen Ink panel.</p>
 
 <ul>
-  <li>Permission gates are filtered before <code>getCommands()</code> returns, so the command table the REPL receives contains no commands the user cannot use; the dispatch phase does not need to re-check permissions.</li>
+  <li>Permission gates are filtered before <code>getCommands()</code> returns, so the command table the REPL receives contains no commands the user cannot use; the dispatch phase doesn't need to check permissions again.</li>
   <li>The command's <code>source</code> field (builtin/mcp/plugin/bundled/skills/...) is shown in the typeahead description, letting the user see at a glance whether a command is built-in or brought by a plugin.</li>
-  <li>Prompt-type commands can also carry <code>allowedTools</code>, temporarily granting the model extra tool permissions when invoked (e.g. <code>/commit</code> temporarily opens up <code>git add/status/commit</code> execution).</li>
+  <li>Prompt-type commands can also carry <code>allowedTools</code>, temporarily granting the model extra tool permissions when invoked (e.g., <code>/commit</code> temporarily loosens permissions for <code>git add/status/commit</code>).</li>
 </ul>
 
 <script>
@@ -196,5 +189,4 @@ window.__sourceMap = {
 <aside id="source-panel"><div id="source-header"></div><div id="monaco-container"></div></aside>
 <script src="../assets/codeindex-runtime.js"></script>
 <script src="../assets/codeindex.js"></script>
-</body>
-</html>
+</body></html>

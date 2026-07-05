@@ -1,26 +1,19 @@
 <!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Skills, Plugins, and Memory System</title>
-<link rel="stylesheet" href="../assets/codeindex.css">
-</head>
-<body>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Skills, Plugins, and Memory System</title><link rel="stylesheet" href="../assets/codeindex.css"></head><body>
 <nav class="topnav"><a href="../index.html">← Back to Overview</a></nav>
 <h1>Skills, Plugins, and Memory System</h1>
 
-<p>This module covers three "extension capabilities" in Claude Code: ① a user or Claude invokes a skill—a reusable workflow prepackaged with prompts and tool configuration; ② installing a plugin to extend capabilities—how plugins are discovered, installed, loaded, and how they contribute tools and commands; ③ how Claude "remembers" things—persistent memory based on CLAUDE.md, split into project-level, user-level, auto-extraction, and team-sync tracks. The three mechanisms are independent, but all revolve around the same theme: letting Claude reuse experience, capabilities, and context beyond the current session.</p>
+<p>This module covers three "extensibility" topics in Claude Code: ① a user or Claude invokes a skill—a pre-packaged, reusable workflow bundling prompts and tool configuration; ② installing a plugin to extend capabilities—how plugins are discovered, installed, loaded, and how they contribute tools and commands; ③ how Claude "remembers" things—persistent memory based on CLAUDE.md, split across project-level, user-level, auto-extracted, and team-synced lines. The three mechanisms are independent, but all revolve around the same theme: letting Claude reuse experience, capabilities, and context beyond the current session.</p>
 
 <h2 id="skills-load">1. Skill Loading and Invocation</h2>
 
-<p>From the user's perspective: typing <code>/skills</code> in a session lists all currently available skills; Claude can also proactively invoke a skill via SkillTool. A skill is essentially a directory containing a SKILL.md file (with YAML frontmatter describing metadata: name, description, allowed tools, parameters, etc.; the body is the prompt shown to Claude). At startup, the system scans these directories from four sources: managed (policy-level), user-level (<code>~/.claude/skills</code>), project-level (<code>.claude/skills</code> walked upward from the project directory to the home directory), and additional <code>--add-dir</code> directories. There are also bundled skills (compiled into the CLI) and skills contributed by MCP servers.</p>
+<p>From the user's perspective: typing <code>/skills</code> in a session lists all currently available skills; Claude can also proactively invoke a skill through SkillTool. A skill is essentially a directory containing a SKILL.md (with YAML frontmatter describing metadata: name, description, allowed tools, parameters, etc.; the body is the prompt Claude sees). At startup the system scans skill directories from four sources: policy-level (managed), user-level (<code>~/.claude/skills</code>), project-level (<code>.claude/skills</code> walking up from the project directory to the home directory), and additional <code>--add-dir</code> directories. There are also built-in skills (compiled into the CLI) and skills contributed by MCP servers.</p>
 
 <dl>
   <dt>Input</dt>
-  <dd>cwd at startup + .claude/skills directories at each level; the skill name chosen by the user/Claude at runtime + optional arguments</dd>
+  <dd>Startup cwd + .claude/skills directories at each level; at runtime the skill name selected by the user/Claude + optional arguments</dd>
   <dt>Output</dt>
-  <dd>An expanded prompt (with $ARGUMENTS, ${CLAUDE_SKILL_DIR}, etc. replaced), injected back into the conversation; at the same time, the tool allowlist, model, and effort for this invocation are adjusted as needed</dd>
+  <dd>An expanded prompt (with $ARGUMENTS, ${CLAUDE_SKILL_DIR}, etc. replaced) injected back into the conversation; at the same time the tool allowlist, model, and effort for this invocation are adjusted as needed</dd>
 </dl>
 
 <pre class="mermaid">
@@ -28,172 +21,172 @@ graph TD
   start["Start getSkillDirCommands"] --> parallel["Scan four sources in parallel"]
   parallel --> scan-managed["Policy-level managed directory"]
   parallel --> scan-user["User-level ~/.claude/skills"]
-  parallel --> scan-project["Project-level .claude/skills (walk upward to home directory)"]
-  parallel --> scan-add["--add-dir additional directories"]
-  parallel --> scan-legacy["legacy /commands directory (backward-compatible format)"]
+  parallel --> scan-project["Project-level .claude/skills (walk up to home)"]
+  parallel --> scan-add["--add-dir extra directories"]
+  parallel --> scan-legacy["Legacy /commands directory (backward compatibility)"]
   scan-managed --> read-skill["Read skill-name/SKILL.md"]
   scan-user --> read-skill
   scan-project --> read-skill
   scan-add --> read-skill
-  scan-legacy --> transform["SKILL.md takes precedence over plain .md; named by directory"]
+  scan-legacy --> transform["SKILL.md takes precedence over plain .md, named by directory"]
   transform --> read-skill
   read-skill --> parse-fm["Parse frontmatter: name/desc/tools/hooks/paths, etc."]
-  parse-fm --> create-cmd["Build Command object (lazy-load body, expand only on invocation)"]
+  parse-fm --> create-cmd["Build Command object (body lazily loaded, expanded only on call)"]
   create-cmd --> dedup["Deduplicate by realpath (same file via multiple paths keeps only the first)"]
   dedup --> split{"Has paths prefix?"}
-  split -->|Yes| cond-store["Stash in conditionalSkills; activate when file path matches"]
-  split -->|No| active["Add to unconditional skill list, available immediately"]
-  cond-store --> activate["Read/Edit at runtime hits path → activate into dynamicSkills"]
-  active --> register-bundled["Register bundled skills separately via registerBundledSkill"]
+  split -->|yes| cond-store["Stash in conditionalSkills, activate when files match"]
+  split -->|no| active["Add to unconditional skill list, immediately available"]
+  cond-store --> activate["Read/Edit hits path at runtime → activate into dynamicSkills"]
+  active --> register-bundled["Built-in skills registered separately via registerBundledSkill"]
   register-bundled --> ready["All skills enter commands registry"]
   ready --> invoke["Claude calls SkillTool(skill, args)"]
   invoke --> find-cmd{"Found and callable?"}
-  find-cmd -->|Not found/disabled| err-skill["Return Unknown skill / disabled"]
-  find-cmd -->|Callable| perm{"Permission check"}
+  find-cmd -->|not found/disabled| err-skill["Return Unknown skill / disabled"]
+  find-cmd -->|callable| perm{"Permission check"}
   perm -->|deny rule| blocked["Skill rejected"]
-  perm -->|allow/safety attributes| fork{"context=fork?"}
-  perm -->|Other| ask["Show confirmation dialog"]
-  fork -->|Yes| exec-fork["Run in isolated sub-agent with independent token budget"]
-  fork -->|No| exec-inline["Expand prompt: replace arguments + execute embedded !commands + inject CLAUDE_SKILL_DIR"]
+  perm -->|allow/safety props| fork{"context=fork?"}
+  perm -->|other| ask["Show confirmation dialog"]
+  fork -->|yes| exec-fork["Run in isolated sub-agent with independent token budget"]
+  fork -->|no| exec-inline["Expand prompt: replace args + run embedded !commands + inject CLAUDE_SKILL_DIR"]
   exec-fork --> result["Return result text"]
-  exec-inline --> inject["Inject expanded prompt as a new message; rewrite tool allowlist/model/effort"]
+  exec-inline --> inject["Inject expanded prompt as new message, rewrite tool allowlist/model/effort"]
 </pre>
 
 <ul>
-  <li>Deduplication uses realpath to resolve symlinks so the same file isn't loaded twice via different paths (order-sensitive: managed > user > project)</li>
-  <li>A skill with a <code>paths</code> frontmatter is a "conditional skill"; it isn't loaded normally and only activates when a user action matches a path pattern (gitignore-style matching), saving tokens</li>
-  <li>Dynamic discovery: when reading/writing files in subdirectories of the cwd at runtime, it walks upward to find <code>.claude/skills</code> and loads them; gitignored directories are skipped</li>
-  <li>MCP skills come from remote servers and are untrusted—embedded <code>!`...`</code> shell commands in their bodies are never executed (security boundary)</li>
-  <li>Bundled skills may carry reference files; on first invocation they are lazily extracted to a private nonce directory (O_NOFOLLOW + 0o600 to prevent symlink attacks)</li>
-  <li>Fork mode: the skill runs in an independent sub-agent with its own token budget and result text is returned; inline mode: the expanded prompt is inserted directly back into the main conversation</li>
-  <li>Permissions: skills containing only "safety attributes" are auto-approved; skills with sensitive fields such as hooks or allowed-tools prompt the user; users can also configure Skill(name) allow/deny rules</li>
+  <li>Deduplication uses realpath to resolve symlinks, preventing the same file from being loaded twice through different paths (order-sensitive: policy > user > project)</li>
+  <li>Skills with a <code>paths</code> frontmatter are "conditional skills"; they are not loaded normally but activate when a user operation hits a path pattern (gitignore-style matching), saving tokens</li>
+  <li>Dynamic discovery: when reading/writing files under cwd subdirectories at runtime, the system looks upward for <code>.claude/skills</code> and loads them; gitignored directories are skipped</li>
+  <li>MCP skills come from remote servers and are untrusted—embedded shell commands <code>!`...`</code> in their bodies are never executed (security boundary)</li>
+  <li>Built-in skills may carry reference files; they are lazily extracted on first call to a private directory with nonce (O_NOFOLLOW + 0o600 to prevent symlink attacks)</li>
+  <li>fork mode: the skill runs in an independent sub-agent with its own token budget and the result text is passed back; inline mode: the expanded prompt is inserted directly into the main conversation</li>
+  <li>Permissions: skills containing only "safety properties" are auto-allowed; skills with hooks, allowed-tools, or other sensitive fields ask the user; users can also configure Skill(name) allow/deny rules</li>
 </ul>
 
 <h2 id="plugins-lifecycle">2. Plugin Lifecycle</h2>
 
-<p>From the user's perspective: a plugin is a larger-granularity extension package than a skill—a single plugin can contribute skills, commands, hooks, MCP servers, LSP servers, agent definitions, and more. Users open the management UI via <code>/plugin</code> to browse/install/enable/disable, or use the command line with <code>claude plugin install foo@marketplace</code>. Plugins come from three sources: ① marketplace (the plugin marketplace, itself a git repository listing plugin entries); ② built-in plugins (compiled with the CLI, user-toggleable); ③ <code>--plugin-dir</code> temporary session plugins (pointing to a local directory, valid only for this session). Installation scopes are user/project/local/managed; managed is locked by enterprise administrators through policy.</p>
+<p>From the user's perspective: a plugin is a larger-granularity extension package than a skill—a plugin can simultaneously contribute skills, commands, hooks, MCP servers, LSP servers, agent definitions, and more. Users browse/install/enable/disable plugins through <code>/plugin</code>, or on the command line with <code>claude plugin install foo@marketplace</code>. Plugins come from three sources: ① marketplace (the plugin marketplace itself is a git repository listing plugin entries); ② built-in plugins (compiled with the CLI, user-toggleable); ③ <code>--plugin-dir</code> temporary session plugins (pointing to a local directory, valid only for this session). Installation scopes are user/project/local/managed; managed is locked by enterprise administrators through policy.</p>
 
 <dl>
   <dt>Input</dt>
-  <dd>Plugin identifier chosen by the user (name@marketplace) + scope; or the marketplace repository declared in the config file</dd>
+  <dd>User-selected plugin identifier (name@marketplace) + scope; or a marketplace repository declared in config files</dd>
   <dt>Output</dt>
-  <dd>A LoadedPlugin in memory—its skills/commands/hooks/MCP/LSP/agents are registered with the corresponding subsystems so Claude can use them next time</dd>
+  <dd>A LoadedPlugin loaded into memory—its skills/commands/hooks/MCP/LSP/agents are all registered into the corresponding subsystems, ready for Claude next time</dd>
 </dl>
 
 <pre class="mermaid">
 graph TD
-  startup["Start performBackgroundPluginInstallations"] --> diff["Compare declared marketplace with installed config to compute pending installations"]
-  diff --> pending{"Any pending installations?"}
-  pending -->|No| skip["Load directly from cache"]
-  pending -->|Yes| reconcile["Clone/update marketplace repository in the background"]
+  startup["Start performBackgroundPluginInstallations"] --> diff["Compare declared marketplace plugins with landed config, compute pending installs"]
+  diff --> pending{"Any pending?"}
+  pending -->|no| skip["Load directly from cache"]
+  pending -->|yes| reconcile["Background clone/update marketplace repository"]
   reconcile --> installed-new{"New marketplace installed?"}
-  installed-new -->|Yes| auto-refresh["Auto refreshActivePlugins to fix empty cache on first run"]
-  installed-new -->|Update only| notify["Set needsRefresh; prompt user to /reload-plugins"]
-  auto-refresh --> load-all["loadAllPlugins: merge three source types"]
+  installed-new -->|yes| auto-refresh["Auto refreshActivePlugins, fix empty first-run cache"]
+  installed-new -->|updated only| notify["Set needsRefresh, prompt user /reload-plugins"]
+  auto-refresh --> load-all["loadAllPlugins: merge three sources"]
   skip --> load-all
-  load-all --> merge["mergePluginSources: session &gt; marketplace &gt; builtin"]
+  load-all --> merge["mergePluginSources: session > marketplace > builtin"]
   merge --> policy{"Locked by managed policy?"}
-  policy -->|Yes| block-session["--plugin-dir copy ignored, error reported"]
-  policy -->|No| assemble["Parse each manifest, createPluginFromPath"]
+  policy -->|yes| block-session["--plugin-dir copy ignored, error"]
+  policy -->|no| assemble["Parse manifests one by one, createPluginFromPath"]
   assemble --> deps{"Dependency check (reverseDependents / policy block)"}
-  deps -->|Dependency blocked by policy| demote["Demote or remove"]
-  deps -->|Pass| split-en{"Split enabled/disabled by enabledPlugins setting"}
+  deps -->|dependency blocked by policy| demote["Demote or remove"]
+  deps -->|passed| split-en{"Split enabled/disabled by enabledPlugins setting"}
   split-en --> refresh["refreshActivePlugins: clear cache → reload → register subsystems"]
-  refresh --> reg-cmd["Plugin-contributed slash commands/skills"]
-  refresh --> reg-mcp["Plugin-contributed MCP servers"]
-  refresh --> reg-lsp["Plugin-contributed LSP servers"]
-  refresh --> reg-hook["Plugin-contributed hooks"]
-  refresh --> reg-agent["Plugin-contributed agents"]
+  refresh --> reg-cmd["getPluginCommands: slash commands/skills contributed by plugin"]
+  refresh --> reg-mcp["loadPluginMcpServers: MCP servers contributed by plugin"]
+  refresh --> reg-lsp["loadPluginLspServers: LSP servers contributed by plugin"]
+  refresh --> reg-hook["loadPluginHooks: hooks contributed by plugin"]
+  refresh --> reg-agent["getAgentDefinitionsWithOverrides: agents contributed by plugin"]
   refresh --> reconnect["pluginReconnectKey++, trigger MCP reconnect"]
   install-cmd["User /plugin install or CLI installPluginOp"] --> find-mkt["Find plugin entry in marketplace config"]
   find-mkt --> found{"Found?"}
-  found -->|No| not-found["Return Plugin not found"]
-  found -->|Yes| resolve["installResolvedPlugin: download source → compute version → copy to versioned cache → write installed_plugins.json → write settings"]
+  found -->|no| not-found["Return Plugin not found"]
+  found -->|yes| resolve["installResolvedPlugin: download source → compute version → copy to version cache → write installed_plugins.json → write settings"]
   resolve --> policy2{"Blocked by policy?"}
-  policy2 -->|Yes| blocked["Blocked by policy"]
-  policy2 -->|No| done-install["Installation succeeded; takes effect on next load"]
+  policy2 -->|yes| blocked["Blocked by policy"]
+  policy2 -->|no| done-install["Install success, effective on next load"]
   uninstall["uninstallPluginOp"] --> rm-settings["Remove enabledPlugins key from settings"]
-  rm-settings --> rm-v2["Remove this scope's record from installed_plugins_v2.json"]
+  rm-settings --> rm-v2["Remove this scope record from installed_plugins_v2.json"]
   rm-v2 --> last-scope{"Last scope?"}
-  last-scope -->|Yes| orphan["Mark version cache as orphan + delete plugin options + delete data directory"]
-  last-scope -->|No| keep["Keep cache, only disable for this scope"]
+  last-scope -->|yes| orphan["Mark version cache as orphan + delete plugin options + delete data directory"]
+  last-scope -->|no| keep["Keep cache, only disable for this scope"]
   orphan --> warn-dep["Warn reverse dependents (non-blocking)"]
 </pre>
 
 <ul>
-  <li>Loading priority: <code>--plugin-dir</code> session plugins > marketplace-installed plugins > built-in plugins; but managed policy overrides <code>--plugin-dir</code> (administrator intent takes precedence over local development convenience)</li>
-  <li>At startup there are two loading paths: loadAllPlugins (will clone missing marketplaces from the network) and loadAllPluginsCacheOnly (reads only cache, no network), the latter used by consumers that must not block startup; the former used for explicit refreshes such as <code>/plugins</code> and <code>/reload-plugins</code></li>
-  <li>Installation is non-in-place update: download to temp directory → compute version (git commit SHA or manifest version) → copy to versioned cache directory → update installed_plugins.json; the old version in memory isn't replaced until restart</li>
-  <li>During uninstall, if other enabled plugins still depend on it, only warn without blocking (to avoid a delisted plugin freezing the entire dependency graph)</li>
-  <li>Uninstalling a project-scoped plugin guides the user to disable it in local scope, because .claude/settings.json is shared by the team</li>
+  <li>Loading priority: <code>--plugin-dir</code> session plugins > marketplace-installed plugins > built-in plugins; but managed policy overrides <code>--plugin-dir</code> (admin intent takes priority over local-dev convenience)</li>
+  <li>There are two startup load paths: loadAllPlugins (may clone missing marketplace plugins over the network) and loadAllPluginsCacheOnly (reads cache only, no network); the latter is for consumers that must not block startup; the former is for explicit refreshes like <code>/plugins</code> and <code>/reload-plugins</code></li>
+  <li>Installation is non-in-place update: download to temp directory → compute version (git commit SHA or manifest version) → copy to versioned cache directory → update installed_plugins.json; the old version in memory is not swapped until restart</li>
+  <li>During uninstall, if other enabled plugins still depend on it, only warn without blocking (avoiding delisted plugins freezing the entire dependency graph)</li>
+  <li>Project-scope uninstall guides the user to disable via local scope because .claude/settings.json is team-shared</li>
   <li>Plugins can contribute MCP/LSP servers; refreshActivePlugins bumps pluginReconnectKey to trigger MCP reconnect and reinitializes the LSP manager</li>
 </ul>
 
 <h2 id="memory-rw-sync">3. Memory Read/Write and Sync</h2>
 
-<p>From the user's perspective: Claude can "remember" things thanks to a persistent memory system based on CLAUDE.md. Memory is split into four tracks: ① <strong>Project-level CLAUDE.md</strong>—.claude/CLAUDE.md at the project root, shared by the team, loaded when entering the project; ② <strong>User-level CLAUDE.md</strong>—~/.claude/CLAUDE.md, effective across projects; ③ <strong>Auto memory</strong>—Claude itself decides during the conversation what is worth remembering and writes it to <code>~/.claude/projects/&lt;slug&gt;/memory/</code>, auto-injected next time; ④ <strong>Team memory sync</strong>—push local memory to a remote server so teammates can pull it down, achieving shared memory. Users can run the <code>/memory</code> command to open an editor and manually edit memory files.</p>
+<p>From the user's perspective: Claude can "remember" things through a persistent memory system based on CLAUDE.md. Memory is split across four lines: ① <strong>Project-level CLAUDE.md</strong>—<code>.claude/CLAUDE.md</code> at the project root, team-shared, loaded when entering the project; ② <strong>User-level CLAUDE.md</strong>—<code>~/.claude/CLAUDE.md</code>, effective across projects; ③ <strong>Auto memory</strong>—Claude decides during conversations what is worth remembering and writes to <code>~/.claude/projects/&lt;slug&gt;/memory/</code>, automatically injected next time; ④ <strong>Team memory sync</strong>—push local memory to a remote server so teammates can pull it down, achieving shared memory. Users can open the editor with the <code>/memory</code> command to manually edit memory files.</p>
 
 <dl>
   <dt>Input</dt>
-  <dd>User messages, corrections, preferences, and project context during a conversation; or memory content handwritten by the user in the editor</dd>
+  <dd>User messages, corrections, preferences, and project background during conversations; or memory content hand-written by the user in the editor</dd>
   <dt>Output</dt>
-  <dd>.md files written to the memory directory (with frontmatter: type/description) + a MEMORY.md index; in team scenarios, also synced to the remote</dd>
+  <dd>.md files landed in the memory directory (with frontmatter: type/description) + a MEMORY.md index; in team scenarios they are also synced to a remote server</dd>
 </dl>
 
 <pre class="mermaid">
 graph TD
-  start["Session starts loadMemoryPrompt"] --> check-enabled{"Auto memory enabled?"}
-  check-enabled -->|No| disabled["Return null, no memory prompt injected"]
-  check-enabled -->|Yes| kairos{"KAIROS long-session mode?"}
-  kairos -->|Yes| daily-log["Use append-only log prompt: write to logs/YYYY/MM/DD.md"]
-  kairos -->|No| team{"Team memory enabled?"}
-  team -->|Yes| combined["Merge prompts: auto + team directories"]
-  team -->|No| single["Single auto memory prompt"]
+  start["Session startup loadMemoryPrompt"] --> check-enabled{"Auto memory enabled?"}
+  check-enabled -->|no| disabled["Return null, no memory prompt injected"]
+  check-enabled -->|yes| kairos{"KAIROS long-session mode?"}
+  kairos -->|yes| daily-log["Use append-only log prompt: write to logs/YYYY/MM/DD.md"]
+  kairos -->|no| team{"Team memory enabled?"}
+  team -->|yes| combined["Combined prompt: auto + team directories"]
+  team -->|no| single["Single auto memory prompt"]
   combined --> ensure-dir["ensureMemoryDirExists: ensure directory exists"]
   single --> ensure-dir
-  ensure-dir --> inject-prompt["Inject behavior instructions + MEMORY.md index into system prompt"]
+  ensure-dir --> inject-prompt["Inject behavior instruction + MEMORY.md index into system prompt"]
   inject-prompt --> conv["Enter conversation: Claude sees memory guidance"]
   conv --> user-says["User speaks / Claude acts"]
   user-says --> recall{"Need to recall?"}
-  recall -->|Yes| scan["scanMemoryFiles: scan directory, read frontmatter, sort by mtime, limit 200"]
-  scan --> select["sideQuery calls Sonnet: select up to 5 relevant memories from the list based on query"]
-  select --> inject-mem["Inject selected memory file contents into this turn"]
-  recall -->|No| skip-recall["Continue directly"]
+  recall -->|yes| scan["scanMemoryFiles: scan directory, read frontmatter, sort by mtime, cap 200"]
+  scan --> select["sideQuery calls Sonnet: choose up to 5 relevant memories from list"]
+  select --> inject-mem["Inject selected memory file contents into current turn"]
+  recall -->|no| skip-recall["Continue directly"]
   user-says --> save{"Worth remembering?"}
   save -->|Claude writes directly| write-direct["Write tool writes to memory directory + updates MEMORY.md index"]
-  save -->|Background extraction| extract["extractMemories: at end of each turn, run forked agent to scan conversation and write what is worth remembering"]
-  extract --> throttle{"Reached extraction frequency threshold?"}
-  throttle -->|No| skip-extract["Skip this turn, counter +1"]
-  throttle -->|Yes| mutual{"Main agent already wrote memory?"}
-  mutual -->|Yes| skip-extract2["Skip to avoid duplication, advance cursor"]
-  mutual -->|No| run-fork["runForkedAgent: fork main conversation cache, let Sonnet extract and write files"]
+  save -->|Background extraction| extract["extractMemories: after each turn a forked agent scans conversation, picks what to remember, and writes"]
+  extract --> throttle{"Extraction frequency threshold reached?"}
+  throttle -->|no| skip-extract["Skip this turn, increment counter"]
+  throttle -->|yes| mutual{"Main agent already wrote memory?"}
+  mutual -->|yes| skip-extract2["Skip to avoid duplication, advance cursor"]
+  mutual -->|no| run-fork["runForkedAgent: fork main conversation cache, let Sonnet extract and write files"]
   write-direct --> team-write["Write to team memory directory?"]
   run-fork --> team-write
   team-write --> notify["notifyTeamMemoryWrite: notify watcher"]
   notify --> debounce["Debounce 2s, merge consecutive writes"]
-  debounce --> push["pushTeamMemory: compute delta (only upload entries with different hashes)"]
-  push --> secret{"secretScanner detected a secret?"}
-  secret -->|Yes| skip-secret["Skip this file, don't upload, warn"]
-  secret -->|No| upload["PUT to remote, isolated by repoSlug"]
+  debounce --> push["pushTeamMemory: compute delta (only entries with different hash)"]
+  push --> secret{"secretScanner detected secret?"}
+  secret -->|yes| skip-secret["Skip that file, do not send, warn"]
+  secret -->|no| upload["PUT to remote server, isolated by repoSlug"]
   upload --> conflict{"412 conflict?"}
-  conflict -->|Yes| pull-refresh["pull refresh serverChecksums, recompute delta, retry (max N times)"]
-  conflict -->|No| done-push["Update local serverChecksums, done"]
-  pull-flow["Startup / manual trigger pullTeamMemory"] --> etag{"ETag hit?"}
-  etag -->|Yes| not-modified["Server unchanged, skip"]
-  etag -->|No| fetch["GET remote entries"]
+  conflict -->|yes| pull-refresh["Pull to refresh serverChecksums, recompute delta, retry (max N times)"]
+  conflict -->|no| done-push["Update local serverChecksums, done"]
+  pull-flow["Startup/manual pullTeamMemory"] --> etag{"ETag hit?"}
+  etag -->|yes| not-modified["Server unchanged, skip"]
+  etag -->|no| fetch["GET remote entries"]
   fetch --> write-local["writeRemoteEntriesToLocal: write back to local team directory"]
 </pre>
 
 <ul>
-  <li>Memories are divided into four types (user/feedback/project/reference); anything derivable from current project state (code patterns, architecture, git history) is explicitly excluded—these should not be remembered</li>
-  <li>MEMORY.md is an index, not the memories themselves: each entry is one line <code>- [Title](file.md) — one-sentence hook</code>; it is truncated and flagged with a warning if it exceeds 200 lines or 25KB</li>
-  <li>Recall mechanism: scan directory, read frontmatter to build a list → use Sonnet for relevance selection (independent sideQuery, doesn't pollute main conversation) → inject selected files; previously injected files are filtered out to avoid duplication</li>
-  <li>Auto extraction (extractMemories) triggers at the end of each conversation turn (when the model produces a final reply with no tool calls), using a forked agent that shares the main conversation cache; it is mutually exclusive with direct writes by the main agent—if the main agent wrote memory, this turn's extraction is skipped</li>
-  <li>There is an extraction frequency throttle (tengu_bramble_lintel, extracts every turn by default) and a cursor (lastMemoryMessageUuid) to ensure only new messages are examined</li>
-  <li>Team memory sync: watcher listens for team directory writes → debounce 2s → push; push uses content hash to compute delta, uploading only changed entries; on conflict (HTTP 412), pull refreshes serverChecksums and retry</li>
-  <li>Secret safety: before push, scan with gitleaks rules; files matching secrets are excluded from upload, and only the rule id is recorded, not the value</li>
-  <li>Session memory is another track: used to compress context during compaction, activated only when auto-compact is enabled, written to dedicated session memory files</li>
-  <li>KAIROS mode: long sessions switch to append-only logs (one file per day), distilled into MEMORY.md + topic files by the nightly /dream skill</li>
+  <li>Memory is split into four types (user/feedback/project/reference); content derivable from current project state (code patterns, architecture, git history) is explicitly excluded—these should not be memorized</li>
+  <li>MEMORY.md is an index, not the memory itself: each line is <code>- [Title](file.md) — one-sentence hook</code>; if it exceeds 200 lines or 25 KB it is truncated and a warning is attached</li>
+  <li>Recall mechanism: scan directory and read frontmatter to build a list → use Sonnet for relevance selection (independent sideQuery, does not pollute main conversation) → inject selected files; already-injected files are filtered to avoid duplication</li>
+  <li>Auto extraction (extractMemories) triggers at the end of each conversation turn (when the model produces a final reply with no tool calls), using a forked agent that shares the main conversation cache; it is mutually exclusive with main-agent direct writes—if the main agent wrote memory this turn, extraction is skipped</li>
+  <li>Extraction frequency throttling (tengu_bramble_lintel, default every turn) and cursor (lastMemoryMessageUuid) ensure only new messages are examined</li>
+  <li>Team memory sync: watcher listens for writes in the team directory → debounce 2s → push; push computes delta using content hash, sending only changed entries; on conflict (HTTP 412) pull to refresh serverChecksums and retry</li>
+  <li>Secret safety: before push, scan with gitleaks rules; files hitting secrets are excluded from upload, only the rule id is recorded, not the value</li>
+  <li>Session memory is a separate line: used to compress context during compaction, activated only when auto-compact is on, written to dedicated session memory files</li>
+  <li>KAIROS mode: long sessions switch to append-only logs (one file per day), distilled by the nightly /dream skill into MEMORY.md + topic files</li>
   <li><code>/memory</code> command: pops a selector for the user to choose which memory file to edit, opened with $EDITOR/$VISUAL</li>
 </ul>
 
@@ -314,5 +307,4 @@ window.__sourceMap = {
 <aside id="source-panel"><div id="source-header"></div><div id="monaco-container"></div></aside>
 <script src="../assets/codeindex-runtime.js"></script>
 <script src="../assets/codeindex.js"></script>
-</body>
-</html>
+</body></html>

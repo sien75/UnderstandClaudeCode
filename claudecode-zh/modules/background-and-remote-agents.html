@@ -1,0 +1,384 @@
+<!DOCTYPE html>
+<html lang="zh"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>后台 Forked 子智能体与远程 Agent 执行</title><link rel="stylesheet" href="../assets/codeindex.css"></head><body>
+<nav class="topnav"><a href="../index.html">← 返回总览</a></nav>
+<h1>后台 Forked 子智能体与远程 Agent 执行</h1>
+
+<p>这个模块讲两件事：一是 Claude Code 主对话每跑完一轮，会在后台"分叉"出若干个子智能体——它们复用主线程的 prompt 缓存，偷偷干一些不打扰用户的活，比如巩固记忆、生成下一句建议、维护 Magic Doc、给协调器子智能体写进度摘要；二是当会话跑在远程 CCR 容器里时，本地 CLI 通过 WebSocket 订阅远程会话事件、转发权限请求、把 curl/gh 的出站流量经 CONNECT-over-WebSocket 隧道中转到 CCR 入口、由服务端做 MITM TLS 并注入凭据。两部分的共同主线是"数据流"：forked 子智能体的核心是<em>缓存命中</em>这条数据流，远程执行的核心是<em>消息与字节</em>在 CLI、WebSocket、CCR 容器之间的双向流动。</p>
+
+<dl>
+  <dt>输入</dt>
+  <dd>主对话每轮结束后的 REPLHookContext（含 systemPrompt、tools、messages、toolUseContext）——后台 fork 子智能体都从这里取经；远程侧则是 CCR 服务端推来的 SDK 消息流，以及本地 curl/gh 等发往 127.0.0.1 隧道端口的 CONNECT 请求。</dd>
+  <dt>输出</dt>
+  <dd>后台侧：巩固后的记忆文件、Magic Doc 更新、会话记忆 markdown、prompt suggestion 文本、协调器摘要——全部回写到磁盘或 AppState，不阻塞主对话。远程侧：本地 REPL 渲染远程 agent 的流式消息、权限请求经本地用户决策后回传 CCR、子进程流量被透明代理到真实上游。</dd>
+</dl>
+
+<ul>
+  <li>"forked"的本质：用主线程一模一样的 system/tools/messages 前缀发起一次新 query，让 Anthropic API 的 prompt cache 命中，把后台活儿几乎变成"只付输出 token"的廉价操作。</li>
+  <li>所有后台 fork 子智能体的共同模式：工具定义留在请求里（保 cache key 一致），但通过 canUseTool 回调按需放行或拒绝——该只读的全 deny，该改特定文件的才 allow。</li>
+  <li>远程侧全链路 fail-open：WebSocket 断了有重连预算，重连失败降级为"会话结束"；upstreamproxy 任一步出错都禁用代理、绝不拖垮会话。</li>
+</ul>
+
+<h2>一、Fork 机制核心：runForkedAgent + CacheSafeParams</h2>
+
+<p>主对话每跑完一轮，<code>handleStopHooks</code> 会把当前轮的 CacheSafeParams 存到模块级 <code>lastCacheSafeParams</code> 槽位。后台 fork 子智能体（promptSuggestion、postTurnSummary、/btw 等）直接从这个槽位取参，不用各自穿透参数——这是缓存命中的第一道保证。CacheSafeParams 携带五个影响 cache key 的字段：systemPrompt、userContext、systemContext、toolUseContext（含 tools/model/options）、forkContextMessages（消息前缀）。</p>
+
+<p>thinking config 也是 cache key 的一部分，所以 <code>maxOutputTokens</code> 这个参数被特别警告：它会在 claude.ts 里钳制 budget_tokens，从而改变 thinking config、击穿缓存。只有"不需要共享父缓存"的场景（比如紧凑摘要）才允许设它。</p>
+
+<pre class="mermaid">
+graph TD
+  stop-hooks["handleStopHooks 每轮结束"] --> save-csp["saveCacheSafeParams 存到模块槽位"]
+  save-csp --> fork-call["后台服务调用 runForkedAgent"]
+  fork-call --> create-ctx["createSubagentContext 隔离可变状态"]
+  create-ctx --> clone-state["克隆 readFileState/contentReplacementState"]
+  create-ctx --> new-abort["新建子 AbortController（链到父）"]
+  create-ctx --> no-op-cbs["setAppState 等 mutation 回调置 no-op"]
+  clone-state --> build-msgs["initialMessages = forkContextMessages + promptMessages"]
+  build-msgs --> query-loop["进入 query() 循环"]
+  query-loop --> stream-ev{"消息类型?"}
+  stream-ev -->|stream_event message_delta| acc-usage["累计 totalUsage"]
+  stream-ev -->|assistant/user/progress| record-tx["recordSidechainTranscript 记录侧链"]
+  stream-ev -->|其他| push-msg["outputMessages.push + onMessage 回调"]
+  acc-usage --> push-msg
+  record-tx --> push-msg
+  push-msg --> query-loop
+  query-loop -->|循环结束| clear-cache["finally: 清 readFileState、清 initialMessages"]
+  clear-cache --> log-event["logForkAgentQueryEvent 打 tengu_fork_agent_query"]
+  log-event --> return-result["返回 messages + totalUsage"]
+</pre>
+
+<p>几个对业务很关键的细节：<code>createSubagentContext</code> 默认把<em>所有</em>可变状态隔离——readFileState 克隆、abortController 新建（但链到父，父 abort 会传播）、所有 mutation 回调置 no-op。这样 fork 写文件不会污染父线程的文件状态视图。例外是 <code>setAppStateForTasks</code>：它必须穿透到根 store，否则后台 bash 任务永远注册不上、杀不掉，变成 PPID=1 的僵尸。<code>contentReplacementState</code> 默认克隆而非新建——fork 处理父消息里带着的 tool_use_ids 时，新建状态会把它们当未见过、做出不同的替换决策、wire 前缀就不同、cache miss；克隆则做相同决策、cache hit。</p>
+
+<h2>二、autoDream：记忆巩固的时间+会话数双闸门</h2>
+
+<p>用户视角：什么都不用做。每轮对话结束后，autoDream 偷偷检查"距离上次巩固记忆过了多久"和"这段时间积累了多少个会话"。两边都过线，就 fork 一个跑 /dream 提示的子智能体，让它读会话 transcript、合并/修订/裁剪记忆文件。这是为了让 Claude 在新会话里能快速 orient——把近期学到的沉淀成持久记忆。</p>
+
+<p>闸门顺序是"最便宜的先查"：先一个 stat 读锁文件 mtime（=lastConsolidatedAt），过时间闸门再扫会话目录、过会话数闸门，最后才尝试拿锁。每个闸门失败都直接 return，不浪费后续成本。</p>
+
+<pre class="mermaid">
+graph TD
+  turn-end["每轮 stopHooks 调 executeAutoDream"] --> gate-check{"isGateOpen?&lt;br/&gt;KAIROS/远程/未启用 → 否"}
+  gate-check -->|否| skip["return"]
+  gate-check -->|是| read-last["readLastConsolidatedAt 读锁文件 mtime"]
+  read-last --> time-gate{"hoursSince &gt;= minHours?&lt;br/&gt;默认24h"}
+  time-gate -->|否| skip
+  time-gate -->|是| scan-throttle{"距上次扫描 &lt; 10min?"}
+  scan-throttle -->|是| skip-throttle["return（防每轮重扫）"]
+  scan-throttle -->|否| list-sessions["listSessionsTouchedSince 扫 transcript 目录"]
+  list-sessions --> filter-current["排除当前会话"]
+  filter-current --> session-gate{"数量 &gt;= minSessions?&lt;br/&gt;默认5"}
+  session-gate -->|否| skip
+  session-gate -->|是| acquire-lock["tryAcquireConsolidationLock 写 PID"]
+  acquire-lock --> lock-ok{"拿到锁?"}
+  lock-ok -->|否（被活 PID 占）| skip
+  lock-ok -->|是| register-task["registerDreamTask 注册后台任务"]
+  register-task --> build-prompt["buildConsolidationPrompt&lt;br/&gt;+ 工具约束 + 会话清单"]
+  build-prompt --> fork["runForkedAgent&lt;br/&gt;canUseTool=createAutoMemCanUseTool&lt;br/&gt;Bash 限只读、Edit/Write 限记忆目录"]
+  fork --> on-msg["onMessage=makeDreamProgressWatcher&lt;br/&gt;收集 text/Edit/Write 路径 → DreamTask 状态"]
+  fork --> fork-ok{"fork 成功?"}
+  fork-ok -->|是| complete["completeDreamTask + appendSystemMessage 'Improved'"]
+  fork-ok -->|否/abort| fail-check{"是用户 kill?"}
+  fail-check -->|是| return-no-rollback["return（kill 已回滚锁）"]
+  fail-check -->|否| fail["failDreamTask + rollbackConsolidationLock 回退 mtime"]
+</pre>
+
+<p>锁的设计很讲究：锁文件<em>本身就是</em> lastConsolidatedAt——它的 mtime 就是上次巩固时间，body 是持有者 PID。拿锁就是覆盖写自己的 PID，然后回读验证"我写的是不是我的 PID"（两个 reclaim 竞争时，最后写的赢、输的 bail）。失败时回退 mtime 到拿锁前的值，让时间闸门下次还能过。HOLDER_STALE_MS=1h 防 PID 复用：即便 PID 还活着，超过 1h 也认 stale 抢占。崩溃场景：mtime 卡住、PID 是死的，下个进程看到 dead PID 直接 reclaim。</p>
+
+<h2>三、后台 fork 服务群（AgentSummary / PromptSuggestion / MagicDocs / SessionMemory）</h2>
+
+<p>这四个服务共享同一个 runForkedAgent 模式，但各自做不同的活。共同点：都用 CacheSafeParams 共享父缓存、都用 canUseTool 回调控制权限、都 skipTranscript 或按需记录。区别在"什么时候 fork、fork 出来干什么、工具放行到什么程度"。</p>
+
+<pre class="mermaid">
+graph TD
+  turn-end["主对话每轮结束 (postSamplingHook)"] --> branch{哪个服务?}
+  branch -->|AgentSummary| as-timer["每 30s setTimeout 触发"]
+  branch -->|PromptSuggestion| ps-hook["executePromptSuggestion 同步 fork"]
+  branch -->|MagicDocs| md-idle["对话空闲(无 tool call)时 sequential 串行"]
+  branch -->|SessionMemory| sm-thresh["token+工具调用双阈值过线"]
+
+  as-timer --> as-read["getAgentTranscript 读协调器子智能体最新消息"]
+  as-read --> as-fork["fork + canUseTool 全 deny&lt;br/&gt;生成 3-5 词进度摘要"]
+  as-fork --> as-update["updateAgentSummary 写 AgentProgress"]
+
+  ps-hook --> ps-guard["早期会话/错误/冷缓存/权限/限流 → 抑制"]
+  ps-guard --> ps-gen["generateSuggestion fork&lt;br/&gt;canUseTool 全 deny、skipCacheWrite"]
+  ps-gen --> ps-filter["shouldFilterSuggestion 12 道过滤"]
+  ps-filter --> ps-state["写 promptSuggestion 到 AppState"]
+  ps-state --> spec-check{"speculation 启用?"}
+  spec-check -->|是| spec-start["startSpeculation 预跑用户可能输入"]
+
+  md-idle --> md-read["FileReadTool 重读 doc（清缓存项）"]
+  md-read --> md-detect["detectMagicDocHeader 仍在跟踪?"]
+  md-detect -->|否| md-untrack["移除跟踪"]
+  md-detect -->|是| md-fork["runAgent (非 runForkedAgent)&lt;br/&gt;canUseTool 仅放行 Edit 该文件"]
+  md-fork --> md-update["子智能体更新 magic doc 内容"]
+
+  sm-thresh --> sm-setup["setupSessionMemoryFile 建 0600 文件 + 读当前内容"]
+  sm-setup --> sm-fork["runForkedAgent&lt;br/&gt;canUseTool 仅放行 Edit 记忆文件"]
+  sm-fork --> sm-record["recordExtractionTokenCount 记录基线"]
+</pre>
+
+<p>PromptSuggestion 是这套里逻辑最重的。它先做一堆抑制检查（aborted、早期会话不足 2 轮、上一条是 API 错误、父缓存冷启动超过 10k 未缓存 token、权限待决、elicitation 队列、plan 模式、external 用户限流），任何一条命中就抑制并打点。fork 出来后还要过 12 道内容过滤——done/meta_text/括号包裹/API 错误前缀/单字过短/超长/多句/带格式/evaluative 评价语/Claude 口吻（"Let me..."）——把这些"模型说错的话"滤掉，保证只把真正像用户会打的字递上去。</p>
+
+<p>speculation 是 PromptSuggestion 的进阶版：fork 出来不是只生成文本，而是<em>预跑</em>用户可能输入的下一句——用 overlay 文件系统做 copy-on-write 隔离写操作、只放行只读工具和 read-only bash、碰到文件编辑/非只读 bash/未知工具就 abort 并记 boundary。用户接受预跑时，把 overlay 里的改动 copy 回主目录、把推测的消息注入主对话。关键约束：fork 用的是 createChildAbortController（链到父），父 abort 会传播下来；onMessage 边收消息边累计 toolUseCount，超过 100 条消息或 20 轮就强制 abort。</p>
+
+<p>AgentSummary 是协调器模式（coordinator agent）下的进度摘要：每 30s 用主线程的 CacheSafeParams fork 一次，从 transcript 拉最新消息，全 deny 工具，生成"Reading runAgent.ts"这种 3-5 词现在进行时摘要。它特意不传 forkContextMessages 进闭包——每次 tick 都从 getAgentTranscript 重读，避免原始 fork 消息被定时器钉住一辈子。</p>
+
+<p>MagicDocs 是唯一不用 runForkedAgent 的——它用 runAgent（因为要带自己的 agent definition 和受限工具集）。它在 FileReadTool 监听器里检测 <code># MAGIC DOC: [title]</code> 头和紧随的斜体指令行，注册跟踪；对话空闲时（上一轮无 tool call）sequential 串行地更新每个 tracked doc。canUseTool 只放行 Edit 且 file_path 必须精确等于该 doc 路径。</p>
+
+<p>SessionMemory 维护一个会话级 markdown 笔记，触发条件是"token 阈值<em>且</em>工具调用阈值"或"token 阈值<em>且</em>上一轮无 tool call"——token 阈值是硬性的，防止过度抽取。它 fork 出来只允许 Edit 那一个记忆文件。</p>
+
+<h2>四、远程 Agent 执行：消息流与权限桥接</h2>
+
+<p>用户视角：在本地 <code>claude</code> CLI 里连一个远程 CCR 会话，看到的就是远程 agent 的对话——打字、看流式输出、对权限请求按 y/n。背后是 RemoteSessionManager 协调一条 WebSocket 订阅 + 一条 HTTP POST 上行通道。</p>
+
+<p>数据流上分三类消息：SDKMessage（assistant/user/stream_event/system/result/tool_progress 等渲染消息）、control_request（CCR 发来问"这个工具能不能用"）、control_response（CLI 回答"能/不能"）。SDKMessage 经 sdkMessageAdapter 转成 REPL 内部 Message 类型渲染；control_request 经 RemoteSessionManager 路由到 onPermissionRequest 回调、最终由 remotePermissionBridge 造一个合成 AssistantMessage 喂给本地权限 UI。</p>
+
+<pre class="mermaid">
+graph TD
+  ccr["CCR 服务端（远程 agent 真正跑的地方）"] -->|WebSocket 推送| ws["SessionsWebSocket"]
+  ws -->|onMessage| rsm["RemoteSessionManager.handleMessage"]
+  rsm --> msg-type{"消息类型?"}
+  msg-type -->|SDKMessage| adapter["sdkMessageAdapter.convertSDKMessage"]
+  adapter --> render["转成 REPL Message 渲染"]
+  msg-type -->|control_request can_use_tool| perm-req["存 pendingPermissionRequests + onPermissionRequest"]
+  msg-type -->|control_cancel_request| perm-cancel["删 pending + onPermissionCancelled"]
+  msg-type -->|control_response| ack["仅 ack，无动作"]
+  perm-req --> bridge["remotePermissionBridge.createSyntheticAssistantMessage"]
+  bridge --> local-ui["本地权限 UI 弹窗"]
+  local-ui --> user-decision{"用户决定?"}
+  user-decision -->|allow| resp-allow["respondToPermissionRequest behavior=allow + updatedInput"]
+  user-decision -->|deny| resp-deny["behavior=deny + message"]
+  resp-allow --> ws-send["SessionsWebSocket.sendControlResponse"]
+  resp-deny --> ws-send
+  ws-send -->|WebSocket 回传| ccr
+  user-input["用户在本地输入消息"] -->|HTTP POST| rsm-send["RemoteSessionManager.sendMessage"]
+  rsm-send -->|sendEventToRemoteSession| ccr
+  user-interrupt["Ctrl+C / Escape"] -->|control_request interrupt| ccr
+</pre>
+
+<p>SDK 消息适配器要处理一个微妙：远程发来的 user 消息可能是工具结果（content 里有 tool_result 块）。在直连模式（convertToolResults=true）要把这些转成 UserMessage 才能像本地工具结果一样折叠渲染；CCR 实时模式则忽略——因为本地 REPL 已经自己加了用户消息。parent_tool_use_id 不可靠（agent 端 normalizeMessage 把它硬编码成 null），所以靠 content shape 判断。success 类型的 result 消息被当噪声忽略（isLoading=false 已经够了），只有 error 才显示。</p>
+
+<p>权限桥接的关键：本地根本没跑那个工具（工具在 CCR 容器里跑），所以 ToolUseConfirm 需要的 AssistantMessage 是合成的——用 request 里的 tool_use_id/name/input 伪造一条 assistant 消息。如果 CCR 装了本地 CLI 不认识的工具（比如某个 MCP 工具），createToolStub 造一个最小 Tool 桩，路由到 FallbackPermissionRequest。</p>
+
+<h2>五、SessionsWebSocket：重连状态机</h2>
+
+<p>这条 WebSocket 是远程会话的生命线。close code 决定了下一步行为——是永久放弃、还是带预算重连、还是瞬时重连。</p>
+
+<pre class="mermaid">
+graph TD
+  conn["connect() 连 wss://api.../v1/sessions/ws/{id}/subscribe"] --> open{"onopen?"}
+  open -->|是| connected["state=connected, 重置计数器, 启 30s ping"]
+  open -->|否/error| closed["onclose 带 code"]
+  connected --> msg["onmessage → jsonParse → isSessionsMessage → onMessage 回调"]
+  connected --> close-ev{"onclose code?"}
+  close-ev -->|4003 unauthorized| permanent["永久关闭, onClose"]
+  close-ev -->|4001 session not found| snf{"4001 重试次数 &lt;= 3?"}
+  snf -->|是| recon-4001["scheduleReconnect 2s*attempt, onReconnecting"]
+  snf -->|否| permanent
+  close-ev -->|其他瞬时| recon-norm{"reconnectAttempts &lt; 5?"}
+  recon-norm -->|是| recon-2s["scheduleReconnect 2s, onReconnecting"]
+  recon-norm -->|否| permanent
+  recon-4001 -->|重新 connect| conn
+  recon-2s -->|重新 connect| conn
+  permanent --> onclose-cb["onClose → RemoteSessionManager.onDisconnected"]
+</pre>
+
+<p>几个要点：认证走 HTTP header（Authorization: Bearer + anthropic-version），不走在途中的 auth 消息——所以 onopen 一到就是 connected 状态。4001（session not found）特意单独处理，因为 CCR 在 compaction 期间可能短暂认为会话 stale，给 3 次重试预算避免假死。isSessionsMessage 故意只检查"有字符串 type 字段"而非白名单——后端发新消息类型时客户端不会静默丢消息，由下游决定怎么处理。Bun 走 globalThis.WebSocket，Node 走 ws 包，两套事件接法（addEventListener vs .on）。</p>
+
+<h2>六、upstreamproxy：CONNECT-over-WebSocket 中转</h2>
+
+<p>用户视角：远程 CCR 容器里的 agent 跑 curl/gh/kubectl 时，这些子进程的 HTTPS 流量被透明代理——经本地 127.0.0.1 的 CONNECT relay、过 WebSocket 隧道到 CCR 服务端、服务端 MITM TLS 并注入组织凭据（如 DD-API-KEY）、再转给真实上游。容器里的 agent 看到的 HTTPS_PROXY 环境变量指向这个本地 relay。</p>
+
+<p>为什么用 WebSocket 而不是裸 CONNECT：CCR 入口是 GKE L7 路径前缀路由，没有 connect_matcher；sessions/tunnel 已经用这个模式。字节流用 UpstreamProxyChunk protobuf（单字段 bytes）封装，跟服务端 gateway.NewWebSocketStreamAdapter 兼容。</p>
+
+<pre class="mermaid">
+graph TD
+  init["initUpstreamProxy (init.ts 启动时)"] --> env-check{"CLAUDE_CODE_REMOTE + CCR_UPSTREAM_PROXY_ENABLED?"}
+  env-check -->|否| disabled["state.enabled=false, 啥也不做"]
+  env-check -->|是| read-token["readToken /run/ccr/session_token"]
+  read-token --> token-ok{"token 存在?"}
+  token-ok -->|否| disabled
+  token-ok -->|是| prctl["setNonDumpable: prctl PR_SET_DUMPABLE=0 防 ptrace 扒堆"]
+  prctl --> dl-ca["downloadCaBundle 拉 /v1/code/upstreamproxy/ca-cert"]
+  dl-ca --> ca-ok{"CA 下载成功?"}
+  ca-ok -->|否| disabled
+  ca-ok -->|是| start-relay["startUpstreamProxyRelay 监听 127.0.0.1:0"]
+  start-relay --> relay-ok{"监听成功?"}
+  relay-ok -->|否| disabled-relay["记 warn, 代理禁用, token 文件保留可重试"]
+  relay-ok -->|是| unlink["unlink token 文件 → token 仅堆内"]
+  unlink --> set-state["state.enabled=true, 暴露 HTTPS_PROXY/SSL_CERT_FILE 等环境变量给子进程"]
+</pre>
+
+<p>relay 自身的两阶段状态机（Phase 1 解析 CONNECT、Phase 2 转发字节）：</p>
+
+<pre class="mermaid">
+graph TD
+  client["curl/gh 连 127.0.0.1:port"] --> data["socket.data 回调"]
+  data --> phase{"ws 已建?"}
+  phase -->|否 phase1| accum["connectBuf 累积直到 CRLFCRLF"]
+  accum --> header-too-big{"buffer &gt; 8KB 仍无 CRLFCRLF?"}
+  header-too-big -->|是| bad-400["回 400 Bad Request 并断开"]
+  header-too-big -->|否| has-header{"找到 CONNECT 头?"}
+  has-header -->|否| bad-405["回 405 Method Not Allowed"]
+  has-header -->|是| stash-pending["把 CRLFCRLF 之后的字节存 pending"]
+  stash-pending --> open-tunnel["openTunnel 建 WebSocket 到 CCR"]
+  open-tunnel --> ws-open{"ws.onopen?"}
+  ws-open -->|是| send-head["首块发 CONNECT 行 + Proxy-Authorization + 清空 pending"]
+  ws-open -->|否 等待| buf-pending["后续 data 进 pending"]
+  send-head --> phase2["Phase 2: 转发模式"]
+  buf-pending --> send-head
+  phase2 --> from-client["client 字节 → encodeChunk → ws.send (512KB 分片)"]
+  phase2 --> from-server["ws.onmessage → decodeChunk → sock.write"]
+  from-server --> established{"首字节到 → established=true"}
+  established --> tunnel["双向 TLS 隧道建立"]
+  tunnel --> ws-err{"ws.onerror?"}
+  ws-err -->|是 未 established| send-502["回 502 Bad Gateway"]
+  ws-err -->|是 已 established| just-close["直接 close（不能污染 TLS 流）"]
+  tunnel --> ws-close{"ws.onclose?"}
+  ws-close --> cleanup["cleanupConn: 清 pinger, 关 ws"]
+</pre>
+
+<p>这里有一堆对抗边界情况的工程细节：Bun 的 sock.write() 是部分写、内核缓冲满时静默丢字节，所以 Bun relay 自己维护 writeBuf 尾队列、drain 回调刷新；Node 的 net.Socket 无条件缓冲、不用尾队列。TCP 会把 CONNECT 头和 ClientHello 合并到一个包里，所以 pending 缓冲要接住"CRLFCRLF 之后跟着的字节"；ws.onopen 之前如果 socket.data 又回调了，那些字节也进 pending。established 标志位一旦置 true（收到服务端首字节），就再也不能写明文 502——会污染客户端的 TLS 流，只能直接 close。closed 标志位防 ws.onerror 后 ws.onclose 二次 sock.end()。</p>
+
+<p>安全设计也值得点出：<code>prctl(PR_SET_DUMPABLE, 0)</code> 通过 libc FFI 调用，防同 UID 的 ptrace 抓堆——这是为了让 prompt-injected 的 <code>gdb -p $PPID</code> 抓不走 session token。token 文件在 relay 起来<em>之后</em>才 unlink，保证 CA 下载或 listen 失败时 supervisor 重启还能重试。NO_PROXY 列表把 Anthropic API、GitHub、各包 registry 都排除——MITM 会破坏非 Bun 运行时（Python httpx/certifi 不信伪造 CA）。子进程环境继承有个继承分支：如果父进程已经设了 HTTPS_PROXY+SSL_CERT_FILE（说明父跑了 relay），子 CLI 也直接继承，因为 token 文件已被父 unlink、子无法重新 init relay。</p>
+
+<p>整个 upstreamproxy 是 fail-open 典范：env 没设→禁用、token 没了→禁用、CA 下载失败→禁用、relay 监听失败→禁用，每一步都只 logForDebugging warn 级别，绝不抛、绝不拖垮会话。</p>
+
+<h2>七、远程会话历史分页</h2>
+
+<p>sessionHistory.ts 是远程会话的事件历史分页——给"查看更早的消息"用。走 HTTP GET /v1/sessions/{id}/events，axios 带 OAuth 头 + anthropic-beta: ccr-byoc-2025-07-29 + x-organization-uuid。两个游标模式：fetchLatestEvents 用 anchor_to_latest=true 拿最新一页；fetchOlderEvents 用 before_id 拿指定游标之前的更老一页。每页 100 条，has_more 表示还有更老的。validateStatus: () => true + .catch(() => null) 让任何 HTTP 错误都降级成 null 返回，调用方自己处理——也是 fail-open 风格。createHistoryAuthCtx 把 auth 头准备一次复用，避免每页重新 prepareApiRequest。</p>
+
+<script>
+window.__sourceMap = {
+  "stop-hooks": { "file": "src/utils/forkedAgent.ts", "startLine": 70, "endLine": 82 },
+  "save-csp": { "file": "src/utils/forkedAgent.ts", "startLine": 75, "endLine": 77 },
+  "fork-call": { "file": "src/utils/forkedAgent.ts", "startLine": 489, "endLine": 518 },
+  "create-ctx": { "file": "src/utils/forkedAgent.ts", "startLine": 345, "endLine": 462 },
+  "clone-state": { "file": "src/utils/forkedAgent.ts", "startLine": 379, "endLine": 403 },
+  "new-abort": { "file": "src/utils/forkedAgent.ts", "startLine": 349, "endLine": 355 },
+  "no-op-cbs": { "file": "src/utils/forkedAgent.ts", "startLine": 410, "endLine": 436 },
+  "build-msgs": { "file": "src/utils/forkedAgent.ts", "startLine": 514, "endLine": 541 },
+  "query-loop": { "file": "src/utils/forkedAgent.ts", "startLine": 544, "endLine": 598 },
+  "stream-ev": { "file": "src/utils/forkedAgent.ts", "startLine": 558, "endLine": 575 },
+  "acc-usage": { "file": "src/utils/forkedAgent.ts", "startLine": 558, "endLine": 568 },
+  "record-tx": { "file": "src/utils/forkedAgent.ts", "startLine": 580, "endLine": 597 },
+  "push-msg": { "file": "src/utils/forkedAgent.ts", "startLine": 577, "endLine": 578 },
+  "clear-cache": { "file": "src/utils/forkedAgent.ts", "startLine": 599, "endLine": 604 },
+  "log-event": { "file": "src/utils/forkedAgent.ts", "startLine": 631, "endLine": 689 },
+  "return-result": { "file": "src/utils/forkedAgent.ts", "startLine": 622, "endLine": 626 },
+  "turn-end": { "file": "src/services/autoDream/autoDream.ts", "startLine": 319, "endLine": 324 },
+  "gate-check": { "file": "src/services/autoDream/autoDream.ts", "startLine": 95, "endLine": 100 },
+  "skip": { "file": "src/services/autoDream/autoDream.ts", "startLine": 128, "endLine": 129 },
+  "read-last": { "file": "src/services/autoDream/autoDream.ts", "startLine": 131, "endLine": 139 },
+  "time-gate": { "file": "src/services/autoDream/autoDream.ts", "startLine": 140, "endLine": 141 },
+  "scan-throttle": { "file": "src/services/autoDream/autoDream.ts", "startLine": 143, "endLine": 151 },
+  "skip-throttle": { "file": "src/services/autoDream/autoDream.ts", "startLine": 145, "endLine": 150 },
+  "list-sessions": { "file": "src/services/autoDream/autoDream.ts", "startLine": 153, "endLine": 162 },
+  "filter-current": { "file": "src/services/autoDream/autoDream.ts", "startLine": 164, "endLine": 165 },
+  "session-gate": { "file": "src/services/autoDream/autoDream.ts", "startLine": 166, "endLine": 171 },
+  "acquire-lock": { "file": "src/services/autoDream/autoDream.ts", "startLine": 173, "endLine": 190 },
+  "lock-ok": { "file": "src/services/autoDream/autoDream.ts", "startLine": 189, "endLine": 190 },
+  "register-task": { "file": "src/services/autoDream/autoDream.ts", "startLine": 200, "endLine": 208 },
+  "build-prompt": { "file": "src/services/autoDream/autoDream.ts", "startLine": 210, "endLine": 223 },
+  "fork": { "file": "src/services/autoDream/autoDream.ts", "startLine": 224, "endLine": 233 },
+  "on-msg": { "file": "src/services/autoDream/autoDream.ts", "startLine": 281, "endLine": 313 },
+  "fork-ok": { "file": "src/services/autoDream/autoDream.ts", "startLine": 234, "endLine": 257 },
+  "complete": { "file": "src/services/autoDream/autoDream.ts", "startLine": 235, "endLine": 248 },
+  "fail-check": { "file": "src/services/autoDream/autoDream.ts", "startLine": 258, "endLine": 271 },
+  "return-no-rollback": { "file": "src/services/autoDream/autoDream.ts", "startLine": 262, "endLine": 265 },
+  "fail": { "file": "src/services/autoDream/autoDream.ts", "startLine": 266, "endLine": 270 },
+  "branch": { "file": "src/utils/hooks/postSamplingHooks.ts", "startLine": 45, "endLine": 70 },
+  "as-timer": { "file": "src/services/AgentSummary/agentSummary.ts", "startLine": 26, "endLine": 26 },
+  "as-read": { "file": "src/services/AgentSummary/agentSummary.ts", "startLine": 67, "endLine": 78 },
+  "as-fork": { "file": "src/services/AgentSummary/agentSummary.ts", "startLine": 109, "endLine": 119 },
+  "as-update": { "file": "src/services/AgentSummary/agentSummary.ts", "startLine": 124, "endLine": 143 },
+  "ps-hook": { "file": "src/services/PromptSuggestion/promptSuggestion.ts", "startLine": 184, "endLine": 237 },
+  "ps-guard": { "file": "src/services/PromptSuggestion/promptSuggestion.ts", "startLine": 136, "endLine": 163 },
+  "ps-gen": { "file": "src/services/PromptSuggestion/promptSuggestion.ts", "startLine": 294, "endLine": 352 },
+  "ps-filter": { "file": "src/services/PromptSuggestion/promptSuggestion.ts", "startLine": 354, "endLine": 456 },
+  "ps-state": { "file": "src/services/PromptSuggestion/promptSuggestion.ts", "startLine": 203, "endLine": 212 },
+  "spec-check": { "file": "src/services/PromptSuggestion/promptSuggestion.ts", "startLine": 214, "endLine": 222 },
+  "spec-start": { "file": "src/services/PromptSuggestion/speculation.ts", "startLine": 402, "endLine": 715 },
+  "md-idle": { "file": "src/services/MagicDocs/magicDocs.ts", "startLine": 217, "endLine": 240 },
+  "md-read": { "file": "src/services/MagicDocs/magicDocs.ts", "startLine": 132, "endLine": 153 },
+  "md-detect": { "file": "src/services/MagicDocs/magicDocs.ts", "startLine": 52, "endLine": 81 },
+  "md-untrack": { "file": "src/services/MagicDocs/magicDocs.ts", "startLine": 156, "endLine": 161 },
+  "md-fork": { "file": "src/services/MagicDocs/magicDocs.ts", "startLine": 194, "endLine": 212 },
+  "md-update": { "file": "src/services/MagicDocs/magicDocs.ts", "startLine": 114, "endLine": 212 },
+  "sm-thresh": { "file": "src/services/SessionMemory/sessionMemory.ts", "startLine": 134, "endLine": 181 },
+  "sm-setup": { "file": "src/services/SessionMemory/sessionMemory.ts", "startLine": 183, "endLine": 233 },
+  "sm-fork": { "file": "src/services/SessionMemory/sessionMemory.ts", "startLine": 318, "endLine": 325 },
+  "sm-record": { "file": "src/services/SessionMemory/sessionMemory.ts", "startLine": 327, "endLine": 349 },
+  "ccr": { "file": "src/remote/RemoteSessionManager.ts", "startLine": 87, "endLine": 95 },
+  "ws": { "file": "src/remote/SessionsWebSocket.ts", "startLine": 82, "endLine": 95 },
+  "rsm": { "file": "src/remote/RemoteSessionManager.ts", "startLine": 146, "endLine": 184 },
+  "msg-type": { "file": "src/remote/RemoteSessionManager.ts", "startLine": 152, "endLine": 184 },
+  "adapter": { "file": "src/remote/sdkMessageAdapter.ts", "startLine": 168, "endLine": 278 },
+  "render": { "file": "src/remote/sdkMessageAdapter.ts", "startLine": 145, "endLine": 148 },
+  "perm-req": { "file": "src/remote/RemoteSessionManager.ts", "startLine": 189, "endLine": 214 },
+  "perm-cancel": { "file": "src/remote/RemoteSessionManager.ts", "startLine": 159, "endLine": 172 },
+  "ack": { "file": "src/remote/RemoteSessionManager.ts", "startLine": 175, "endLine": 178 },
+  "bridge": { "file": "src/remote/remotePermissionBridge.ts", "startLine": 12, "endLine": 46 },
+  "local-ui": { "file": "src/remote/remotePermissionBridge.ts", "startLine": 53, "endLine": 78 },
+  "user-decision": { "file": "src/remote/RemoteSessionManager.ts", "startLine": 247, "endLine": 282 },
+  "resp-allow": { "file": "src/remote/RemoteSessionManager.ts", "startLine": 263, "endLine": 275 },
+  "resp-deny": { "file": "src/remote/RemoteSessionManager.ts", "startLine": 263, "endLine": 275 },
+  "ws-send": { "file": "src/remote/SessionsWebSocket.ts", "startLine": 328, "endLine": 336 },
+  "user-input": { "file": "src/remote/RemoteSessionManager.ts", "startLine": 219, "endLine": 242 },
+  "rsm-send": { "file": "src/remote/RemoteSessionManager.ts", "startLine": 219, "endLine": 242 },
+  "user-interrupt": { "file": "src/remote/RemoteSessionManager.ts", "startLine": 294, "endLine": 297 },
+  "conn": { "file": "src/remote/SessionsWebSocket.ts", "startLine": 100, "endLine": 205 },
+  "open": { "file": "src/remote/SessionsWebSocket.ts", "startLine": 130, "endLine": 139 },
+  "connected": { "file": "src/remote/SessionsWebSocket.ts", "startLine": 134, "endLine": 138 },
+  "closed": { "file": "src/remote/SessionsWebSocket.ts", "startLine": 234, "endLine": 288 },
+  "msg": { "file": "src/remote/SessionsWebSocket.ts", "startLine": 210, "endLine": 229 },
+  "close-ev": { "file": "src/remote/SessionsWebSocket.ts", "startLine": 234, "endLine": 288 },
+  "permanent": { "file": "src/remote/SessionsWebSocket.ts", "startLine": 247, "endLine": 253 },
+  "snf": { "file": "src/remote/SessionsWebSocket.ts", "startLine": 258, "endLine": 272 },
+  "recon-4001": { "file": "src/remote/SessionsWebSocket.ts", "startLine": 267, "endLine": 271 },
+  "recon-norm": { "file": "src/remote/SessionsWebSocket.ts", "startLine": 275, "endLine": 283 },
+  "recon-2s": { "file": "src/remote/SessionsWebSocket.ts", "startLine": 279, "endLine": 283 },
+  "onclose-cb": { "file": "src/remote/SessionsWebSocket.ts", "startLine": 251, "endLine": 252 },
+  "init": { "file": "src/upstreamproxy/upstreamproxy.ts", "startLine": 79, "endLine": 153 },
+  "env-check": { "file": "src/upstreamproxy/upstreamproxy.ts", "startLine": 85, "endLine": 94 },
+  "disabled": { "file": "src/upstreamproxy/upstreamproxy.ts", "startLine": 86, "endLine": 87 },
+  "read-token": { "file": "src/upstreamproxy/upstreamproxy.ts", "startLine": 105, "endLine": 110 },
+  "token-ok": { "file": "src/upstreamproxy/upstreamproxy.ts", "startLine": 107, "endLine": 110 },
+  "prctl": { "file": "src/upstreamproxy/upstreamproxy.ts", "startLine": 225, "endLine": 252 },
+  "dl-ca": { "file": "src/upstreamproxy/upstreamproxy.ts", "startLine": 254, "endLine": 285 },
+  "ca-ok": { "file": "src/upstreamproxy/upstreamproxy.ts", "startLine": 125, "endLine": 130 },
+  "start-relay": { "file": "src/upstreamproxy/upstreamproxy.ts", "startLine": 132, "endLine": 135 },
+  "relay-ok": { "file": "src/upstreamproxy/upstreamproxy.ts", "startLine": 145, "endLine": 150 },
+  "disabled-relay": { "file": "src/upstreamproxy/upstreamproxy.ts", "startLine": 146, "endLine": 149 },
+  "unlink": { "file": "src/upstreamproxy/upstreamproxy.ts", "startLine": 140, "endLine": 144 },
+  "set-state": { "file": "src/upstreamproxy/upstreamproxy.ts", "startLine": 160, "endLine": 199 },
+  "client": { "file": "src/upstreamproxy/relay.ts", "startLine": 155, "endLine": 174 },
+  "data": { "file": "src/upstreamproxy/relay.ts", "startLine": 295, "endLine": 342 },
+  "phase": { "file": "src/upstreamproxy/relay.ts", "startLine": 306, "endLine": 307 },
+  "accum": { "file": "src/upstreamproxy/relay.ts", "startLine": 307, "endLine": 316 },
+  "header-too-big": { "file": "src/upstreamproxy/relay.ts", "startLine": 311, "endLine": 314 },
+  "bad-400": { "file": "src/upstreamproxy/relay.ts", "startLine": 312, "endLine": 313 },
+  "has-header": { "file": "src/upstreamproxy/relay.ts", "startLine": 319, "endLine": 324 },
+  "bad-405": { "file": "src/upstreamproxy/relay.ts", "startLine": 321, "endLine": 323 },
+  "stash-pending": { "file": "src/upstreamproxy/relay.ts", "startLine": 326, "endLine": 330 },
+  "open-tunnel": { "file": "src/upstreamproxy/relay.ts", "startLine": 344, "endLine": 428 },
+  "ws-open": { "file": "src/upstreamproxy/relay.ts", "startLine": 378, "endLine": 396 },
+  "send-head": { "file": "src/upstreamproxy/relay.ts", "startLine": 378, "endLine": 396 },
+  "buf-pending": { "file": "src/upstreamproxy/relay.ts", "startLine": 337, "endLine": 340 },
+  "phase2": { "file": "src/upstreamproxy/relay.ts", "startLine": 336, "endLine": 342 },
+  "from-client": { "file": "src/upstreamproxy/relay.ts", "startLine": 436, "endLine": 442 },
+  "from-server": { "file": "src/upstreamproxy/relay.ts", "startLine": 398, "endLine": 408 },
+  "established": { "file": "src/upstreamproxy/relay.ts", "startLine": 404, "endLine": 406 },
+  "tunnel": { "file": "src/upstreamproxy/relay.ts", "startLine": 404, "endLine": 408 },
+  "ws-err": { "file": "src/upstreamproxy/relay.ts", "startLine": 410, "endLine": 420 },
+  "send-502": { "file": "src/upstreamproxy/relay.ts", "startLine": 415, "endLine": 417 },
+  "just-close": { "file": "src/upstreamproxy/relay.ts", "startLine": 415, "endLine": 418 },
+  "ws-close": { "file": "src/upstreamproxy/relay.ts", "startLine": 422, "endLine": 427 },
+  "cleanup": { "file": "src/upstreamproxy/relay.ts", "startLine": 444, "endLine": 455 }
+};
+</script>
+
+<aside id="source-panel"><div id="source-header"></div><div id="monaco-container"></div></aside>
+<script src="../assets/codeindex-runtime.js"></script>
+<script src="../assets/codeindex.js"></script>
+</body></html>

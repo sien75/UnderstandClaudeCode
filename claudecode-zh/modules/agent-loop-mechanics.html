@@ -1,0 +1,324 @@
+<!DOCTYPE html>
+<html lang="zh"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Agent 循环机制（状态机·预算·钩子·历史）</title><link rel="stylesheet" href="../assets/codeindex.css"></head><body>
+<nav class="topnav"><a href="../index.html">← 返回总览</a></nav>
+<h1>Agent 循环机制（状态机·预算·钩子·历史）</h1>
+
+<p>这一模块回答的是「一次 agent 会话的循环到底怎么转」。当用户在 REPL 输入一条提示，或 SDK / -p 脚本调用进入一次 query，系统并不是简单地把请求丢给模型就完事——它会进入一个多轮循环：每一轮调用模型、执行工具、检查预算、跑终止钩子、决定是继续下一轮还是结束。本模块覆盖循环的五个核心控制面：终止/继续状态机（transitions）、上下文窗口预算与续写（tokenBudget）、终止钩子（stopHooks）、对话历史落盘（history）、会话状态地基与 plan 模式切换（bootstrap/state）。钩子系统的总执行链在 src/utils/hooks.ts，这里补全其主执行函数与匹配逻辑。</p>
+
+<dl>
+  <dt>输入</dt>
+  <dd>用户的一条提示 + 当前会话状态（cwd、权限模式、agent 身份、历史消息）+ 运行时开关快照（QueryConfig）</dd>
+  <dt>输出</dt>
+  <dd>一条结束原因（Terminal）或一条继续原因（Continue）+ 可能的多轮工具执行结果与落盘的对话历史</dd>
+</dl>
+
+<ul>
+  <li>transitions.ts 是循环的「状态枚举」，本身不含逻辑，但它是 query 主循环里所有 if/else 分支的判别依据——读懂它就读懂了循环能走到哪些终态。</li>
+  <li>tokenBudget 只在「主会话、非 agent、且配置了预算」时启用；子 agent 直接走 stop。</li>
+  <li>Stop 钩子在主线程与子 agent 行为不同：ComputerUse 锁、模板任务分类、记忆抽取都只对主线程跑，避免子 agent 污染主时间线。</li>
+</ul>
+
+<h2>一、终止/继续状态机</h2>
+
+<p>从外部调用者视角：一次 query 调用最终只会以两种方式离开循环——「Terminal」（循环返回，会话这一段结束）或「Continue」（再迭代一轮）。每种方式下又有一组业务原因。transitions.ts 把这些原因列成两个 union type，相当于状态机的状态集定义。下面这张图把所有可达状态及其业务语义画出来，并标注触发条件。</p>
+
+<pre class="mermaid">
+graph TD
+  loop-start["循环开始（query 主循环）"] --> after-model{"模型本轮返回后判定"}
+  after-model -->|模型无工具调用、未中断| terminal-completed["completed 完成"]
+  after-model -->|用户/系统中断流| terminal-aborted["aborted_streaming / aborted_tools 中断"]
+  after-model -->|模型或图片错误| terminal-model-error["model_error / image_error"]
+  after-model -->|输入超过上下文窗口| terminal-prompt-too-long["prompt_too_long 输入过长"]
+  after-model -->|达到最大轮数| terminal-max-turns["max_turns 达到轮数上限"]
+  after-model -->|Stop 钩子阻止继续| terminal-stop-hook["stop_hook_prevented 钩子阻止"]
+  after-model -->|Stop 钩子主动停止| terminal-hook-stopped["hook_stopped 钩子停止"]
+  after-model -->|blocking 限制触发| terminal-blocking["blocking_limit 阻塞限制"]
+  after-model -->|模型本轮要求调工具| continue-tool-use["tool_use 继续工具轮"]
+  after-model -->|自动压缩重试| continue-compact-retry["reactive_compact_retry 紧凑重试"]
+  after-model -->|输出 token 超限恢复| continue-output-recovery["max_output_tokens_recovery 输出恢复"]
+  after-model -->|输出 token 升级模型| continue-output-escalate["max_output_tokens_escalate 升级"]
+  after-model -->|压缩排空重试| continue-collapse-drain["collapse_drain_retry 排空重试"]
+  after-model -->|Stop 钩子阻塞但可继续| continue-stop-blocking["stop_hook_blocking 钩子阻塞中"]
+  after-model -->|token 预算未满继续| continue-budget["token_budget_continuation 预算续写"]
+  after-model -->|排队命令待执行| continue-queued["queued_command 排队命令"]
+</pre>
+
+<p>状态机的「出口」是 Terminal 集合，「回路」是 Continue 集合。query 主循环每轮结束时会算出一个 reason，落到 Continue 之一就回到循环顶，落到 Terminal 之一就 break 返回。注意 prompt_too_long 与 reactive_compact_retry / collapse_drain_retry 是一对：前者是「即使压缩也救不回来」的终态，后两者是「还能再试一次」的回路。token_budget_continuation 则来自 tokenBudget.ts 的预算判定。</p>
+
+<h2>二、Token 预算与续写</h2>
+
+<p>业务背景：长任务（如大规模重构、长链路研究）单轮跑不完模型上下文窗口。系统允许配置一个「全局 token 预算」（按整个会话累计 token 计），当本轮累计还没烧到预算 90% 时，循环会在模型自然停下后注入一条「继续」nudge 消息，让模型接着干；接近预算或收益递减时停止。这个机制只对主会话、非子 agent 生效——子 agent 没有跨轮续写的语义。</p>
+
+<pre class="mermaid">
+graph TD
+  budget-entry["checkTokenBudget 入口"] --> gate-check{"有 agentId 或 无预算?"}
+  gate-check -->|是| stop-null["直接 stop（无事件）"]
+  gate-check -->|否| calc-pct["算 pct=turnTokens/budget 累计 delta"]
+  calc-pct --> diminishing-check{"连续≥3轮 且 最近两轮 delta 都 &lt; 500?"}
+  diminishing-check -->|是| stop-diminishing["stop 收益递减 产出 completionEvent"]
+  diminishing-check -->|否| threshold-check{"turnTokens &lt; budget*0.9?"}
+  threshold-check -->|是| continue-nudge["continue 注入 nudge 消息 累加 continuationCount"]
+  threshold-check -->|否| stop-budget["stop 预算用满 产出 completionEvent"]
+  continue-nudge --> done-cont["返回 ContinueDecision"]
+  stop-diminishing --> done-stop["返回 StopDecision"]
+  stop-budget --> done-stop
+  stop-null --> done-stop
+</pre>
+
+<ul>
+  <li>COMPLETION_THRESHOLD = 0.9：累计 token 没到预算 90% 才允许续写。</li>
+  <li>DIMINISHING_THRESHOLD = 500：连续 3 轮、每轮新增 token 都不到 500，认定模型在「原地打转」，停。</li>
+  <li>BudgetTracker 是有状态的：continuationCount、上次 delta、上次累计 token 都存在 tracker 里跨轮传递。</li>
+  <li>completionEvent 会带 diminishingReturns 标志和 durationMs，用于上报分析。</li>
+</ul>
+
+<h2>三、Stop 钩子执行链</h2>
+
+<p>从用户视角：当模型本轮不再调工具、循环准备收尾时，会触发 Stop 钩子——用户可能在 settings.json 配了「停止时跑某条命令」（比如格式化、跑测试、发通知）。钩子可以阻断继续、可以塞 blocking 错误回灌给模型、也可以纯粹做副作用。handleStopHooks 是这个流程的编排器：先做一堆主线程专属的收尾（任务分类、记忆抽取、auto-dream、ComputerUse 解锁），再真正跑用户配的 Stop 钩子，最后如果是 teammate 身份还会跑 TaskCompleted 与 TeammateIdle 钩子。</p>
+
+<pre class="mermaid">
+graph TD
+  sh-enter["handleStopHooks 入口"] --> save-params["主线程/SDK 保存 cacheSafeParams 供 /btw 与 side_question 读取"]
+  save-params --> job-classify{"TEMPLATES 开 + 有 JOB_DIR + 主线程?"}
+  job-classify -->|是| classify["分类任务状态写 state.json 60s 超时保护"]
+  job-classify -->|否| bare-check{"非 bare 模式?"}
+  classify --> bare-check
+  bare-check -->|是| bg-tasks["fire-and-forget: prompt建议 记忆抽取 autoDream"]
+  bare-check -->|否| cu-cleanup{"CHICAGO_MCP + 主线程?"}
+  bg-tasks --> cu-cleanup
+  cu-cleanup -->|是| cu-release["释放 ComputerUse 锁 自动取消隐藏"]
+  cu-cleanup -->|否| run-stop["executeStopHooks 跑用户 Stop 钩子"]
+  cu-release --> run-stop
+  run-stop --> hook-iter{"遍历钩子结果"}
+  hook-iter -->|有 blockingError| collect-block["收集 blocking 错误回灌模型"]
+  hook-iter -->|preventContinuation| mark-prevented["标记阻止 产出 hook_stopped_continuation 附件"]
+  hook-iter -->|abort 信号| abort-return["中断返回 preventContinuation=true"]
+  hook-iter -->|结束| summary{"hookCount&gt;0?"}
+  summary -->|是| summary-msg["产出 Stop 钩子摘要消息 + 错误通知"]
+  summary -->|否| teammate-check{"是 teammate?"}
+  summary-msg --> teammate-check
+  teammate-check -->|是| teammate-hooks["跑 TaskCompleted（按 in_progress 任务）+ TeammateIdle"]
+  teammate-check -->|否| return-ok["返回无阻塞"]
+  teammate-hooks --> return-ok
+  mark-prevented --> return-prevented["返回 preventContinuation=true"]
+  collect-block --> return-blocks["返回 blockingErrors"]
+</pre>
+
+<ul>
+  <li>主线程判定靠 !toolUseContext.agentId——子 agent 跳过任务分类、记忆抽取、autoDream、ComputerUse 清理，避免污染主时间线或误释放进程级锁。</li>
+  <li>Stop 钩子结果有四种形态：成功无输出、成功有输出、非阻塞错误、执行中错误；后者两类都计入 hasOutput 与 hookErrors，用于摘要消息。</li>
+  <li>teammate 的 TaskCompleted 钩子按 in_progress 任务逐个跑，每个任务独立生成 toolUseID。</li>
+  <li>整个流程包了 try/catch：钩子自身崩溃不会让 query 循环挂掉，只会产出一条 warning 系统消息和一条 tengu_stop_hook_error 上报。</li>
+</ul>
+
+<h2>四、对话历史持久化</h2>
+
+<p>从用户视角：当用户在 REPL 敲下回车提交一条提示，这条提示会进入「上箭头历史」和「ctrl+r 搜索」。系统把每条提示按 JSONL 行追加写到全局文件 ~/.claude/history.jsonl，每行带 display 文本、项目根、sessionId、时间戳、粘贴内容。读取时按逆序读文件，保证最新优先。粘贴内容（图片、大段文本）单独走 paste store，历史行里只存内联小文本或哈希引用，避免历史文件膨胀。</p>
+
+<pre class="mermaid">
+graph TD
+  user-submit["用户回车提交提示"] --> add["addToHistory 入口"]
+  add --> skip-check{"CLAUDE_CODE_SKIP_PROMPT_HISTORY?"}
+  skip-check -->|是| skip["跳过 不写"]
+  skip-check -->|否| reg-cleanup["首次注册 cleanup 钩子 等待 in-flight flush + 最终兜底 flush"]
+  reg-cleanup --> build-entry["addToPromptHistory 组装 LogEntry"]
+  build-entry --> paste-loop{"遍历粘贴内容"}
+  paste-loop -->|图片| skip-img["跳过 图片存 image-cache"]
+  paste-loop -->|小文本 ≤1024| inline["内联存 content"]
+  paste-loop -->|大文本| hash["hashPastedText 算哈希 存 contentHash fire-and-forget 写 paste store"]
+  paste-loop -->|结束| push-pending["压入 pendingEntries 设置 lastAddedEntry 启动 flush"]
+  inline --> push-pending
+  hash --> push-pending
+  push-pending --> flush{"isWriting 或 pending 空?"}
+  flush -->|是| no-op["直接返回"]
+  flush -->|否| retries-check{"retries &gt; 5?"}
+  retries-check -->|是| give-up["放弃 直到下次用户提示再试"]
+  retries-check -->|否| lock["获取 lockfile stale=10s"]
+  lock --> append["appendFile 追加 JSONL"]
+  append --> remaining{"仍有 pending?"}
+  remaining -->|是| sleep500["sleep 500ms 退避递归 retries+1"]
+  remaining -->|否| done["完成"]
+  sleep500 --> flush
+</pre>
+
+<ul>
+  <li>读取侧 makeLogEntryReader 先吐 pendingEntries（未落盘的），再逆序读 history.jsonl；保证 Up 箭头立刻看到刚提交的提示。</li>
+  <li>getHistory 把当前 session 的条目优先吐、其它 session 暂存后吐，避免多 session 交错；上限 MAX_HISTORY_ITEMS=100。</li>
+  <li>removeLastFromHistory 配合 Esc 撤销：pending 命中就 pop，否则把时间戳加入 skippedTimestamps 让读取侧跳过——保证已落盘的撤销条目不在 Up 箭头里出现两次。</li>
+  <li>lockfile 超时 stale=10s、重试 3 次、minTimeout 50ms，防止多进程并发追加互相踩。</li>
+  <li>大文本粘贴 fire-and-forget 写盘，哈希引用立即进历史，不阻塞用户提交。</li>
+</ul>
+
+<h2>五、会话状态地基与 Plan 模式切换</h2>
+
+<p>bootstrap/state.ts 是整个会话的「单例状态盒」。它不直接驱动循环，但循环里几乎每个判断都要读它：当前 cwd、原始 cwd、稳定项目根、sessionId、累计 token 与成本、本轮预算基线、post-compaction 标志、注册的 hook matchers、plan/auto 模式切换附件标志。这里只展开与 agent loop 直接相关的两段——cwd/项目根三元组 与 plan/auto 模式切换——OTel provider 段 mapped 不展开。</p>
+
+<p>cwd 三元组的业务含义：originalCwd 是会话启动时的工作目录（EnterWorktree 工具会改它）；cwd 是当前工作目录（每次工具切换就更新）；projectRoot 是稳定项目根，不受 mid-session worktree 影响，专门给历史/技能/session 锚定身份用。三者分离是为了「进临时 worktree 干活时，历史和技能还指向原项目」。</p>
+
+<p>Plan 模式切换的逻辑很轻：切到 plan 时清掉待发的 plan_mode_exit 附件标志（防止快速来回切时同时发 plan_mode 和 plan_mode_exit）；切出 plan 时置 needsPlanModeExitAttachment=true，由后续消息组装侧消费。Auto 模式同理，但 auto↔plan 双向跳过，交给 prepareContextForPlanMode / ExitPlanMode 处理。</p>
+
+<p>token 预算相关状态也在这一层：snapshotOutputTokensForTurn 在每轮开始拍下「截至本轮开始的累计输出 token」基线 + 设本轮预算 + 重置 continuationCount；getTurnOutputTokens = 总输出 - 基线，给 tokenBudget.ts 用作 turnTokens。</p>
+
+<h2>六、钩子匹配与执行总链（utils/hooks.ts 补全）</h2>
+
+<p>这一节补全 src/utils/hooks.ts 的主执行链。每个 execute*Hooks 函数（PreToolUse / PostToolUse / Stop / TeammateIdle / TaskCompleted / UserPromptSubmit / SessionStart 等）结构都一样：构造 hookInput → hasHookForEvent 快速短路 → 调 executeHooks。executeHooks 是核心：先做信任检查与 SIMPLE 模式短路，再 getMatchingHooks 拉到本事件匹配的钩子，按类型分组并行执行（callback/function/command/prompt/agent/http），逐个 yield 进度消息与结果。</p>
+
+<p>匹配逻辑：getMatchingHooks 按 hookEvent 决定 matchQuery（PreToolUse/PostToolUse 用 tool_name，SessionStart 用 source，Notification 用 notification_type，FileChanged 用 basename 等），再用 matchesPattern 与每条 matcher 的 matcher 字段比对。matchesPattern 支持三种语义：通配 '*' 或空 → 全匹配；纯字母数字下划线竖线 → 精确匹配或竖线分隔多选；其它 → 当正则。同时还会对 legacy 工具名也试一遍正则，保证旧模式如 ^Task$ 仍能命中。</p>
+
+<pre class="mermaid">
+graph TD
+  ex-event["execute*Hooks 入口 构造 hookInput"] --> has-hook{"hasHookForEvent 快查?"}
+  has-hook -->|否| skip-ret["直接返回 不执行"]
+  has-hook -->|是| ex-hooks["executeHooks"]
+  ex-hooks --> disable-check{"禁用全部钩子 或 SIMPLE 模式?"}
+  disable-check -->|是| skip-ret
+  disable-check -->|否| trust-check{"workspace 未授信?"}
+  trust-check -->|是| skip-trust["跳过 防止 RCE"]
+  trust-check -->|否| match["getMatchingHooks 拉+匹配+去重"]
+  match --> query-switch{"按 hookEvent 定 matchQuery"}
+  query-switch -->|PreToolUse/PostToolUse 等| q-tool["tool_name"]
+  query-switch -->|SessionStart| q-source["source"]
+  query-switch -->|Notification| q-ntype["notification_type"]
+  query-switch -->|FileChanged| q-base["basename"]
+  query-switch -->|其它| q-none["无 matchQuery"]
+  q-tool --> mp["matchesPattern"]
+  q-source --> mp
+  q-ntype --> mp
+  q-base --> mp
+  q-none --> dedup
+  mp --> dedup["按类型去重 command/prompt/agent 各自 Map"]
+  dedup --> internal-fast{"全是内部 callback?"}
+  internal-fast -->|是| fast-batch["快路径 直接批量 callback 跳过 span/progress/abort"]
+  internal-fast -->|否| yield-progress["逐钩子 yield 进度消息"]
+  yield-progress --> parallel["并行执行 每个独立超时"]
+  parallel --> type-dispatch{"按 hook.type 分派"}
+  type-dispatch -->|callback| cb["executeHookCallback 带超时信号"]
+  type-dispatch -->|function| fn["executeFunctionHook 需 messages"]
+  type-dispatch -->|command| cmd["execCommandHook"]
+  type-dispatch -->|prompt| pr["execPromptHook"]
+  type-dispatch -->|agent| ag["agent 钩子"]
+  type-dispatch -->|http| http["HTTP 钩子"]
+  cb --> results["聚合 AggregatedHookResult"]
+  fn --> results
+  cmd --> results
+  pr --> results
+  ag --> results
+  http --> results
+  results --> yield-out["yield 进度+blocking+附件"]
+</pre>
+
+<ul>
+  <li>matchesPattern 三态：通配 / 精确（含竖线多选）/ 正则；正则失败只 debug 不抛。</li>
+  <li>去重按 command+shell+if / prompt+if / agent+if 分组，hookDedupKey 用 pluginRoot/skillRoot 做命名空间前缀，避免不同插件的同模板钩子互相吞。</li>
+  <li>全 callback 批次走快路径，跳过 span/progress/abortSignal/processHookJSONOutput，比通用路径快约 70%。</li>
+  <li>Stop / SubagentStop 由 subagentId 是否存在决定 hookEvent，SubagentStop 多带 agent_id、agent_transcript_path、agent_type。</li>
+  <li>registerHookCallbacks 是 SDK 注入回调钩子的入口， STATE.registeredHooks 按 event 累积合并（不覆盖），clearRegisteredPluginHooks 只清带 pluginRoot 的、保留纯 callback 钩子。</li>
+</ul>
+
+<script>
+window.__sourceMap = {
+  "loop-start": { "file": "src/query/transitions.ts", "startLine": 1, "endLine": 37 },
+  "after-model": { "file": "src/query/transitions.ts", "startLine": 8, "endLine": 37 },
+  "terminal-completed": { "file": "src/query/transitions.ts", "startLine": 9, "endLine": 23 },
+  "terminal-aborted": { "file": "src/query/transitions.ts", "startLine": 14, "endLine": 16 },
+  "terminal-model-error": { "file": "src/query/transitions.ts", "startLine": 13, "endLine": 14 },
+  "terminal-prompt-too-long": { "file": "src/query/transitions.ts", "startLine": 17, "endLine": 17 },
+  "terminal-max-turns": { "file": "src/query/transitions.ts", "startLine": 20, "endLine": 20 },
+  "terminal-stop-hook": { "file": "src/query/transitions.ts", "startLine": 18, "endLine": 18 },
+  "terminal-hook-stopped": { "file": "src/query/transitions.ts", "startLine": 19, "endLine": 19 },
+  "terminal-blocking": { "file": "src/query/transitions.ts", "startLine": 12, "endLine": 12 },
+  "continue-tool-use": { "file": "src/query/transitions.ts", "startLine": 28, "endLine": 28 },
+  "continue-compact-retry": { "file": "src/query/transitions.ts", "startLine": 29, "endLine": 29 },
+  "continue-output-recovery": { "file": "src/query/transitions.ts", "startLine": 30, "endLine": 30 },
+  "continue-output-escalate": { "file": "src/query/transitions.ts", "startLine": 31, "endLine": 31 },
+  "continue-collapse-drain": { "file": "src/query/transitions.ts", "startLine": 32, "endLine": 32 },
+  "continue-stop-blocking": { "file": "src/query/transitions.ts", "startLine": 33, "endLine": 33 },
+  "continue-budget": { "file": "src/query/transitions.ts", "startLine": 34, "endLine": 34 },
+  "continue-queued": { "file": "src/query/transitions.ts", "startLine": 35, "endLine": 35 },
+  "budget-entry": { "file": "src/query/tokenBudget.ts", "startLine": 45, "endLine": 53 },
+  "gate-check": { "file": "src/query/tokenBudget.ts", "startLine": 51, "endLine": 53 },
+  "stop-null": { "file": "src/query/tokenBudget.ts", "startLine": 52, "endLine": 53 },
+  "calc-pct": { "file": "src/query/tokenBudget.ts", "startLine": 55, "endLine": 57 },
+  "diminishing-check": { "file": "src/query/tokenBudget.ts", "startLine": 59, "endLine": 62 },
+  "stop-diminishing": { "file": "src/query/tokenBudget.ts", "startLine": 78, "endLine": 90 },
+  "threshold-check": { "file": "src/query/tokenBudget.ts", "startLine": 64, "endLine": 64 },
+  "continue-nudge": { "file": "src/query/tokenBudget.ts", "startLine": 64, "endLine": 76 },
+  "stop-budget": { "file": "src/query/tokenBudget.ts", "startLine": 78, "endLine": 90 },
+  "done-cont": { "file": "src/query/tokenBudget.ts", "startLine": 22, "endLine": 29 },
+  "done-stop": { "file": "src/query/tokenBudget.ts", "startLine": 31, "endLine": 43 },
+  "sh-enter": { "file": "src/query/stopHooks.ts", "startLine": 65, "endLine": 82 },
+  "save-params": { "file": "src/query/stopHooks.ts", "startLine": 84, "endLine": 98 },
+  "job-classify": { "file": "src/query/stopHooks.ts", "startLine": 108, "endLine": 113 },
+  "classify": { "file": "src/query/stopHooks.ts", "startLine": 117, "endLine": 132 },
+  "bare-check": { "file": "src/query/stopHooks.ts", "startLine": 136, "endLine": 136 },
+  "bg-tasks": { "file": "src/query/stopHooks.ts", "startLine": 138, "endLine": 157 },
+  "cu-cleanup": { "file": "src/query/stopHooks.ts", "startLine": 164, "endLine": 164 },
+  "cu-release": { "file": "src/query/stopHooks.ts", "startLine": 166, "endLine": 172 },
+  "run-stop": { "file": "src/query/stopHooks.ts", "startLine": 175, "endLine": 189 },
+  "hook-iter": { "file": "src/query/stopHooks.ts", "startLine": 200, "endLine": 295 },
+  "collect-block": { "file": "src/query/stopHooks.ts", "startLine": 257, "endLine": 267 },
+  "mark-prevented": { "file": "src/query/stopHooks.ts", "startLine": 269, "endLine": 280 },
+  "abort-return": { "file": "src/query/stopHooks.ts", "startLine": 283, "endLine": 294 },
+  "summary": { "file": "src/query/stopHooks.ts", "startLine": 298, "endLine": 298 },
+  "summary-msg": { "file": "src/query/stopHooks.ts", "startLine": 299, "endLine": 323 },
+  "teammate-check": { "file": "src/query/stopHooks.ts", "startLine": 335, "endLine": 335 },
+  "teammate-hooks": { "file": "src/query/stopHooks.ts", "startLine": 346, "endLine": 441 },
+  "return-ok": { "file": "src/query/stopHooks.ts", "startLine": 455, "endLine": 455 },
+  "return-prevented": { "file": "src/query/stopHooks.ts", "startLine": 325, "endLine": 327 },
+  "return-blocks": { "file": "src/query/stopHooks.ts", "startLine": 330, "endLine": 332 },
+  "user-submit": { "file": "src/history.ts", "startLine": 411, "endLine": 416 },
+  "add": { "file": "src/history.ts", "startLine": 411, "endLine": 434 },
+  "skip-check": { "file": "src/history.ts", "startLine": 414, "endLine": 416 },
+  "skip": { "file": "src/history.ts", "startLine": 415, "endLine": 415 },
+  "reg-cleanup": { "file": "src/history.ts", "startLine": 419, "endLine": 431 },
+  "build-entry": { "file": "src/history.ts", "startLine": 355, "endLine": 409 },
+  "paste-loop": { "file": "src/history.ts", "startLine": 364, "endLine": 395 },
+  "skip-img": { "file": "src/history.ts", "startLine": 367, "endLine": 369 },
+  "inline": { "file": "src/history.ts", "startLine": 372, "endLine": 379 },
+  "hash": { "file": "src/history.ts", "startLine": 380, "endLine": 393 },
+  "push-pending": { "file": "src/history.ts", "startLine": 397, "endLine": 408 },
+  "flush": { "file": "src/history.ts", "startLine": 329, "endLine": 337 },
+  "no-op": { "file": "src/history.ts", "startLine": 330, "endLine": 332 },
+  "retries-check": { "file": "src/history.ts", "startLine": 335, "endLine": 337 },
+  "give-up": { "file": "src/history.ts", "startLine": 336, "endLine": 336 },
+  "lock": { "file": "src/history.ts", "startLine": 297, "endLine": 314 },
+  "append": { "file": "src/history.ts", "startLine": 316, "endLine": 319 },
+  "remaining": { "file": "src/history.ts", "startLine": 346, "endLine": 352 },
+  "sleep500": { "file": "src/history.ts", "startLine": 347, "endLine": 351 },
+  "done": { "file": "src/history.ts", "startLine": 352, "endLine": 352 },
+  "ex-event": { "file": "src/utils/hooks.ts", "startLine": 3394, "endLine": 3436 },
+  "has-hook": { "file": "src/utils/hooks.ts", "startLine": 3410, "endLine": 3412 },
+  "skip-ret": { "file": "src/utils/hooks.ts", "startLine": 3411, "endLine": 3412 },
+  "ex-hooks": { "file": "src/utils/hooks.ts", "startLine": 1952, "endLine": 1977 },
+  "disable-check": { "file": "src/utils/hooks.ts", "startLine": 1978, "endLine": 1984 },
+  "trust-check": { "file": "src/utils/hooks.ts", "startLine": 1994, "endLine": 1999 },
+  "skip-trust": { "file": "src/utils/hooks.ts", "startLine": 1995, "endLine": 1999 },
+  "match": { "file": "src/utils/hooks.ts", "startLine": 2004, "endLine": 2013 },
+  "query-switch": { "file": "src/utils/hooks.ts", "startLine": 1616, "endLine": 1670 },
+  "q-tool": { "file": "src/utils/hooks.ts", "startLine": 1617, "endLine": 1623 },
+  "q-source": { "file": "src/utils/hooks.ts", "startLine": 1624, "endLine": 1626 },
+  "q-ntype": { "file": "src/utils/hooks.ts", "startLine": 1634, "endLine": 1636 },
+  "q-base": { "file": "src/utils/hooks.ts", "startLine": 1665, "endLine": 1667 },
+  "q-none": { "file": "src/utils/hooks.ts", "startLine": 1649, "endLine": 1652 },
+  "mp": { "file": "src/utils/hooks.ts", "startLine": 1346, "endLine": 1381 },
+  "dedup": { "file": "src/utils/hooks.ts", "startLine": 1731, "endLine": 1782 },
+  "internal-fast": { "file": "src/utils/hooks.ts", "startLine": 2024, "endLine": 2027 },
+  "fast-batch": { "file": "src/utils/hooks.ts", "startLine": 2041, "endLine": 2066 },
+  "yield-progress": { "file": "src/utils/hooks.ts", "startLine": 2095, "endLine": 2116 },
+  "parallel": { "file": "src/utils/hooks.ts", "startLine": 2143, "endLine": 2146 },
+  "type-dispatch": { "file": "src/utils/hooks.ts", "startLine": 2147, "endLine": 2192 },
+  "cb": { "file": "src/utils/hooks.ts", "startLine": 2147, "endLine": 2163 },
+  "fn": { "file": "src/utils/hooks.ts", "startLine": 2165, "endLine": 2192 },
+  "cmd": { "file": "src/utils/hooks.ts", "startLine": 2194, "endLine": 2198 },
+  "pr": { "file": "src/utils/hooks.ts", "startLine": 2224, "endLine": 2239 },
+  "ag": { "file": "src/utils/hooks.ts", "startLine": 2194, "endLine": 2198 },
+  "http": { "file": "src/utils/hooks.ts", "startLine": 2194, "endLine": 2198 },
+  "results": { "file": "src/utils/hooks.ts", "startLine": 2143, "endLine": 2146 },
+  "yield-out": { "file": "src/utils/hooks.ts", "startLine": 2095, "endLine": 2116 }
+};
+</script>
+
+<aside id="source-panel"><div id="source-header"></div><div id="monaco-container"></div></aside>
+<script src="../assets/codeindex-runtime.js"></script>
+<script src="../assets/codeindex.js"></script>
+</body></html>

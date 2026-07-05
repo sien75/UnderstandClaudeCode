@@ -1,141 +1,134 @@
 <!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Permission System</title>
-<link rel="stylesheet" href="../assets/codeindex.css">
-</head>
-<body>
-<nav class="topnav"><a href="../index.html">← Back to overview</a></nav>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Permission System</title><link rel="stylesheet" href="../assets/codeindex.css"></head><body>
+<nav class="topnav"><a href="../index.html">← Back to Overview</a></nav>
 <h1>Permission System</h1>
 
-<p>Every time Claude is about to execute an operation that could change the environment (run a bash snippet, write a file, call an MCP tool, etc.), the system first passes it through a "gate" that decides how to handle the action: allow it directly, pause and ask the user, or reject it outright. This module is that gate. It combines four runtime modes (default / plan / bypassPermissions / auto, plus the internal ant mode dontAsk), user-configured allow / deny / ask rules, tool-reported command-level checks, and (in auto mode) an AI classifier to produce a final verdict for each pending tool call: allow / ask / deny.</p>
+<p>Every time Claude is about to perform an operation that could change the environment (run a bash snippet, write a file, call an MCP tool, etc.), the system first runs a "gate check" to decide how to handle the action: allow it directly, pause and ask the user, or reject it outright. This module is that gate. It combines four runtime modes (default / plan / bypassPermissions / auto, plus the internal ant mode dontAsk), user-configured allow/deny/ask rules, tool-self-reported command-level checks, and (in auto mode) an AI classifier to deliver a final verdict for each pending tool call: allow / ask / deny.</p>
 
 <dl>
   <dt>Input</dt>
-  <dd>A pending tool call (tool name + input arguments) + the current session's permission context (mode, allow/deny/ask rules from each source, additional working directories) + the current conversation history (used by the auto-mode classifier).</dd>
+  <dd>A pending tool call (tool name + input parameters) + the current session's permission context (mode, allow/deny/ask rule lists from each source, additional working directories) + the current conversation history (used by the auto-mode classifier).</dd>
   <dt>Output</dt>
-  <dd>A verdict: allow (possibly with user-modified input), ask (popup to the user, possibly with a "suggested rule" and concurrent classifier check), or deny (with a reason). The verdict is also logged and recorded for analytics.</dd>
+  <dd>A verdict: allow (permit, possibly with user-edited input), ask (pop-up asking the user, possibly with a "suggested rule" and concurrent classifier checks), or deny (rejected, with a reason). The verdict is also logged and recorded for analytics.</dd>
 </dl>
 
 <ul>
-  <li>The four modes are not flat switches; they form a "pre-processing + post-processing" layering: rule checks run first (deny / ask / safetyCheck cannot be bypassed), then the result is routed by mode (bypass allows directly, auto invokes the classifier, dontAsk turns ask into deny, headless turns ask into deny / uses hooks).</li>
-  <li>User-configured rules are grouped by source (userSettings/projectSettings/localSettings/flagSettings/policySettings/cliArg/command/session). The rule syntax is <code>ToolName</code> or <code>ToolName(content)</code>; parentheses support escaping. MCP tools are matched by their full name <code>mcp__server__tool</code>, and <code>mcp__server__*</code> is supported for whole-server granularity.</li>
-  <li>Safety checks (safetyCheck), e.g. touching <code>.git/</code>, <code>.claude/</code>, or shell config files, are "bypass-immune" — even in bypassPermissions mode the user must be asked. Among these, entries with <code>classifierApprovable=true</code> (sensitive file paths) can be adjudicated by the classifier in auto mode, while <code>false</code> entries (Windows path bypass, cross-machine bridge messages) require human confirmation in every mode.</li>
-  <li>Auto mode has a circuit breaker: after 3 consecutive denials or 20 cumulative denials in the session, it falls back to human confirmation. If the classifier API is unavailable, the <code>tengu_iron_gate_closed</code> switch decides whether to fail-closed (deny and prompt retry) or fail-open (fall back to human). An overly long transcript is a deterministic error and falls back to human confirmation, or aborts in headless mode.</li>
+  <li>The four modes are not flat switches; they form a "pre-processing + post-processing" layering: rule checks run first (deny/ask/safetyCheck bypasses cannot skip these), then the mode branches (bypass allows directly, auto calls the classifier, dontAsk turns ask into deny, headless turns ask into deny / goes through hooks).</li>
+  <li>User-configured rules are grouped by source (userSettings/projectSettings/localSettings/flagSettings/policySettings/cliArg/command/session). The rule syntax is <code>ToolName</code> or <code>ToolName(content)</code>; parentheses support escaping. MCP tools are matched by their full <code>mcp__server__tool</code> name, and <code>mcp__server__*</code> is supported for whole-server granularity.</li>
+  <li>Safety checks (safetyCheck), such as touching <code>.git/</code>, <code>.claude/</code>, or shell config files, are "bypass-immune" — even in bypassPermissions mode the system must stop and ask. Among these, entries with <code>classifierApprovable=true</code> (sensitive file paths) can be judged by the classifier in auto mode; those with <code>false</code> (Windows path bypasses, cross-machine bridge messages) require human confirmation in every mode.</li>
+  <li>Auto mode has a circuit breaker: after 3 consecutive classifier denials or 20 cumulative denials in the session, it falls back to human confirmation; if the classifier API is unavailable, the <code>tengu_iron_gate_closed</code> switch decides fail-closed (deny and prompt retry) or fail-open (fall back to human); transcript-too-long is a deterministic error that falls back to human or, in headless mode, aborts.</li>
 </ul>
 
-<h2>Main decision chain: from tool call to final verdict</h2>
+<h2>Main Decision Chain: From Tool Call to Final Verdict</h2>
 
-<p>This is the core data flow. From the user's perspective, the trigger is: Claude produces a tool_use in conversation (for example, it wants to run <code>rm</code>). Before the tool system actually executes it, it calls <code>hasPermissionsToUseTool</code>, and the following chain begins. First, "hard rule checks that every mode must pass" run, then the result is routed by mode, and finally some post-processing is applied (dontAsk flips to deny, auto runs the classifier, headless falls back to deny).</p>
+<p>This is the core data flow. From the user's point of view, the trigger is: Claude produces a tool_use in the conversation (for example, it wants to run <code>rm</code>). Before the tool system actually executes it, it calls <code>hasPermissionsToUseTool</code>, and the following chain begins. It first runs "hard rule checks that every mode must pass", then branches by mode, and finally performs some post-processing (dontAsk turns ask to deny, auto runs the classifier, headless falls back to deny).</p>
 
 <pre class="mermaid">
 graph TD
-  abort-check["Session already aborted?"] -->|Yes| throw-abort["Throw AbortError"]
-  abort-check -->|No| deny-rule["Whole-tool deny rule?&lt;br/&gt;getDenyRuleForTool"]
+  abort-check["Session aborted?"] -->|Yes| throw-abort["Throw AbortError"]
+  abort-check -->|No| deny-rule["Whole tool has a deny rule?&lt;br/&gt;getDenyRuleForTool"]
   deny-rule -->|Hit| ret-deny-rule["Return deny + matched rule"]
-  deny-rule -->|Miss| ask-rule["Whole-tool ask rule?&lt;br/&gt;getAskRuleForTool"]
+  deny-rule -->|Miss| ask-rule["Whole tool has an ask rule?&lt;br/&gt;getAskRuleForTool"]
   ask-rule -->|Hit and not sandbox auto-allow| ret-ask-rule["Return ask + matched rule"]
-  ask-rule -->|Miss / sandbox allow| tool-check["Invoke tool's own checkPermissions&lt;br/&gt;(bash subcommand rules, etc.)"]
+  ask-rule -->|Miss/sandbox allow| tool-check["Call tool's own checkPermissions&lt;br/&gt;(bash subcommand rules, etc.)"]
   tool-check --> tool-deny{"Tool returns deny?"}
   tool-deny -->|Yes| ret-tool-deny["Return that deny"]
   tool-deny -->|No| ask-content{"ask with reason=rule&lt;br/&gt;(content-level must-ask)?"}
-  ask-content -->|Yes| ret-ask-content["Return that ask&lt;br/&gt;(bypass cannot bypass)"]
+  ask-content -->|Yes| ret-ask-content["Return that ask&lt;br/&gt;(bypass cannot skip)"]
   ask-content -->|No| safety{"ask with reason=safetyCheck?&lt;br/&gt;(sensitive path)"}
   safety -->|Yes| ret-safety["Return that ask&lt;br/&gt;(bypass-immune)"]
-  safety -->|No| mode-branch["Route by mode"]
-  mode-branch --> bypass{"bypassPermissions?&lt;br/&gt;(or plan+original bypass)"}
+  safety -->|No| mode-branch["Branch by mode"]
+  mode-branch --> bypass{"bypassPermissions?&lt;br/&gt;(or plan + original bypass)"}
   bypass -->|Yes| ret-allow-bypass["Return allow&lt;br/&gt;reason=mode"]
-  bypass -->|No| allow-rule{"Whole-tool allow rule?&lt;br/&gt;toolAlwaysAllowedRule"}
+  bypass -->|No| allow-rule{"Whole tool has an allow rule?&lt;br/&gt;toolAlwaysAllowedRule"}
   allow-rule -->|Yes| ret-allow-rule["Return allow&lt;br/&gt;reason=rule"]
-  allow-rule -->|No| passthrough-to-ask["passthrough→ask&lt;br/&gt;ready for post-processing"]
+  allow-rule -->|No| passthrough-to-ask["passthrough→ask&lt;br/&gt;Prepare for post-processing"]
   passthrough-to-ask --> postproc["Enter post-processing hasPermissionsToUseTool"]
 </pre>
 
-<p>Post-processing (the wrapper layer of <code>hasPermissionsToUseTool</code>) takes the inner result and applies mode-specific transformations to <code>ask</code> results, while also resetting the auto-mode consecutive-denial counter on <code>allow</code> results. The diagram below shows the post-processing branch after ask.</p>
+<p>Post-processing (the <code>hasPermissionsToUseTool</code> wrapper) takes the inner result and applies one more mode-related transformation to <code>ask</code> results; for <code>allow</code> results it resets the auto-mode consecutive-denial counter. Below is the post-processing branch after ask.</p>
 
 <pre class="mermaid">
 graph TD
   inner-result["Inner verdict result"] --> allow{"behavior=allow?"}
-  allow -->|Yes| reset-denial["Reset consecutive denial count in auto mode&lt;br/&gt;recordSuccess"] --> done-allow["Return allow"]
+  allow -->|Yes| reset-denial["Auto mode: reset consecutive denial counter&lt;br/&gt;recordSuccess"] --> done-allow["Return allow"]
   allow -->|No| ask2{"behavior=ask?"}
   ask2 -->|No| done-other["Return original result (deny, etc.)"]
-  ask2 -->|Yes| dontask{"mode=dontAsk?"}
-  dontask -->|Yes| ret-deny-dontask["Flip to deny&lt;br/&gt;'Tool that should not be asked'"]
-  dontask -->|No| auto-decide{"mode=auto&lt;br/&gt;(or plan+auto activated)?"}
+  ask2 -->|Yes| dontask{"Mode=dontAsk?"}
+  dontask -->|Yes| ret-deny-dontask["Flip to deny&lt;br/&gt;'Tools that shouldn't be asked, aren't'"]
+  dontask -->|No| auto-decide{"Mode=auto&lt;br/&gt;(or plan with auto activated)?"}
   auto-decide -->|No| headless{"shouldAvoidPermissionPrompts?&lt;br/&gt;(headless/background)"}
   auto-decide -->|Yes| auto-flow["Enter auto classifier flow"]
   headless -->|Yes| hook-headless["Run PermissionRequest hook&lt;br/&gt;runPermissionRequestHooksForHeadlessAgent"]
-  headless -->|No| ret-ask-user["Return ask&lt;br/&gt;hand to useCanUseTool popup"]
-  hook-headless --> hook-decided{"Hook produced a verdict?"}
+  headless -->|No| ret-ask-user["Return ask&lt;br/&gt;Hand to useCanUseTool popup"]
+  hook-headless --> hook-decided{"Hook returned a verdict?"}
   hook-decided -->|Yes| ret-hook["Return hook verdict"]
   hook-decided -->|No| ret-deny-headless["Return deny&lt;br/&gt;'This environment cannot show permission dialogs'"]
 </pre>
 
-<h2>Auto-mode classifier flow</h2>
+<h2>Auto-Mode Classifier Flow</h2>
 
-<p>When the mode is auto (or auto is temporarily activated in plan mode) and the inner result is ask, this flow is entered. Its goal is to replace human confirmation with an independent AI classifier: feed the current conversation history plus the pending action to the classifier, and let it decide whether the action should be allowed. However, there are several fast paths that avoid invoking the classifier whenever possible (saving tokens and latency).</p>
+<p>When the mode is auto (or auto is temporarily active in plan mode) and the inner result is ask, this flow is entered. Its goal is to use an independent AI classifier in place of human confirmation: feed the current conversation history plus the action about to be taken into the classifier, and let it decide whether the action should be allowed. However, there are several fast-path checks that avoid calling the classifier whenever possible (saving tokens and latency).</p>
 
 <pre class="mermaid">
 graph TD
   auto-enter["Auto mode + ask result"] --> safety-immune{"safetyCheck and&lt;br/&gt;classifierApprovable=false?"}
-  safety-immune -->|Yes| ret-ask-safety["Keep ask&lt;br/&gt;(sensitive safety check not delegated to classifier)"]
+  safety-immune -->|Yes| ret-ask-safety["Keep ask&lt;br/&gt;(Sensitive safety checks are not handed to classifier)"]
   safety-immune -->|No| needs-interact{"Tool requires user interaction?"}
   needs-interact -->|Yes| ret-ask-interact["Keep ask"]
   needs-interact -->|No| ps-guard{"PowerShell and POWERSHELL_AUTO_MODE&lt;br/&gt;not enabled?"}
   ps-guard -->|Yes| ret-ask-ps["Keep ask&lt;br/&gt;(PS requires human confirmation)"]
-  ps-guard -->|No| accept-edits-fast["Fast path 1: pretend acceptEdits&lt;br/&gt;then ask tool checkPermissions again"]
-  accept-edits-fast --> ae-allow{"Would it allow under acceptEdits?"}
+  ps-guard -->|No| accept-edits-fast["Fast path 1: simulate acceptEdits&lt;br/&gt;and ask tool checkPermissions again"]
+  accept-edits-fast --> ae-allow{"Would allow under acceptEdits?"}
   ae-allow -->|Yes| ret-allow-ae["Return allow&lt;br/&gt;fastPath=acceptEdits"]
-  ae-allow -->|No| allowlist-fast["Fast path 2: tool in&lt;br/&gt;safety allowlist isAutoModeAllowlistedTool?"]
+  ae-allow -->|No| allowlist-fast["Fast path 2: tool is on&lt;br/&gt;safe allowlist isAutoModeAllowlistedTool?"]
   allowlist-fast -->|Yes| ret-allow-wl["Return allow&lt;br/&gt;fastPath=allowlist"]
-  allowlist-fast -->|No| call-classifier["Invoke classifier&lt;br/&gt;classifyYoloAction"]
+  allowlist-fast -->|No| call-classifier["Call classifier&lt;br/&gt;classifyYoloAction"]
   call-classifier --> cls-result{"Classifier result"}
   cls-result -->|shouldBlock=false| ret-allow-cls["Return allow&lt;br/&gt;reason=classifier"]
-  cls-result -->|transcriptTooLong| ret-fallback-tl["Fall back to human ask&lt;br/&gt;(abort in headless)"]
+  cls-result -->|transcriptTooLong| ret-fallback-tl["Fallback to human ask&lt;br/&gt;(headless aborts)"]
   cls-result -->|unavailable| iron-gate{"tengu_iron_gate_closed?"}
   cls-result -->|shouldBlock=true| record-denial["Record denial count&lt;br/&gt;recordDenial"]
   iron-gate -->|"true (default)"| ret-deny-closed["Return deny&lt;br/&gt;'Classifier unavailable, please retry'"]
-  iron-gate -->|false| ret-ask-open["Fall back to human ask"]
+  iron-gate -->|false| ret-ask-open["Fallback to human ask"]
   record-denial --> denial-limit{"Limit reached?&lt;br/&gt;3 consecutive / 20 cumulative"}
-  denial-limit -->|Yes| ret-fallback-limit["Fall back to human ask&lt;br/&gt;(abort in headless)"]
+  denial-limit -->|Yes| ret-fallback-limit["Fallback to human ask&lt;br/&gt;(headless aborts)"]
   denial-limit -->|No| ret-deny-cls["Return deny&lt;br/&gt;reason=classifier"]
 </pre>
 
-<h2>User interaction: from popup to resolved verdict</h2>
+<h2>User Interaction: From Ask Popup to Verdict Commitment</h2>
 
-<p>When <code>hasPermissionsToUseTool</code> returns ask, <code>useCanUseTool</code> takes over and pushes the permission request into the UI queue to wait for a user response. This section describes what the user can do in the popup and how the system converts the user's choice into a final verdict. Three sources of "allow" (manual yes, PreToolUse hook, concurrent bash classifier) race for the same verdict; an atomic <code>createResolveOnce</code> claim ensures only the first winner takes effect.</p>
+<p>When <code>hasPermissionsToUseTool</code> returns ask, <code>useCanUseTool</code> takes over and pushes the permission request into the UI queue to await the user's response. This section describes what the user can do in the popup and how the system commits the user's choice back to a verdict. Three sources of "allow" (the user clicking yes, a PreToolUse hook, and a concurrent bash classifier) race for the same verdict; <code>createResolveOnce</code>'s atomic claim guarantees only the first winner takes effect.</p>
 
 <pre class="mermaid">
 graph TD
   ask-result["hasPermissionsToUseTool returns ask"] --> coord{"awaitAutomatedChecksBeforeDialog?"}
-  coord -->|Yes| coordinator["Run coordinatorHandler first&lt;br/&gt;(hook / bash classifier quick-answer)"]
-  coordinator --> coord-decided{"Produced a verdict?"}
-  coord-decided -->|Yes| done-coord["Apply that verdict"]
+  coord -->|Yes| coordinator["Run coordinatorHandler first&lt;br/&gt;(hook / bash classifier snipes answer)"]
+  coordinator --> coord-decided{"Got a verdict?"}
+  coord-decided -->|Yes| done-coord["Commit that verdict"]
   coord-decided -->|No| swarm["Then run swarmWorkerHandler"]
   coord -->|No| swarm
-  swarm --> swarm-decided{"Produced a verdict?"}
-  swarm-decided -->|Yes| done-swarm["Apply that verdict"]
-  swarm-decided -->|No| interactive["handleInteractivePermission&lt;br/&gt;push to UI queue and wait for user"]
+  swarm --> swarm-decided{"Got a verdict?"}
+  swarm-decided -->|Yes| done-swarm["Commit that verdict"]
+  swarm-decided -->|No| interactive["handleInteractivePermission&lt;br/&gt;Push to UI queue and wait for user"]
   interactive --> user-resp{"User response"}
-  user-resp -->|"Allow (may modify input / add rule)"| on-allow["handleUserAllow&lt;br/&gt;persist rule + log"]
-  user-resp -->|"Deny (may include feedback)"| on-deny["Log denial"]
-  user-resp -->|Esc abort| on-abort["cancelAndAbort&lt;br/&gt;abort this tool call"]
-  on-allow --> done-allow2["Apply allow"]
-  on-deny --> done-deny["Apply deny"]
-  on-abort --> done-abort["Apply ask (abort message)"]
+  user-resp -->|"Allow (possibly edit input / add rule)"| on-allow["handleUserAllow&lt;br/&gt;Persist rule + log"]
+  user-resp -->|"Deny (possibly with feedback)"| on-deny["Log denial"]
+  user-resp -->|Esc abort| on-abort["cancelAndAbort&lt;br/&gt;Abort this tool call"]
+  on-allow --> done-allow2["Commit allow"]
+  on-deny --> done-deny["Commit deny"]
+  on-abort --> done-abort["Commit ask (abort message)"]
 </pre>
 
 <ul>
-  <li>If the concurrent bash classifier (BASH_CLASSIFIER) produces an allow while the popup is open, it auto-allows before the user clicks; if the user starts keyboard interaction, the auto-answer is canceled after a 200ms grace period.</li>
-  <li>When the user chooses "Allow and always allow this kind of operation", <code>persistPermissions</code> writes the new rule to the appropriate source (userSettings/projectSettings/localSettings/session), so the next matching call goes straight through the allow-rule path.</li>
-  <li>Tools denied by the classifier in auto mode trigger a UI notification "Denied by auto mode", and the denial is recorded in <code>recordAutoModeDenial</code> for later display.</li>
+  <li>If the concurrent bash classifier (BASH_CLASSIFIER) returns allow during the popup, it can auto-allow before the user clicks; once the user begins keyboard interaction (after a 200ms grace period), this auto-snipe is canceled.</li>
+  <li>When the user selects "Allow and always allow this kind of operation", <code>persistPermissions</code> writes the new rule to the corresponding source (userSettings/projectSettings/localSettings/session). Next time, the same kind of call goes directly through the allow-rule path.</li>
+  <li>Tools denied by the classifier in auto mode surface a UI notification "Rejected by auto mode" and record the denial in <code>recordAutoModeDenial</code> for later display.</li>
 </ul>
 
-<h2>Mode-switch state machine (Shift+Tab cycle)</h2>
+<h2>Mode Switching State Machine (Shift+Tab Cycle)</h2>
 
-<p>When the user presses Shift+Tab to cycle modes, <code>getNextPermissionMode</code> decides the next mode. default / plan / acceptEdits / bypassPermissions are the four user-visible modes; auto is only exposed to internal ant users, and only when the TRANSCRIPT_CLASSIFIER feature flag is on and the auto gate (<code>isAutoModeGateEnabled</code>, including circuit-breaker state) passes. dontAsk is not exposed in the cycle. When entering auto, <code>transitionPermissionMode</code> also strips dangerous permission rules (to prevent the auto + dangerous-rule combination).</p>
+<p>The user presses Shift+Tab to cycle through modes; <code>getNextPermissionMode</code> decides the next mode. default/plan/acceptEdits/bypassPermissions are the four user-visible modes; auto is only shown to internal ant users, and only when the TRANSCRIPT_CLASSIFIER feature flag is on and the auto gate (<code>isAutoModeGateEnabled</code>, including circuit-breaker status) passes; dontAsk is not exposed in the cycle. Entering auto via <code>transitionPermissionMode</code> strips dangerous permission rules (preventing the dangerous auto + dangerous rule combination).</p>
 
 <pre class="mermaid">
 graph TD
@@ -158,9 +151,9 @@ graph TD
   auto -->|Shift+Tab| def
 </pre>
 
-<h2>Rule matching decision table</h2>
+<h2>Rule Matching Decision Table</h2>
 
-<p>Rules are bucketed by behavior: allow / deny / ask. Matching separates "whole-tool" rules from "content" rules: <code>ToolName</code> (no parentheses) matches the whole tool; <code>ToolName(content)</code> is interpreted by the tool's own <code>checkPermissions</code> (bash does command-prefix matching, Write/Edit does glob path matching). Whole-tool deny/ask run before the tool's self-check; whole-tool allow runs after the tool's self-check — this order is deliberate: deny has the highest priority, ask forces a popup, and allow only takes effect when no deny/ask objects.</p>
+<p>Rules are divided into three buckets by behavior: allow / deny / ask. Matching separates "whole tool" from "with content": <code>ToolName</code> (no parentheses) matches the whole tool; <code>ToolName(content)</code> is interpreted by the tool's own <code>checkPermissions</code> (bash uses command-prefix matching, Write/Edit uses glob path matching). Whole-tool deny/ask run before the tool's self-reported check; whole-tool allow runs after the tool's self-reported check — this order is intentional: deny has the highest priority, ask forces a popup, and allow only takes effect when no deny/ask objects.</p>
 
 <pre class="mermaid">
 graph TD
@@ -168,21 +161,21 @@ graph TD
   d1 -->|Hit| out-deny["deny, reason=rule"]
   d1 -->|No| d2{"Whole-tool ask rule?"}
   d2 -->|Hit and not sandbox allow| out-ask["ask, reason=rule"]
-  d2 -->|No / sandbox allow| d3{"Tool checkPermissions&lt;br/&gt;returns deny / content ask / safetyCheck?"}
-  d3 -->|deny| out-tool-deny["deny (tool self-report)"]
-  d3 -->|"content ask (rule)"| out-ask-content["ask, reason=rule&lt;br/&gt;(bypass-immune)"]
+  d2 -->|No/sandbox allow| d3{"Tool checkPermissions&lt;br/&gt;returns deny/content-level ask/safetyCheck?"}
+  d3 -->|deny| out-tool-deny["deny (tool self-reported)"]
+  d3 -->|"content-level ask(rule)"| out-ask-content["ask, reason=rule&lt;br/&gt;(bypass-immune)"]
   d3 -->|safetyCheck| out-ask-safety["ask, reason=safetyCheck&lt;br/&gt;(bypass-immune)"]
-  d3 -->|passthrough/allow| d4{"mode=bypass?"}
+  d3 -->|passthrough/allow| d4{"Mode=bypass?"}
   d4 -->|Yes| out-allow-bypass["allow, reason=mode"]
   d4 -->|No| d5{"Whole-tool allow rule?&lt;br/&gt;toolAlwaysAllowedRule"}
   d5 -->|Hit| out-allow-rule["allow, reason=rule"]
-  d5 -->|No| out-ask-default["passthrough→ask&lt;br/&gt;(hand to mode post-processing)"]
+  d5 -->|No| out-ask-default["passthrough→ask&lt;br/&gt;(Hand to mode post-processing)"]
 </pre>
 
 <ul>
-  <li>Rule source priority is merged by <code>permissionsLoader</code> (policy > userSettings > projectSettings > localSettings > ...), ultimately collapsed into the three buckets attached to <code>ToolPermissionContext</code>. Within the same bucket, earlier sources shadow later sources with the same content (shadowedRuleDetection is responsible for warning about shadowed rules).</li>
-  <li>Rule string parsing happens in <code>permissionRuleValueFromString</code>: find the first unescaped <code>(</code> and the last unescaped <code>)</code>; the content inside is ruleContent; <code>Bash(*)</code> and <code>Bash()</code> degenerate into whole-tool rules; parentheses themselves can be escaped with <code>\( \)</code>.</li>
-  <li>Agent-type denial is a special syntax <code>Agent(Explore)</code>; <code>filterDeniedAgents</code> collects all denied agent types at once and then filters, avoiding O(agent×rule) repeated parsing.</li>
+  <li>Rule source precedence is merged by <code>permissionsLoader</code> (policy > userSettings > projectSettings > localSettings > ...), finally collapsing into the three rule buckets attached to <code>ToolPermissionContext</code>. Within the same bucket, earlier-source rules shadow later-source rules with the same content (<code>shadowedRuleDetection</code> warns about shadowed rules).</li>
+  <li>Rule string parsing happens in <code>permissionRuleValueFromString</code>: find the first unescaped <code>(</code> and the last unescaped <code>)</code>; the inside is ruleContent; <code>Bash(*)</code> and <code>Bash()</code> degenerate into whole-tool rules; parentheses themselves can be escaped with <code>\( \)</code>.</li>
+  <li>Agent-type denial is special syntax <code>Agent(Explore)</code>; <code>filterDeniedAgents</code> collects all denied agent types at once and then filters, avoiding O(agent×rule) repeated parsing.</li>
 </ul>
 
 <script>
@@ -293,5 +286,4 @@ window.__sourceMap = {
 <aside id="source-panel"><div id="source-header"></div><div id="monaco-container"></div></aside>
 <script src="../assets/codeindex-runtime.js"></script>
 <script src="../assets/codeindex.js"></script>
-</body>
-</html>
+</body></html>

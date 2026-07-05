@@ -1,17 +1,10 @@
 <!DOCTYPE html>
-<html lang="zh">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Claude Code CLI（泄露源码）</title>
-<link rel="stylesheet" href="assets/codeindex.css">
-</head>
-<body>
+<html lang="zh"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Claude Code CLI（泄露源码）</title><link rel="stylesheet" href="assets/codeindex.css"></head><body>
 <h1>Claude Code CLI（泄露源码）</h1>
 
 <p>这是 Anthropic 的终端原生 AI 编程助手 Claude Code 的泄露源码（2026-03-31，非官方发布）。一个 Bun 运行的单二进制 CLI，整个终端界面用 React + Ink 渲染。核心管道是：<b>用户输入 → CLI 解析 → 对话引擎(QueryEngine) → 调 LLM API 流式返回 → 若模型要调工具就执行工具把结果喂回去循环 → 终端 UI 渲染</b>。语言 TypeScript，包管理 Bun，校验 Zod，权限用规则模式 + auto 分类器，外部能力靠 MCP，IDE 集成靠 bridge，扩展靠 skill/plugin，记忆靠 CLAUDE.md。</p>
 
-<p>本报告按"用户/外部触发者能做什么"纵向切成 13 个业务模块，每个模块顺着数据流讲清"什么变成什么"。主视图为<b>数据流</b>，遇到状态机/权限/生命周期等模式时辅助标注。覆盖以核心管道深度精读为主、长尾知晓职责为辅，非运行时资产（lock/生成的 terminal.js/构建脚本/docker/CI）已排除。</p>
+<p>本报告按"用户/外部触发者能做什么"纵向切成 16 个业务模块，每个模块顺着数据流讲清"什么变成什么"。主视图为<b>数据流</b>，遇到状态机/权限/生命周期等模式时辅助标注。覆盖以核心管道深度精读为主、长尾知晓职责为辅，非运行时资产（lock/生成的 terminal.js/构建脚本/docker/CI）已排除。其中"沙箱 / agent 循环机制 / 后台与远程 agent"三块为 agent 设计视角的补深模块。</p>
 
 <h2>用户与外部能做什么</h2>
 <ul>
@@ -27,6 +20,9 @@
   <li>在浏览器用 claude.ai/code 风格的网页版（记忆全在浏览器）→ <a href="modules/web-app.html">Web 端</a></li>
   <li>让别的 AI 客户端通过 MCP 浏览本仓库源码 → <a href="modules/mcp-server-subproject.html">MCP 探索服务器</a></li>
   <li>（支撑层）消息处理、会话存储、bash 安全解析、插件加载、OAuth/埋点/LSP/策略限制等 → <a href="modules/core-utils-services.html">核心工具函数与服务层补充</a></li>
+  <li>（agent 设计·安全）每次 bash/文件操作前的 OS 级沙箱隔离：FS/网络限制、违规回流权限 → <a href="modules/sandbox.html">沙箱机制</a></li>
+  <li>（agent 设计·循环）query 循环的状态机、token 预算续写、stop/工具钩子、对话历史落盘 → <a href="modules/agent-loop-mechanics.html">Agent 循环机制</a></li>
+  <li>（agent 设计·分布式）后台 forked 子智能体服务群 + 远程 CCR agent 执行面 → <a href="modules/background-and-remote-agents.html">后台 Forked 子智能体与远程 Agent 执行</a></li>
 </ul>
 
 <a class="module-card" href="modules/cli-startup-init.html">
@@ -120,11 +116,28 @@
   </section>
 </a>
 
-<section class="coverage">
-<h2>覆盖率说明</h2>
-<p>覆盖率（全仓 573780 行）：Deep 49029 (8.5%) · Mapped 109488 (19.1%) · Ignored 38858 (6.8%) · 总覆盖 34.4%。核心管道（启动→对话引擎→工具→权限→命令→UI）已深度精读，长尾组件/hooks/命令按代表抽样、非运行时资产（lock/生成的 terminal.js/构建脚本/docker/CI/泄露的系统提示文档）已排除。<b>源码已通过 codeindex-pack 内嵌（108 文件 / 5.8MB），无需本地文件即可点击流程图节点看源码，可直接部署到任意静态托管。</b></p>
-</section>
+<a class="module-card" href="modules/sandbox.html">
+  <section>
+    <h2>沙箱机制（OS 级执行隔离）</h2>
+    <p>把"agent 要跑的一条 bash 命令"变成"在 FS/网络限制内隔离执行、违规回流权限决策"——包 @anthropic-ai/sandbox-runtime，按命令决策进不进沙箱，是 agent 自主动手的硬安全边界。</p>
+  </section>
+</a>
+
+<a class="module-card" href="modules/agent-loop-mechanics.html">
+  <section>
+    <h2>Agent 循环机制（状态机·预算·钩子·历史）</h2>
+    <p>把"一次 agent 会话"的循环控制流讲透——transitions 终止/继续状态机、token 预算续写三重判据、stop/工具钩子执行链、对话历史落盘与撤销。agent loop 的"字典"与"账本"。</p>
+  </section>
+</a>
+
+<a class="module-card" href="modules/background-and-remote-agents.html">
+  <section>
+    <h2>后台 Forked 子智能体与远程 Agent 执行</h2>
+    <p>把"环境式后台工作"与"远程 agent 即服务"两块讲清——runForkedAgent+共享 prompt cache 的后台服务群（autoDream/AgentSummary/MagicDocs/SessionMemory/PromptSuggestion），加 CCR 远程执行面（SDK 消息协议、权限桥接、WebSocket 重连、upstreamproxy 凭据注入）。</p>
+  </section>
+</a>
+
+<section class="coverage"><h2>覆盖率说明</h2><p>覆盖率（全仓 573780 行）：Deep 58141 (10.1%) · Mapped 108002 (18.8%) · Ignored 38734 (6.8%) · 总覆盖 35.7%。核心管道+agent 设计关键子系统（沙箱/循环机制/后台与远程 agent）已深度精读，长尾组件/hooks/命令按代表抽样、非运行时资产（lock/生成的 terminal.js/构建脚本/docker/CI）已排除。<b>源码已通过 codeindex-pack 内嵌，无需本地文件即可点击流程图节点看源码，可直接部署到任意静态托管。</b></p></section>
 <script src="assets/codeindex-runtime.js"></script>
 <script src="assets/codeindex.js"></script>
-</body>
-</html>
+</body></html>

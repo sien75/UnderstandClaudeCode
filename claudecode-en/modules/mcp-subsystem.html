@@ -1,45 +1,38 @@
 <!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>MCP Subsystem</title>
-<link rel="stylesheet" href="../assets/codeindex.css">
-</head>
-<body>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>MCP Subsystem</title><link rel="stylesheet" href="../assets/codeindex.css"></head><body>
 <nav class="topnav"><a href="../index.html">← Back to Overview</a></nav>
 <h1>MCP Subsystem</h1>
 
-<p>MCP (Model Context Protocol) is the core channel through which Claude Code connects to external capabilities. This subsystem has <strong>two symmetrical directions</strong>: ① Claude Code acts as a client, connecting to the various MCP servers configured by the user (local stdio processes, remote SSE/HTTP/WebSocket, claude.ai proxy connectors, IDE-embedded services), discovering the tools/resources/prompts they expose, and forwarding invocations during conversations; ② Claude Code itself also acts as an MCP server, exposing its built-in tools to other AI clients via stdio (<code>claude mcp serve</code>). The entire flow centers on the data path of "connect → discover → invoke → process results → failure recovery," with additional state-machine branches for reconnection, session expiration, OAuth authorization, and URL-based elicitation.</p>
+<p>MCP (Model Context Protocol) is Claude Code's core channel for connecting to external capabilities. This subsystem has <strong>two symmetric directions</strong>: ① Claude Code acts as a client, connecting to the various MCP servers configured by the user (local stdio processes, remote SSE/HTTP/WebSocket, claude.ai proxy connectors, IDE-embedded services), discovering the tools/resources/prompts they expose, and forwarding calls during conversations; ② Claude Code itself also serves as an MCP server, exposing its built-in tools to other AI clients via stdio (<code>claude mcp serve</code>). The entire flow revolves around the data pipeline of "connect → discover → call → process results → failure recovery," with additional state-machine branches for reconnection, session expiration, OAuth authorization, and URL-guided authorization (elicitation).</p>
 
 <dl>
-  <dt>Inputs</dt>
-  <dd>The user-configured list of MCP servers (<code>.mcp.json</code> / config files / claude.ai connectors / IDE lock files / SDK dynamic injection), plus the specific MCP tool name and parameters that the model decides to call during a conversation; in server mode, these are the list_tools / call_tool JSON-RPC requests sent by an external MCP client.</dd>
-  <dt>Outputs</dt>
-  <dd>Client mode: the tools/resources/prompts from external MCP servers are integrated into Claude's toolset; after the model invokes one, the returned content (text/image/audio/binary) is normalized into message chunks and sent back to the model. Server mode: Claude Code's built-in tools are exposed to external clients in MCP protocol form, and the invocation results are returned.</dd>
+  <dt>Input</dt>
+  <dd>The user's configured MCP server list (<code>.mcp.json</code> / config files / claude.ai connectors / IDE lockfiles / SDK dynamic injection), plus the MCP tool name and arguments that the model decides to call during a conversation; in server mode, it is the list_tools / call_tool JSON-RPC request sent by an external MCP client.</dd>
+  <dt>Output</dt>
+  <dd>Client mode: the tools/resources/prompts of external MCP servers are integrated into Claude's toolset, and the content returned after a model call (text/images/audio/binary) is normalized into message blocks and sent back to the model; server mode: Claude Code's built-in tools are exposed to external clients in MCP protocol form and the call results are returned.</dd>
 </dl>
 
 <h2>Direction 1: Claude Code as an MCP Client</h2>
 
-<p>At startup (or when configuration changes), <code>useManageMCPConnections</code> gathers all active server configurations and calls <code>getMcpToolsCommandsAndResources</code> to batch-establish connections and discover capabilities. Each server establishes a long-lived connection through <code>connectToServer</code> (memoized by a serialized config key): depending on the <code>type</code>, it selects StdioClientTransport / SSEClientTransport / StreamableHTTPClientTransport / WebSocketTransport / SdkControlClientTransport / or an in-process InProcessTransport (heavy servers like Chrome and Computer Use run directly in the main process to avoid spawning ~325MB child processes). The connection carries a 30-second timeout (<code>MCP_TIMEOUT</code>); if it times out, the transport is closed and a timeout error is thrown.</p>
+<p>At startup (or when configuration changes), <code>useManageMCPConnections</code> collects all active server configurations and calls <code>getMcpToolsCommandsAndResources</code> to batch-establish connections and discover capabilities. Each server establishes a long-lived connection through <code>connectToServer</code> (memoized by a serialized config key). Based on the <code>type</code>, it selects StdioClientTransport / SSEClientTransport / StreamableHTTPClientTransport / WebSocketTransport / SdkControlClientTransport / or an in-process InProcessTransport (heavy servers such as Chrome and Computer Use run inside the main process to avoid spawning ~325 MB child processes). The connection carries a 30-second timeout (<code>MCP_TIMEOUT</code>); if it times out, the transport is closed and a timeout error is thrown.</p>
 
-<p>For remote servers (SSE/HTTP/claude.ai-proxy), before connecting the system checks the "needs-auth cache" (15-minute TTL) and the "probed but no token" flag — if either matches, the connection is skipped and an <code>McpAuthTool</code> pseudo-tool is attached to that server, avoiding repeated probes every 15 minutes against servers that are destined to return 401. Remote server fetches are wrapped in three layers: innermost <code>wrapFetchWithStepUpDetection</code> (captures 403 step-up requests), middle <code>wrapFetchWithTimeout</code> (fresh 60-second timeout per POST plus mandatory Streamable HTTP Accept header), and outermost <code>createClaudeAiProxyFetch</code> for claude.ai proxy connections (carries OAuth bearer, forces one refresh and retry on 401).</p>
+<p>For remote servers (SSE/HTTP/claude.ai-proxy), before connecting the system checks the "needs-auth cache" (15-minute TTL) and a "probed but no token" flag—if either matches, the connection is skipped and an <code>McpAuthTool</code> pseudo-tool is attached to that server, avoiding repeated probes every 15 minutes against servers that are destined to return 401. Remote server fetches are wrapped in three layers: innermost <code>wrapFetchWithStepUpDetection</code> (catches 403 step-up requests), middle <code>wrapFetchWithTimeout</code> (60-second fresh timeout per POST plus forced Streamable HTTP Accept header), and outermost <code>createClaudeAiProxyFetch</code> for claude.ai proxies (carries OAuth bearer, force-refreshes once on 401 and retries).</p>
 
-<p>After a successful connection, <code>fetchToolsForClient</code> / <code>fetchResourcesForClient</code> / <code>fetchCommandsForClient</code> (all LRU-cached by server name) request <code>tools/list</code>, <code>resources/list</code>, and <code>prompts/list</code> respectively. Discovered MCP tools are wrapped into the internal <code>Tool</code> interface (names like <code>mcp__&lt;server&gt;__&lt;tool&gt;</code>), whose <code>call</code> method actually executes <code>callMCPToolWithUrlElicitationRetry → callMCPTool</code> at invocation time. If a server declares resource support and no resource tools exist yet, <code>ListMcpResourcesTool</code> and <code>ReadMcpResourceTool</code> are attached. Any server that enters the needs-auth state gets an additional <code>McpAuthTool</code> so the model can trigger the OAuth flow.</p>
+<p>After a successful connection, <code>fetchToolsForClient</code> / <code>fetchResourcesForClient</code> / <code>fetchCommandsForClient</code> (all LRU-cached by server name) request <code>tools/list</code>, <code>resources/list</code>, and <code>prompts/list</code> respectively. The discovered MCP tools are wrapped into the internal <code>Tool</code> interface (names like <code>mcp__&lt;server&gt;__&lt;tool&gt;</code>), whose <code>call</code> method lazily executes via <code>callMCPToolWithUrlElicitationRetry → callMCPTool</code>. If a server declares resource support and no resource tools exist yet, <code>ListMcpResourcesTool</code> and <code>ReadMcpResourceTool</code> are attached. Any server that enters the needs-auth state gets an additional <code>McpAuthTool</code> so the model can trigger the OAuth flow.</p>
 
-<p>When invoking an MCP tool, <code>callMCPTool</code> uses <code>client.callTool</code> to initiate the JSON-RPC call, with its own timeout (default <code>MCP_TOOL_TIMEOUT</code>, about 27.8 hours — effectively infinite, because many MCP tools are long-running tasks) and 30-second progress logging. The returned result is first normalized by <code>processMCPResult</code>: text is kept as-is, images are compressed to API size limits, binary blobs are written to disk and only the path is returned (to avoid pumping base64 into context), and oversized output goes through <code>persistToolResult</code> to disk and returns a reading guide. If the server returns <code>isError: true</code>, a <code>McpToolCallError</code> is thrown (carrying <code>_meta</code> so SDK consumers can still obtain metadata). If it returns 401/UnauthorizedError, an <code>McpAuthError</code> is thrown so the upper layer flips the server state to needs-auth; if it returns 404 plus JSON-RPC -32001 (session expired) or the derived -32000 Connection closed, the connection cache is cleared and a <code>McpSessionExpiredError</code> is thrown; the invocation loop inside <code>fetchToolsForClient</code> automatically retries once (obtaining a new client and reconnecting).</p>
+<p>When calling an MCP tool, <code>callMCPTool</code> initiates a JSON-RPC call with <code>client.callTool</code>, with its own timeout (default <code>MCP_TOOL_TIMEOUT</code>, about 27.8 hours—effectively infinite, because many MCP tools are long-running tasks) and 30-second progress logs. The returned result is first normalized by <code>processMCPResult</code>: text is preserved directly, images are compressed to API size limits, binary blobs are written to disk and only the path is returned (avoiding dumping base64 into context), and oversized output goes through <code>persistToolResult</code> to disk with a read guide. If the server returns <code>isError: true</code>, it throws <code>McpToolCallError</code> (carrying <code>_meta</code> so SDK consumers can still get metadata). If it returns 401/UnauthorizedError, it throws <code>McpAuthError</code> so the upper layer flips the server state to needs-auth; if it returns 404 + JSON-RPC -32001 (session expired) or derived -32000 Connection closed, the connection cache is cleared and <code>McpSessionExpiredError</code> is thrown; the call loop inside <code>fetchToolsForClient</code> automatically retries once (reconnecting with a new client).</p>
 
-<p>Disconnections are detected via <code>client.onerror</code> / <code>client.onclose</code>. onclose clears the memoize caches for connectToServer / fetch*, so the next call automatically reconnects. onerror distinguishes terminal errors (ECONNRESET/ETIMEDOUT/EPIPE/…) from transient errors: terminal errors accumulate up to 3 consecutive times before actively closing the transport, causing pending callTool to fail and triggering reconnection; HTTP-style transports also recognize two server-initiated abandonment signals: "SSE reconnect exhausted" and "session expired." stdio server cleanup escalates through SIGINT → 100ms → SIGTERM → 400ms → SIGKILL, ensuring servers like Docker containers that require explicit signals can exit gracefully.</p>
+<p>Connection drops are detected via <code>client.onerror</code> / <code>client.onclose</code>. onclose clears the connectToServer / fetch* memoize caches so the next call reconnects automatically. onerror distinguishes terminal errors (ECONNRESET/ETIMEDOUT/EPIPE/…) from transient errors: terminal errors accumulate to 3 consecutive occurrences before actively closing the transport, letting pending callTools fail and triggering reconnection; HTTP classes also recognize two server-initiated abandonment signals, "SSE reconnection exhausted" and "session expired." stdio server cleanup escalates SIGINT → 100 ms → SIGTERM → 400 ms → SIGKILL, ensuring servers such as Docker containers that need explicit signals can exit gracefully.</p>
 
 <pre class="mermaid">
 graph TD
   start["Startup/config change: useManageMCPConnections collects server configs"] --> partition["Group by local/remote, batch with concurrency limits"]
-  partition --> skip{"Remote server hits needs-auth cache or has no token?"}
-  skip -->|Yes| needsauth1["Attach McpAuthTool pseudo-tool, skip connection"]
-  skip -->|No| connect["connectToServer (memoized by key)"]
-  connect --> choose{"Select transport by type"}
+  partition --> skip{"Remote server matches needs-auth cache or has no token?"}
+  skip -->|yes| needsauth1["Attach McpAuthTool pseudo-tool, skip connection"]
+  skip -->|no| connect["connectToServer (memoized by key)"]
+  connect --> choose{"Choose transport by type"}
   choose -->|stdio/none| stdio["StdioClientTransport spawns child process"]
-  choose -->|sse/http/ws| remote["SSE/StreamableHTTP/WebSocket + ClaudeAuthProvider + three-layer fetch wrapper"]
+  choose -->|sse/http/ws| remote["SSE/StreamableHTTP/WebSocket + ClaudeAuthProvider + three-layer fetch wrapping"]
   choose -->|claudeai-proxy| proxy["StreamableHTTP + claude.ai OAuth bearer + 401 retry"]
   choose -->|chrome/computeruse| inproc["InProcessTransport in-process server"]
   choose -->|sdk| sdk["setupSdkMcpClients via control channel"]
@@ -51,40 +44,40 @@ graph TD
   ide --> race
   sdk --> race2["client.connect (control channel)"]
   race --> timeout{"Timed out?"}
-  timeout -->|Yes| failtimeout["Close transport, throw timeout error → failed"]
-  timeout -->|No| authok{"401/Unauthorized?"}
-  authok -->|Yes| handleauth["handleRemoteAuthFailure: write needs-auth cache, return needs-auth"]
-  authok -->|No| connected["Return connected (with capabilities/instructions/cleanup)"]
+  timeout -->|yes| failtimeout["Close transport, throw timeout error → failed"]
+  timeout -->|no| authok{"401/Unauthorized?"}
+  authok -->|yes| handleauth["handleRemoteAuthFailure: write needs-auth cache, return needs-auth"]
+  authok -->|no| connected["Return connected (with capabilities/instructions/cleanup)"]
   race2 --> connected
   connected --> discover["Concurrent fetchTools/Resources/Commands (LRU cache)"]
-  discover --> addtools["Wrap as mcp__ tools + attach resource tools/McpAuthTool as needed"]
+  discover --> addtools["Wrap into mcp__ tools + attach resource tools/McpAuthTool as needed"]
   addtools --> onattempt["onConnectionAttempt callback writes appState.mcp"]
   needsauth1 --> onattempt
   handleauth --> onattempt
   failtimeout --> onattempt
 </pre>
 
-<p>The diagram above covers the connection-establishment part of the data flow. Once connected, tools are registered in <code>appState.mcp.tools</code>, and the model can invoke them by the <code>mcp__server__tool</code> name during conversations. The diagram below shows the data flow when a tool is actually invoked, including all failure branches.</p>
+<p>The diagram above covers the "connection establishment" part of the data flow. After the connection reaches connected, tools are registered into <code>appState.mcp.tools</code>, and the model can call them by the <code>mcp__server__tool</code> name during conversations. The next diagram shows the data flow when a tool is actually called, including all failure branches.</p>
 
 <pre class="mermaid">
 graph TD
   modelcall["Model decides to call mcp__server__tool(args)"] --> toolcall["MCPTool.call (closure wrapped inside fetchToolsForClient)"]
-  toolcall --> ensure["ensureConnectedClient: return if memoize hit, otherwise reconnect"]
+  toolcall --> ensure["ensureConnectedClient: return memoized client or reconnect"]
   ensure --> retry1["callMCPToolWithUrlElicitationRetry"]
   retry1 --> callmcp["callMCPTool: client.callTool + built-in timeout + 30s progress logs"]
-  callmcp --> result{"Return result"}
+  callmcp --> result{"Returned result"}
   result -->|isError=true| toolerr["Throw McpToolCallError (with _meta)"]
   result -->|401/Unauthorized| autherr["Throw McpAuthError → upper layer flips to needs-auth"]
   result -->|404/-32001 or -32000 Connection closed| session["Clear connection cache, throw McpSessionExpiredError"]
-  result -->|Normal return| process["processMCPResult: normalize content"]
+  result -->|normal return| process["processMCPResult: normalize content"]
   session --> sesretry{"attempt < 1?"}
-  sesretry -->|Yes| ensure
-  sesretry -->|No| propagate["Propagate upward"]
+  sesretry -->|yes| ensure
+  sesretry -->|no| propagate["Propagate upward"]
   process --> large{"Content too large?"}
-  large -->|Yes, contains images| truncate["Truncate"]
-  large -->|Yes, plain text/structured| persist["persistToolResult to disk, return reading guide"]
-  large -->|No| returncontent["Return content + _meta + structuredContent"]
-  retry1 -->|UrlElicitation -32042| elic["Present URL elicitation (hook or UI queue)"]
+  large -->|yes, contains image| truncate["Truncate"]
+  large -->|yes, plain text/structured| persist["persistToolResult to disk, return read guide"]
+  large -->|no| returncontent["Return content + _meta + structuredContent"]
+  retry1 -->|UrlElicitation -32042| elic["Show URL elicitation (hook or UI queue)"]
   elic --> user{"User/hook result"}
   user -->|accept| retry1
   user -->|decline/cancel| elicdecline["Return 'user declined' text"]
@@ -94,21 +87,21 @@ graph TD
 
 <ul>
   <li><strong>Caching strategy</strong>: connectToServer is memoized by <code>${name}-${JSON(config)}</code>; fetchTools/Resources/Commands are LRU-cached by server name (capacity 20). onclose / clearServerCache / reconnectMcpServerImpl all clear these three caches together, ensuring old data is not returned after reconnection.</li>
-  <li><strong>needs-auth cache</strong>: A single 401 from a remote server writes to <code>mcp-needs-auth-cache.json</code>; within 15 minutes no further connection attempts are made; <code>McpAuthTool</code> calls <code>clearMcpAuthCache</code> after completing OAuth or <code>/mcp</code> manual authentication.</li>
-  <li><strong>Session expiration self-healing</strong>: Under the Streamable HTTP protocol, a server returning 404 + -32001 indicates session invalidation; the client clears the cache and automatically reconnects to obtain a new session on the next call, retrying at most once from the caller's perspective.</li>
-  <li><strong>URL elicitation</strong>: MCP tools can return -32042 to ask the user to open a URL (OAuth authorization, external confirmation, etc.). The system first runs the elicitation hook; if the hook does not handle it, the request is queued in the REPL for user action, or delivered via structuredIO callback in print/SDK mode; it retries up to 3 times.</li>
-  <li><strong>Result normalization</strong>: Images are compressed and downsampled, binary blobs are written to disk with only the path returned, and oversized output is persisted to disk with a reading guide — all aimed at minimizing context volume.</li>
-  <li><strong>Connection health monitoring</strong>: The <code>useMcpConnectivityStatus</code> hook checks failed/needs-auth counts when mcpClients changes, sending one notification each for local servers and claude.ai connectors ("/mcp") so users know a server is down or needs authorization.</li>
-  <li><strong>Project-level server approval</strong>: <code>handleMcpjsonServerApprovals</code> checks project servers with status=pending in <code>.mcp.json</code> at startup; a single server uses a single-select dialog, multiple servers use a multi-select dialog, and only approved servers enter the connection flow — preventing project repositories from silently launching untrusted servers.</li>
+  <li><strong>needs-auth cache</strong>: a single 401 from a remote server writes to <code>mcp-needs-auth-cache.json</code>; within 15 minutes the system will not try to connect again; <code>McpAuthTool</code> clears the cache after OAuth completes or after <code>/mcp</code> manual auth via <code>clearMcpAuthCache</code>.</li>
+  <li><strong>Session-expiration self-healing</strong>: under the Streamable HTTP protocol, a server returning 404 + -32001 means the session is invalid; the client clears the cache and automatically reconnects with a new session on the next call, retrying at most once from the caller's perspective.</li>
+  <li><strong>URL elicitation</strong>: an MCP tool can return -32042 asking the user to open a URL (OAuth authorization, external confirmation, etc.). The system first runs the elicitation hook; if the hook does not handle it, the request is queued in the REPL for user action, or in print/SDK mode sent through the structuredIO callback; it retries up to 3 times.</li>
+  <li><strong>Result normalization</strong>: images are compressed and downsampled, binary blobs are written to disk and only the path is returned, and oversized output is persisted to disk with a read guide—the goal is to keep context volume minimal.</li>
+  <li><strong>Connection health monitoring</strong>: the <code>useMcpConnectivityStatus</code> hook checks failed/needs-auth counts when mcpClients changes and sends one notification each to local servers and claude.ai connectors ("/mcp"), letting the user know when a server is offline or needs authorization.</li>
+  <li><strong>Project-level server approval</strong>: <code>handleMcpjsonServerApprovals</code> checks project servers with status=pending in <code>.mcp.json</code> at startup; a single server uses a single-choice dialog, multiple servers use a multi-choice dialog. Only after user approval does the server enter the connection flow—preventing project repositories from quietly launching untrusted servers.</li>
 </ul>
 
 <h2>Direction 2: Claude Code as an MCP Server</h2>
 
 <p>When an external AI client wants to use Claude Code's capabilities as MCP tools, run <code>claude mcp serve</code> (<code>src/cli/handlers/mcp.tsx</code> dynamically imports <code>startMCPServer</code> from <code>src/entrypoints/mcp.ts</code>). This path is straightforward: create a stdio MCP server, declare tools capability, and register <code>ListToolsRequest</code> and <code>CallToolRequest</code> handlers.</p>
 
-<p>ListTools converts each built-in tool returned by <code>getTools</code> into an MCP-protocol Tool description: call <code>tool.prompt()</code> for the description, use <code>zodToJsonSchema</code> to convert inputSchema and outputSchema (outputSchema is only included when the root is <code>type: object</code>, to avoid anyOf/oneOf being rejected by SDK clients). CallTool receives <code>{name, arguments}</code>, then: find the matching tool → check <code>isEnabled</code> → call <code>validateInput</code> → use <code>hasPermissionsToUseTool</code> for permission checks → call <code>tool.call</code>. Success serializes the result as text content; any thrown error is broken into error text via <code>getErrorParts</code> and returned as a structured error with <code>isError: true</code> (so exceptions do not break the stdio session).</p>
+<p>ListTools converts each built-in tool returned by <code>getTools</code> into an MCP-protocol Tool description: it calls <code>tool.prompt()</code> for the description, <code>zodToJsonSchema</code> for the inputSchema and outputSchema (outputSchema is only included when the root is <code>type: object</code>, avoiding anyOf/oneOf rejections on the SDK side). CallTool receives <code>{name, arguments}</code> and: finds the matching tool → checks <code>isEnabled</code> → calls <code>validateInput</code> → uses <code>hasPermissionsToUseTool</code> for permission validation → calls <code>tool.call</code>. Success serializes the result into text content; any error goes through <code>getErrorParts</code> to extract error text and returns a structured error with <code>isError: true</code> (preventing exceptions from breaking the stdio session).</p>
 
-<p>The ToolUseContext constructed in server mode is a "stateless shell": <code>mcpClients: []</code>, <code>messages: []</code>, <code>isNonInteractiveSession: true</code>, <code>thinkingConfig: disabled</code> — MCP clients do not read message history; parameters are everything. File-read state uses an LRU cache capped at 100 files / 25MB to prevent unbounded memory growth during long-running server sessions. Comments include two TODOs: "Also re-expose any MCP tools" — currently server mode only exposes Claude Code's own built-in tools and does not forward MCP tools connected in client mode (to avoid circular dependencies).</p>
+<p>The ToolUseContext constructed in server mode is a "stateless shell": <code>mcpClients: []</code>, <code>messages: []</code>, <code>isNonInteractiveSession: true</code>, <code>thinkingConfig: disabled</code>—MCP clients do not read message history; parameters are everything. File read state uses an LRU cache with a 100-file / 25 MB limit to prevent unbounded memory growth during long-running server sessions. There are two TODOs in the comments: "Also re-expose any MCP tools"—currently server mode only exposes Claude Code's own built-in tools and does not forward MCP tools connected in client mode (to avoid circular dependencies).</p>
 
 <pre class="mermaid">
 graph TD
@@ -116,22 +109,22 @@ graph TD
   start --> newserver["new Server(name=claude/tengu, capabilities.tools)"]
   newserver --> setcwd["setCwd + create readFileState LRU cache"]
   setcwd --> listhandler["Register ListToolsRequest handler"]
-  listhandler --> gettools["getTools(toolPermissionContext) fetch built-in tools"]
+  listhandler --> gettools["getTools(toolPermissionContext) get built-in tools"]
   gettools --> maptools["For each: prompt for description, zodToJsonSchema for schema, outputSchema only when root is object"]
   maptools --> returnlist["Return ListToolsResult"]
   setcwd --> callhandler["Register CallToolRequest handler"]
   callhandler --> findtool["Receive {name, args} → findToolByName"]
   findtool --> found{"Found?"}
-  found -->|No| notfound["Throw 'Tool not found'"]
-  found -->|Yes| enabled{"isEnabled?"}
-  enabled -->|No| notenabled["Throw 'Tool not enabled'"]
-  enabled -->|Yes| validate["validateInput"]
+  found -->|no| notfound["Throw 'Tool not found'"]
+  found -->|yes| enabled{"isEnabled?"}
+  enabled -->|no| notenabled["Throw 'Tool not enabled'"]
+  enabled -->|yes| validate["validateInput"]
   validate --> valid{"Passed?"}
-  valid -->|No| invalid["Throw input invalid error"]
-  valid -->|Yes| docall["tool.call(args, context, hasPermissionsToUseTool)"]
-  docall --> callresult{"Invocation result"}
-  callresult -->|string| strtext["Return as text directly"]
-  callresult -->|object| jsontext["jsonStringify(data) returned as text"]
+  valid -->|no| invalid["Throw input invalid error"]
+  valid -->|yes| docall["tool.call(args, context, hasPermissionsToUseTool)"]
+  docall --> callresult{"Call result"}
+  callresult -->|string| strtext["Return directly as text"]
+  callresult -->|object| jsontext["jsonStringify(data) as text"]
   strtext --> okreturn["Return {content:[{text}]}"]
   jsontext --> okreturn
   notfound --> errreturn["catch: getErrorParts → return {isError:true, content:[{text}]}"]
@@ -140,27 +133,27 @@ graph TD
   docall -. throws error .-> errreturn
   listhandler --> run["runServer: StdioServerTransport + server.connect"]
   callhandler --> run
-  run --> serve2["Serve MCP tools over stdio"]
+  run --> serve2["Expose MCP tools over stdio"]
 </pre>
 
 <ul>
-  <li><strong>stdio transport</strong>: Server mode uses only StdioServerTransport; stdin/stdout carry JSON-RPC and stderr is reserved for logs — this is the most universal MCP server access method; any MCP client can directly launch <code>claude mcp serve</code>.</li>
-  <li><strong>Stateless context</strong>: ToolUseContext has empty mcpClients/messages, and setAppState is a no-op — server mode does not maintain session state; each call_tool is an independent invocation.</li>
-  <li><strong>Permission checks</strong>: Before invocation, <code>hasPermissionsToUseTool</code> applies the same permission rules used in client mode; requests from external clients are subject to the same approvals and rules.</li>
-  <li><strong>Errors do not kill the session</strong>: CallTool's try/catch converts any exception into an <code>isError: true</code> structured response, preventing a single tool failure from crashing the stdio session.</li>
-  <li><strong>MCP tools are not forwarded yet</strong>: Code comments explicitly mark this as a TODO; future versions may forward MCP tools connected in client mode, but currently only built-in tools are exposed to avoid circular/performance issues.</li>
+  <li><strong>stdio transport</strong>: server mode only uses StdioServerTransport; stdin/stdout carry JSON-RPC and stderr is reserved for logs—this is the most universal way to access an MCP server; any MCP client can directly launch <code>claude mcp serve</code>.</li>
+  <li><strong>Stateless context</strong>: in ToolUseContext, mcpClients/messages are empty and setAppState is a no-op—server mode does not maintain session state; each call_tool is an independent call.</li>
+  <li><strong>Permission validation</strong>: before calling, the request passes through <code>hasPermissionsToUseTool</code>, reusing the same permission rules as client mode; requests from external clients are subject to the same approval/rules.</li>
+  <li><strong>Errors do not kill the session</strong>: CallTool's try/catch converts any exception into a structured return with <code>isError: true</code>, preventing a single tool failure from collapsing the stdio session.</li>
+  <li><strong>MCP tools are not forwarded yet</strong>: code comments explicitly mark this as a TODO; in the future MCP tools connected by the client may be passed through, but currently only built-in tools are exposed to avoid circular/performance issues.</li>
 </ul>
 
-<h2>OAuth Authorization Flow (Client Mode Authentication)</h2>
+<h2>OAuth Authorization Flow (Client-Mode Authentication)</h2>
 
-<p>Remote servers use <code>performMCPOAuthFlow</code> on first connection or when a token expires. If <code>oauth.xaa</code> (cross-app authorization) is configured, <code>performMCPXaaAuth</code> is used — as long as the IdP's id_token is still cached, the whole chain is zero-interaction: exchange the id_token for the MCP server's access/refresh token, store it in the same keychain slot, and subsequent <code>ClaudeAuthProvider.tokens()</code> calls are completely transparent.</p>
+<p>Remote servers use <code>performMCPOAuthFlow</code> on first connection or when a token expires. If <code>oauth.xaa</code> (cross-app authorization) is configured, it goes through <code>performMCPXaaAuth</code>—as long as the IdP's id_token is still cached, the entire chain is zero-interaction: exchange the id_token for the MCP server's access/refresh token, store it in the same keychain slot, and subsequent <code>ClaudeAuthProvider.tokens()</code> calls are completely transparent.</p>
 
-<p>The standard OAuth flow: find an available port and create a localhost callback server → use PKCE to generate an authorization URL (state + code_verifier + code_challenge) → open the browser for the user to authorize on the AS → receive the code in the callback → exchange for tokens → store in keychain. <code>ClaudeAuthProvider</code> implements the MCP SDK's <code>OAuthClientProvider</code> interface: <code>tokens()</code> reads from the keychain and refreshes with refresh_token when expired (with in-process deduplication so concurrent requests share the same refresh promise); <code>saveTokens</code> writes to the keychain and clears the step-up flag; <code>invalidateCredentials('tokens')</code> clears tokens but keeps discovery information when refresh fails, so the next connection re-runs authorization. When encountering 403 insufficient_scope, the fetch wrapper calls <code>markStepUpPending(scope)</code>, causing <code>tokens()</code> to intentionally omit the refresh_token — RFC 6749 §6 forbids using refresh to escalate scope, so authorization must be rerun to obtain a token with broader scope.</p>
+<p>The standard OAuth flow: find an available port, start a localhost callback server → use PKCE to generate an authorization URL (state + code_verifier + code_challenge) → open the browser for the user to authorize on the AS → receive the code in the callback → exchange for tokens → store in keychain. <code>ClaudeAuthProvider</code> implements the MCP SDK's <code>OAuthClientProvider</code> interface: <code>tokens()</code> reads the keychain and refreshes with refresh_token when expired (with in-process deduplication so concurrent requests share the same refresh promise); <code>saveTokens</code> writes to the keychain and clears the step-up flag; <code>invalidateCredentials('tokens')</code> clears tokens but keeps discovery information when refresh fails, so the next connection re-authorizes. When encountering 403 insufficient_scope, the fetch wrapper calls <code>markStepUpPending(scope)</code>, causing <code>tokens()</code> to deliberately omit the refresh_token—RFC 6749 §6 forbids using refresh for privilege escalation, so authorization must be rerun to obtain a token with a larger scope.</p>
 
 <ul>
-  <li><strong>XAA silent authorization</strong>: After a single organization-level IdP login, credentials are shared across all XAA servers, avoiding a browser popup for each server.</li>
-  <li><strong>Cross-process token consistency</strong>: Keychain reads are cached with a TTL; <code>reconnectMcpServerImpl</code> first calls <code>clearKeychainCache</code> to ensure this process sees token changes made by other processes such as the VS Code extension.</li>
-  <li><strong>State/nonce protection</strong>: Sensitive OAuth parameters such as state/nonce/code_verifier/code are redacted in logs to prevent CSRF/session fixation attacks.</li>
+  <li><strong>XAA silent authorization</strong>: after one organization-level IdP login, all XAA servers share credentials, avoiding a browser popup per server.</li>
+  <li><strong>Cross-process token consistency</strong>: keychain reads have a cache TTL; <code>reconnectMcpServerImpl</code> first calls <code>clearKeychainCache</code>, ensuring this process sees tokens changed by other processes such as the VS Code extension.</li>
+  <li><strong>State/nonce protection</strong>: OAuth-sensitive parameters such as state/nonce/code_verifier/code are redacted in logs to prevent CSRF/session fixation.</li>
 </ul>
 
 <script>
@@ -237,5 +230,4 @@ window.__sourceMap = {
 <aside id="source-panel"><div id="source-header"></div><div id="monaco-container"></div></aside>
 <script src="../assets/codeindex-runtime.js"></script>
 <script src="../assets/codeindex.js"></script>
-</body>
-</html>
+</body></html>

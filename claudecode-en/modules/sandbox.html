@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Sandbox Mechanism (OS-Level Execution Isolation)</title><link rel="stylesheet" href="../assets/codeindex.css"></head><body>
+<nav class="topnav"><a href="../index.html">← Back to Overview</a></nav>
+<h1>Sandbox Mechanism (OS-Level Execution Isolation)</h1>
+
+<p>When Claude is about to run a bash command, read/write files, or make a network request, the system must decide one thing: should this command be executed inside an OS-level sandbox? The sandbox is a hard security boundary — implemented at the OS layer by <code>@anthropic-ai/sandbox-runtime</code> (sandbox-exec on macOS, bubblewrap+socat on Linux/WSL2), restricting which files the process can write and which hosts it can connect to. Violations don't let Claude go where it shouldn't; they are blocked, logged, and the user is prompted if necessary.</p>
+
+<p>The entry point for this module is not a UI button, but the moment the agent autonomously executes a tool: before BashTool actually spawns the child process, it asks <code>shouldUseSandbox(input)</code>; if the answer is yes, the original command is handed to <code>SandboxManager.wrapWithSandbox</code> to wrap it with a sandbox launcher before spawn. After the command finishes, <code>cleanupAfterCommand</code> cleans up temporary directories and scrubs any bare-git files implanted by an attacker. The whole lifecycle is exposed uniformly by <code>SandboxManager</code> (adapter), which forwards internally to the external package's <code>BaseSandboxManager</code>.</p>
+
+<dl>
+  <dt>Input</dt>
+  <dd>A bash command triggered by the user/agent (including the <code>dangerouslyDisableSandbox</code> flag) + the currently merged settings (permissions allow/deny rules, sandbox.* config) + platform/dependency detection results.</dd>
+  <dt>Output</dt>
+  <dd>A command string that is either unchanged or wrapped by the sandbox launcher; stderr annotated with sandbox failures; possible violation events, permission popups, and (after user consent) WebFetch(domain) rules persisted to local settings.</dd>
+</dl>
+
+<ul>
+  <li>The sandbox is not an "optional enhancement": when <code>autoAllowBashIfSandboxed</code> is enabled, sandbox hit = automatic bash allow (bypassing ask rules). So "whether to enter the sandbox" directly determines "whether to show a permission dialog" — the two are the same decision point.</li>
+  <li>The external package <code>@anthropic-ai/sandbox-runtime</code> is the real OS-level implementation; this module only translates CLI settings → runtime config and pipes events back, without reading its source.</li>
+  <li>There are three independent gates: platform/dependency support, settings enabled, and single-command exclusion / <code>dangerouslyDisableSandbox</code> exemption. If any gate fails, the command does not enter the sandbox.</li>
+  <li>Violations and permissions flow back along two independent paths: network violations go through the ask callback popup; FS/network violations go through the violation store and are surfaced in the UI expansion.</li>
+</ul>
+
+<h2>Figure 1: Sandbox Decision and Execution Flow for a Bash Command</h2>
+
+<p>From the user perspective: Claude decides to run <code>npm install</code>. Before spawn, BashTool asks "should this go into the sandbox?" in the order "global switch → explicit exemption → command on exclusion list → default into sandbox." Once sandboxing is decided, the command string is wrapped by the sandbox-runtime package into something like <code>bwrap ... -- sh -c 'original command'</code> (macOS equivalent), and after spawn the OS layer forcibly restricts reads/writes and network. After the command ends, cleanup removes the sandbox, and stderr lines tagged by sandbox-runtime are folded back into the output shown to Claude.</p>
+
+<pre class="mermaid">
+graph TD
+  bash-call["BashTool.call receives command to execute"] --> exec-opts["Construct exec options, pass shouldUseSandbox(input)"]
+  exec-opts --> sus["shouldUseSandbox: master gate"]
+  sus --> sus-enabled{"Sandbox globally enabled?&lt;br/&gt;(platform + deps + enabled)"}
+  sus-enabled -->|No| no-sandbox["Run without sandbox, spawn unchanged"]
+  sus-enabled -->|Yes| sus-disable{"dangerouslyDisableSandbox&lt;br/&gt;and unsandboxed commands allowed?"}
+  sus-disable -->|Yes| no-sandbox
+  sus-disable -->|No| sus-cmd{"Has command?"}
+  sus-cmd -->|No| no-sandbox
+  sus-cmd -->|Yes| excl{"Hit excludedCommands?&lt;br/&gt;(user list / ant dynamic list)"}
+  excl -->|Yes| no-sandbox
+  excl -->|No| yes-sandbox["Return true: enter sandbox"]
+  yes-sandbox --> shell-wrap["Shell.ts: call wrapWithSandbox"]
+  shell-wrap --> init-wait{"Already initialized?"}
+  init-wait -->|No| init-err["Throw Sandbox not initialized error"]
+  init-wait -->|Yes| runtime-wrap["BaseSandboxManager.wrapWithSandbox&lt;br/&gt;Generate bwrap/sandbox-exec launcher string"]
+  runtime-wrap --> mkdir-tmp["Create 0700 sandbox temp directory"]
+  mkdir-tmp --> spawn["Spawn wrapped command"]
+  spawn --> run["Child process executes inside OS sandbox"]
+  run --> violate{"FS/network violation?"}
+  violate -->|Yes| record["Write violation to SandboxViolationStore"]
+  violate -->|No| done["End normally"]
+  record --> done
+  done --> annotate["BashTool: annotateStderrWithSandboxFailures&lt;br/&gt;Annotate violations into stdout"]
+  annotate --> cleanup["Shell.ts finally: cleanupAfterCommand"]
+  cleanup --> scrub["scrubBareGitRepoFiles: delete implanted bare-git files"]
+  no-sandbox --> spawn-plain["Spawn original command directly, no OS restrictions"]
+</pre>
+
+<h2>Figure 2: How Sandbox Restrictions Are Assembled from Settings</h2>
+
+<p>This step happens during <code>initialize()</code> and whenever settings change. <code>convertToSandboxRuntimeConfig</code> translates the scattered permissions rules and <code>sandbox.*</code> fields from multiple settings sources (user/project/local/policy/flag) into a <code>SandboxRuntimeConfig</code> the sandbox-runtime can consume (network + filesystem + ignoreViolations + ripgrep). The key point is that path semantics are two different systems — in permission rules <code>/foo</code> is "relative to the settings file directory", while in <code>sandbox.filesystem.*</code> <code>/foo</code> is an absolute path, and they must not be confused. Additionally, there is a set of "unconditionally hardcoded" write-deny paths: all settings.json files, <code>.claude/skills</code>, and bare-git files — these are the moat against escape.</p>
+
+<pre class="mermaid">
+graph TD
+  init["initialize() startup"] --> wt["detectWorktreeMainRepoPath&lt;br/&gt;Parse whether .git points to main repo"]
+  wt --> conv["convertToSandboxRuntimeConfig(settings)"]
+  conv --> net-branch["Assemble network domains"]
+  conv --> fs-branch["Assemble filesystem paths"]
+  conv --> rg-branch["Assemble ripgrep config"]
+  net-branch --> net-managed{"allowManagedDomainsOnly?"}
+  net-managed -->|Yes| net-policy["Only take policy allowedDomains + WebFetch(domain) allow"]
+  net-managed -->|No| net-all["Merge all sources' sandbox.network.allowedDomains + WebFetch(domain) allow"]
+  net-all --> net-deny["Scan all sources' WebFetch(domain) deny → deniedDomains"]
+  net-policy --> net-deny
+  fs-branch --> fs-always["Hardcoded: allowWrite=['.', claudeTempDir]&lt;br/&gt;denyWrite=all settings.json + managedDropInDir"]
+  fs-always --> fs-skills["denyWrite append .claude/skills (original + current cwd)"]
+  fs-skills --> fs-baregit["Stat cwd HEAD/objects/refs/hooks/config&lt;br/&gt;Exists→denyWrite; not exists→add to scrubPaths"]
+  fs-baregit --> fs-wt{"worktree main repo?"}
+  fs-wt -->|Yes| fs-wt-allow["allowWrite append main repo path"]
+  fs-wt -->|No| fs-add-dir["allowWrite append --add-dir directory"]
+  fs-wt-allow --> fs-add-dir
+  fs-add-dir --> fs-loop["Iterate each settings source"]
+  fs-loop --> fs-perm["Extract paths from Edit/Read allow/deny rules&lt;br/&gt;(resolvePathPatternForSandbox: // = absolute, / = settings-relative)"]
+  fs-perm --> fs-sandbox["Extract paths from sandbox.filesystem.*&lt;br/&gt;(resolveSandboxFilesystemPath: / = absolute, ~ expanded)"]
+  fs-sandbox --> fs-managed-read{"allowManagedReadPathsOnly?"}
+  fs-managed-read -->|Yes| fs-read-policy["allowRead only from policy source"]
+  fs-managed-read -->|No| fs-read-all["allowRead from all sources"]
+  fs-read-policy --> fs-assemble["Assemble filesystem: {denyRead,allowRead,allowWrite,denyWrite}"]
+  fs-read-all --> fs-assemble
+  net-deny --> net-assemble["Assemble network: {allowedDomains,deniedDomains,unixSockets,proxy...}"]
+  rg-branch --> rg-pick["Prefer settings.sandbox.ripgrep; otherwise built-in ripgrepCommand()"]
+  net-assemble --> out["Return SandboxRuntimeConfig"]
+  fs-assemble --> out
+  rg-pick --> out
+  out --> subscribe["Subscribe to settingsChangeDetector&lt;br/&gt;Refresh updateConfig dynamically on change"]
+</pre>
+
+<h2>Figure 3: Violation Event Handling and Permission Feedback</h2>
+
+<p>After the sandbox blocks something at the OS layer, there are two independent feedback paths. <strong>Network path</strong>: while the sandbox-runtime runs a command and encounters a host not in allowedDomains, it calls back to <code>SandboxAskCallback</code> — this callback is wired in the REPL as "queue a SandboxPermissionRequest popup", where the user chooses Yes / Don't ask again / No. Choosing "Don't ask again" persists <code>WebFetch(domain:host)</code> as an allow rule in localSettings and immediately calls <code>refreshConfig</code> so in-flight requests also benefit from the new rule. <strong>FS/general path</strong>: violations are written to <code>SandboxViolationStore</code>; <code>annotateStderrWithSandboxFailures</code> stitches them into the command output shown to Claude; two UI components subscribe to the store to display the count and the latest 10. There is also a startup hard gate: if <code>failIfUnavailable=true</code> and the sandbox fails to start, the REPL exits directly with <code>gracefulShutdownSync(1)</code> and refuses to run without a sandbox — this is the hard security gate for enterprise deployments.</p>
+
+<pre class="mermaid">
+graph TD
+  start["Sandboxed command triggers out-of-bounds behavior"] --> kind{"Violation type?"}
+  kind -->|Unauthorized network host| ask["sandbox-runtime calls SandboxAskCallback(hostPattern)"]
+  kind -->|FS write out of bounds / other| store["Write to SandboxViolationStore"]
+  ask --> managed{"allowManagedDomainsOnly?"}
+  managed -->|Yes| block["Return false directly, block"]
+  managed -->|No| queue["REPL: enqueue into sandboxPermissionRequestQueue"]
+  queue --> swarm{"swarm worker?"}
+  swarm -->|Yes| mailbox["Forward via mailbox to leader for approval"]
+  swarm -->|No| bridge{"Remote Control bridge connected?"}
+  bridge -->|Yes| remote["Also send can_use_tool to remote user"]
+  bridge -->|No| local["Local SandboxPermissionRequest popup"]
+  mailbox --> wait-worker["Worker waits for leader reply"]
+  wait-worker --> local
+  remote --> local
+  local --> choice{"User choice?"}
+  choice -->|Yes| allow-once["allow=true, not persisted"]
+  choice -->|Yes don't ask again| allow-persist["allow=true, persistToSettings=true"]
+  choice -->|No / Esc| deny["allow=false"]
+  allow-persist --> write-rule["Write WebFetch(domain:host) into localSettings.allow"]
+  write-rule --> refresh["SandboxManager.refreshConfig() refresh in-memory config immediately"]
+  refresh --> resolve["Resolve all pending requests for same host"]
+  allow-once --> resolve
+  deny --> resolve
+  store --> annotate["BashTool: annotateStderrWithSandboxFailures&lt;br/&gt;Stitch violation lines into stdout for Claude"]
+  store --> expanded["SandboxViolationExpandedView subscribes to store&lt;br/&gt;Show total + latest 10 (macOS only)"]
+  store --> footer["SandboxPromptFooterHint subscribes to store&lt;br/&gt;Footer hint shows recent violation count"]
+  block --> done["Network request denied, command continues inside sandbox"]
+  resolve --> done2["Command continues/aborts per user decision"]
+  annotate --> done2
+</pre>
+
+<ul>
+  <li><code>autoAllowBashIfSandboxed</code> welds "sandbox hit" to "automatic permission allow": in <code>hasPermissionsToUseToolInner</code>, as long as shouldUseSandbox returns true and auto-allow is on, it skips Bash's ask rule and directly allows, but explicit deny/ask rules still take priority (including subcommand-level checks to prevent <code>echo ok && rm -rf /</code> escape).</li>
+  <li><code>excludedCommands</code> is a convenience feature, not a security boundary — code comments explicitly state that the real security control is the permission system that shows popups. It matches by prefix/exact/wildcard, and for compound commands splits on <code>&&</code> and checks each segment, preventing the first segment from letting the whole command escape.</li>
+  <li>The dual path semantics are a frequent pitfall: in <code>Edit(/foo)</code>, <code>/foo</code> is "relative to the settings file directory", while in <code>sandbox.filesystem.allowWrite: ["/foo"]</code>, <code>/foo</code> is an absolute path. The latter was the fix for #30067 — when users write sandbox config they reasonably expect absolute paths. <code>//foo</code> is the historical absolute escape syntax, and both systems treat it as absolute.</li>
+  <li>At startup, if <code>failIfUnavailable=true</code> and the sandbox fails to start (missing deps/unsupported platform/not in enabledPlatforms), the REPL exits directly with <code>gracefulShutdownSync(1)</code> and refuses to run without a sandbox — the hard gate for deployments like NVIDIA. Otherwise it only sends a <code>sandbox disabled</code> notification pointing to <code>/sandbox</code>.</li>
+  <li>Bare git repo escape (#29316): an attacker implants <code>HEAD/objects/refs</code> in cwd so that subsequent unsandboxed git by Claude treats cwd as a bare repo and triggers <code>core.fsmonitor</code>. The adapter stats these files during config assembly: if they exist, denyWrite (read-only bind in sandbox); if they don't exist, add them to <code>bareGitRepoScrubPaths</code> and delete them in <code>cleanupAfterCommand</code>, so unsandboxed git won't see them.</li>
+  <li>Settings changes dynamically refresh via <code>settingsChangeDetector</code> subscription; the permission popup "Don't ask again" also manually calls <code>refreshConfig</code> once more to prevent race conditions (before the settings file flush event arrives, pending requests might slip through with the old config).</li>
+  <li>In swarm scenarios, a worker's network permission request is forwarded via mailbox to the leader for approval; on the leader side, <code>useInboxPoller</code> receives a <code>SandboxPermissionRequestMessage</code> and pops the same <code>SandboxPermissionRequest</code> component.</li>
+</ul>
+
+<script>
+window.__sourceMap = {
+  "bash-call": { "file": "src/tools/BashTool/BashTool.tsx", "startLine": 880, "endLine": 898 },
+  "exec-opts": { "file": "src/tools/BashTool/BashTool.tsx", "startLine": 880, "endLine": 898 },
+  "sus": { "file": "src/tools/BashTool/shouldUseSandbox.ts", "startLine": 130, "endLine": 153 },
+  "sus-enabled": { "file": "src/tools/BashTool/shouldUseSandbox.ts", "startLine": 131, "endLine": 133 },
+  "sus-disable": { "file": "src/tools/BashTool/shouldUseSandbox.ts", "startLine": 136, "endLine": 141 },
+  "sus-cmd": { "file": "src/tools/BashTool/shouldUseSandbox.ts", "startLine": 143, "endLine": 145 },
+  "excl": { "file": "src/tools/BashTool/shouldUseSandbox.ts", "startLine": 148, "endLine": 150 },
+  "contains-excluded": { "file": "src/tools/BashTool/shouldUseSandbox.ts", "startLine": 21, "endLine": 128 },
+  "no-sandbox": { "file": "src/tools/BashTool/shouldUseSandbox.ts", "startLine": 152, "endLine": 152 },
+  "yes-sandbox": { "file": "src/tools/BashTool/shouldUseSandbox.ts", "startLine": 152, "endLine": 152 },
+  "shell-wrap": { "file": "src/utils/Shell.ts", "startLine": 256, "endLine": 273 },
+  "init-wait": { "file": "src/utils/sandbox/sandbox-adapter.ts", "startLine": 711, "endLine": 717 },
+  "init-err": { "file": "src/utils/sandbox/sandbox-adapter.ts", "startLine": 715, "endLine": 716 },
+  "runtime-wrap": { "file": "src/utils/sandbox/sandbox-adapter.ts", "startLine": 719, "endLine": 725 },
+  "mkdir-tmp": { "file": "src/utils/Shell.ts", "startLine": 267, "endLine": 272 },
+  "spawn": { "file": "src/utils/Shell.ts", "startLine": 315, "endLine": 330 },
+  "run": { "file": "src/utils/Shell.ts", "startLine": 315, "endLine": 390 },
+  "violate": { "file": "src/utils/sandbox/sandbox-adapter.ts", "startLine": 960, "endLine": 961 },
+  "record": { "file": "src/utils/sandbox/sandbox-adapter.ts", "startLine": 960, "endLine": 961 },
+  "done": { "file": "src/utils/Shell.ts", "startLine": 391, "endLine": 392 },
+  "annotate": { "file": "src/tools/BashTool/BashTool.tsx", "startLine": 710, "endLine": 710 },
+  "cleanup": { "file": "src/utils/Shell.ts", "startLine": 391, "endLine": 392 },
+  "scrub": { "file": "src/utils/sandbox/sandbox-adapter.ts", "startLine": 404, "endLine": 414 },
+  "spawn-plain": { "file": "src/utils/Shell.ts", "startLine": 315, "endLine": 330 },
+
+  "init": { "file": "src/utils/sandbox/sandbox-adapter.ts", "startLine": 730, "endLine": 792 },
+  "wt": { "file": "src/utils/sandbox/sandbox-adapter.ts", "startLine": 422, "endLine": 445 },
+  "conv": { "file": "src/utils/sandbox/sandbox-adapter.ts", "startLine": 172, "endLine": 381 },
+  "net-branch": { "file": "src/utils/sandbox/sandbox-adapter.ts", "startLine": 178, "endLine": 220 },
+  "fs-branch": { "file": "src/utils/sandbox/sandbox-adapter.ts", "startLine": 222, "endLine": 349 },
+  "rg-branch": { "file": "src/utils/sandbox/sandbox-adapter.ts", "startLine": 350, "endLine": 357 },
+  "net-managed": { "file": "src/utils/sandbox/sandbox-adapter.ts", "startLine": 182, "endLine": 196 },
+  "net-policy": { "file": "src/utils/sandbox/sandbox-adapter.ts", "startLine": 183, "endLine": 196 },
+  "net-all": { "file": "src/utils/sandbox/sandbox-adapter.ts", "startLine": 197, "endLine": 210 },
+  "net-deny": { "file": "src/utils/sandbox/sandbox-adapter.ts", "startLine": 212, "endLine": 220 },
+  "net-assemble": { "file": "src/utils/sandbox/sandbox-adapter.ts", "startLine": 360, "endLine": 368 },
+  "fs-always": { "file": "src/utils/sandbox/sandbox-adapter.ts", "startLine": 225, "endLine": 236 },
+  "fs-skills": { "file": "src/utils/sandbox/sandbox-adapter.ts", "startLine": 247, "endLine": 255 },
+  "fs-baregit": { "file": "src/utils/sandbox/sandbox-adapter.ts", "startLine": 267, "endLine": 280 },
+  "fs-wt": { "file": "src/utils/sandbox/sandbox-adapter.ts", "startLine": 286, "endLine": 288 },
+  "fs-wt-allow": { "file": "src/utils/sandbox/sandbox-adapter.ts", "startLine": 286, "endLine": 288 },
+  "fs-add-dir": { "file": "src/utils/sandbox/sandbox-adapter.ts", "startLine": 295, "endLine": 299 },
+  "fs-loop": { "file": "src/utils/sandbox/sandbox-adapter.ts", "startLine": 304, "endLine": 349 },
+  "fs-perm": { "file": "src/utils/sandbox/sandbox-adapter.ts", "startLine": 308, "endLine": 327 },
+  "fs-sandbox": { "file": "src/utils/sandbox/sandbox-adapter.ts", "startLine": 332, "endLine": 348 },
+  "fs-managed-read": { "file": "src/utils/sandbox/sandbox-adapter.ts", "startLine": 343, "endLine": 347 },
+  "fs-read-policy": { "file": "src/utils/sandbox/sandbox-adapter.ts", "startLine": 343, "endLine": 347 },
+  "fs-read-all": { "file": "src/utils/sandbox/sandbox-adapter.ts", "startLine": 344, "endLine": 346 },
+  "fs-assemble": { "file": "src/utils/sandbox/sandbox-adapter.ts", "startLine": 369, "endLine": 374 },
+  "rg-pick": { "file": "src/utils/sandbox/sandbox-adapter.ts", "startLine": 352, "endLine": 357 },
+  "out": { "file": "src/utils/sandbox/sandbox-adapter.ts", "startLine": 359, "endLine": 381 },
+  "subscribe": { "file": "src/utils/sandbox/sandbox-adapter.ts", "startLine": 776, "endLine": 781 },
+  "resolve-path-pattern": { "file": "src/utils/sandbox/sandbox-adapter.ts", "startLine": 99, "endLine": 119 },
+  "resolve-fs-path": { "file": "src/utils/sandbox/sandbox-adapter.ts", "startLine": 138, "endLine": 146 },
+
+  "start": { "file": "src/utils/sandbox/sandbox-adapter.ts", "startLine": 719, "endLine": 725 },
+  "kind": { "file": "src/utils/sandbox/sandbox-adapter.ts", "startLine": 960, "endLine": 962 },
+  "ask": { "file": "src/utils/sandbox/sandbox-adapter.ts", "startLine": 745, "endLine": 755 },
+  "store": { "file": "src/utils/sandbox/sandbox-adapter.ts", "startLine": 960, "endLine": 961 },
+  "managed": { "file": "src/utils/sandbox/sandbox-adapter.ts", "startLine": 747, "endLine": 752 },
+  "block": { "file": "src/utils/sandbox/sandbox-adapter.ts", "startLine": 748, "endLine": 751 },
+  "queue": { "file": "src/screens/REPL.tsx", "startLine": 2262, "endLine": 2265 },
+  "swarm": { "file": "src/screens/REPL.tsx", "startLine": 2218, "endLine": 2249 },
+  "mailbox": { "file": "src/screens/REPL.tsx", "startLine": 2222, "endLine": 2238 },
+  "wait-worker": { "file": "src/screens/REPL.tsx", "startLine": 2234, "endLine": 2247 },
+  "bridge": { "file": "src/screens/REPL.tsx", "startLine": 2270, "endLine": 2308 },
+  "remote": { "file": "src/screens/REPL.tsx", "startLine": 2273, "endLine": 2306 },
+  "local": { "file": "src/screens/REPL.tsx", "startLine": 4609, "endLine": 4657 },
+  "sandbox-permission-request": { "file": "src/components/permissions/SandboxPermissionRequest.tsx", "startLine": 15, "endLine": 162 },
+  "choice": { "file": "src/components/permissions/SandboxPermissionRequest.tsx", "startLine": 27, "endLine": 52 },
+  "allow-once": { "file": "src/components/permissions/SandboxPermissionRequest.tsx", "startLine": 28, "endLine": 34 },
+  "allow-persist": { "file": "src/components/permissions/SandboxPermissionRequest.tsx", "startLine": 36, "endLine": 42 },
+  "deny": { "file": "src/components/permissions/SandboxPermissionRequest.tsx", "startLine": 44, "endLine": 50 },
+  "write-rule": { "file": "src/screens/REPL.tsx", "startLine": 4620, "endLine": 4634 },
+  "refresh": { "file": "src/screens/REPL.tsx", "startLine": 4638, "endLine": 4638 },
+  "resolve": { "file": "src/screens/REPL.tsx", "startLine": 4643, "endLine": 4646 },
+  "expanded": { "file": "src/components/SandboxViolationExpandedView.tsx", "startLine": 20, "endLine": 95 },
+  "footer": { "file": "src/components/PromptInput/SandboxPromptFooterHint.tsx", "startLine": 1, "endLine": 64 },
+  "done2": { "file": "src/utils/Shell.ts", "startLine": 391, "endLine": 392 },
+  "startup-gate": { "file": "src/screens/REPL.tsx", "startLine": 2317, "endLine": 2344 },
+  "fail-if-unavailable": { "file": "src/utils/sandbox/sandbox-adapter.ts", "startLine": 479, "endLine": 485 },
+  "unavailable-reason": { "file": "src/utils/sandbox/sandbox-adapter.ts", "startLine": 562, "endLine": 592 }
+};
+</script>
+
+<aside id="source-panel"><div id="source-header"></div><div id="monaco-container"></div></aside>
+<script src="../assets/codeindex-runtime.js"></script>
+<script src="../assets/codeindex.js"></script>
+</body></html>

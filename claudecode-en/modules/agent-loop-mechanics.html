@@ -1,0 +1,324 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Agent Loop Mechanics (State Machine · Budget · Hooks · History)</title><link rel="stylesheet" href="../assets/codeindex.css"></head><body>
+<nav class="topnav"><a href="../index.html">← Back to Overview</a></nav>
+<h1>Agent Loop Mechanics (State Machine · Budget · Hooks · History)</h1>
+
+<p>This module answers "how does one agent-session loop actually turn." When the user enters a prompt in the REPL, or an SDK / -p script call enters a query, the system does not simply throw the request at the model and finish — it enters a multi-round loop: each round calls the model, executes tools, checks budget, runs stop hooks, and decides whether to continue another round or end. This module covers five core control surfaces of the loop: terminal/continue state machine (transitions), context-window budget and continuation (tokenBudget), stop hooks (stopHooks), conversation history persistence (history), and session-state foundation plus plan-mode switching (bootstrap/state). The hook system's total execution chain is in src/utils/hooks.ts; here we supplement its main execution function and matching logic.</p>
+
+<dl>
+  <dt>Input</dt>
+  <dd>A user prompt + current session state (cwd, permission mode, agent identity, history messages) + a snapshot of runtime toggles (QueryConfig).</dd>
+  <dt>Output</dt>
+  <dd>A terminal reason (Terminal) or a continuation reason (Continue) + possibly multiple rounds of tool-execution results and persisted conversation history.</dd>
+</dl>
+
+<ul>
+  <li>transitions.ts is the loop's "state enumeration"; it contains no logic itself, but it is the basis for every if/else branch in the query main loop — understanding it means understanding which terminal states the loop can reach.</li>
+  <li>tokenBudget is only enabled for "main session, non-agent, and budget configured"; sub-agents go directly to stop.</li>
+  <li>Stop hooks behave differently on the main thread vs. sub-agents: ComputerUse locks, template task classification, and memory extraction only run on the main thread, avoiding sub-agent pollution of the main timeline.</li>
+</ul>
+
+<h2>I. Terminal / Continue State Machine</h2>
+
+<p>From the external caller's perspective, a query call can ultimately leave the loop in only two ways — "Terminal" (the loop returns and this segment of the session ends) or "Continue" (iterate another round). Each way has a set of business reasons. transitions.ts lists these reasons as two union types, equivalent to the state set definition of the state machine. The diagram below shows all reachable states and their business semantics, annotated with trigger conditions.</p>
+
+<pre class="mermaid">
+graph TD
+  loop-start["Loop starts (query main loop)"] --> after-model{"Decision after model returns this round"}
+  after-model -->|Model has no tool calls, not interrupted| terminal-completed["completed: finished"]
+  after-model -->|User/system interrupted stream| terminal-aborted["aborted_streaming / aborted_tools: interrupted"]
+  after-model -->|Model or image error| terminal-model-error["model_error / image_error"]
+  after-model -->|Input exceeds context window| terminal-prompt-too-long["prompt_too_long: input too long"]
+  after-model -->|Max turns reached| terminal-max-turns["max_turns: turn limit reached"]
+  after-model -->|Stop hook prevents continuation| terminal-stop-hook["stop_hook_prevented: hook blocked"]
+  after-model -->|Stop hook actively stopped| terminal-hook-stopped["hook_stopped: hook stopped"]
+  after-model -->|Blocking limit triggered| terminal-blocking["blocking_limit: blocking limit"]
+  after-model -->|Model requests tool use this round| continue-tool-use["tool_use: continue tool round"]
+  after-model -->|Auto-compact retry| continue-compact-retry["reactive_compact_retry: compact retry"]
+  after-model -->|Output token overrun recovery| continue-output-recovery["max_output_tokens_recovery: output recovery"]
+  after-model -->|Output token model escalation| continue-output-escalate["max_output_tokens_escalate: escalate"]
+  after-model -->|Compact drain retry| continue-collapse-drain["collapse_drain_retry: drain retry"]
+  after-model -->|Stop hook blocking but continuable| continue-stop-blocking["stop_hook_blocking: hook blocking"]
+  after-model -->|Token budget not full, continue| continue-budget["token_budget_continuation: budget continuation"]
+  after-model -->|Queued command pending| continue-queued["queued_command: queued command"]
+</pre>
+
+<p>The "exit" of the state machine is the Terminal set; the "loopback" is the Continue set. At the end of each round the query main loop computes a reason; if it falls into one of the Continue reasons it returns to the top of the loop, and if it falls into one of the Terminal reasons it breaks and returns. Note that prompt_too_long and reactive_compact_retry / collapse_drain_retry are a pair: the former is the terminal state of "even compaction can't save it", while the latter two are loopbacks of "try once more". token_budget_continuation comes from the budget decision in tokenBudget.ts.</p>
+
+<h2>II. Token Budget and Continuation</h2>
+
+<p>Business context: long tasks (such as large-scale refactoring or long-chain research) cannot finish in a single model context window. The system allows configuring a "global token budget" (counting cumulative tokens across the whole session). When the cumulative burn hasn't reached 90% of the budget this round, the loop injects a "continue" nudge message after the model naturally stops, asking it to keep going; when near the budget or returns diminish, it stops. This mechanism only applies to the main session, not sub-agents — sub-agents have no cross-round continuation semantics.</p>
+
+<pre class="mermaid">
+graph TD
+  budget-entry["checkTokenBudget entry"] --> gate-check{"Has agentId or no budget?"}
+  gate-check -->|Yes| stop-null["Stop directly (no event)"]
+  gate-check -->|No| calc-pct["Compute pct=turnTokens/budget cumulative delta"]
+  calc-pct --> diminishing-check{"≥3 consecutive rounds and last two deltas both &lt; 500?"}
+  diminishing-check -->|Yes| stop-diminishing["Stop: diminishing returns, emit completionEvent"]
+  diminishing-check -->|No| threshold-check{"turnTokens &lt; budget*0.9?"}
+  threshold-check -->|Yes| continue-nudge["Continue: inject nudge message, increment continuationCount"]
+  threshold-check -->|No| stop-budget["Stop: budget exhausted, emit completionEvent"]
+  continue-nudge --> done-cont["Return ContinueDecision"]
+  stop-diminishing --> done-stop["Return StopDecision"]
+  stop-budget --> done-stop
+  stop-null --> done-stop
+</pre>
+
+<ul>
+  <li>COMPLETION_THRESHOLD = 0.9: continuation is only allowed when cumulative tokens are below 90% of the budget.</li>
+  <li>DIMINISHING_THRESHOLD = 500: 3 consecutive rounds with each round's new tokens below 500 is considered the model "spinning in place", and it stops.</li>
+  <li>BudgetTracker is stateful: continuationCount, last delta, and last cumulative token are stored in the tracker and passed across rounds.</li>
+  <li>completionEvent carries the diminishingReturns flag and durationMs for reporting analysis.</li>
+</ul>
+
+<h2>III. Stop Hook Execution Chain</h2>
+
+<p>From the user perspective: when the model stops calling tools this round and the loop is preparing to wrap up, Stop hooks fire — the user may have configured in settings.json "run this command on stop" (such as formatting, running tests, sending notifications). Hooks can block continuation, feed blocking errors back to the model, or simply perform side effects. handleStopHooks is the orchestrator: it first does a bunch of main-thread-only wrap-up (task classification, memory extraction, auto-dream, ComputerUse unlock), then actually runs user-configured Stop hooks, and finally if the identity is teammate it also runs TaskCompleted and TeammateIdle hooks.</p>
+
+<pre class="mermaid">
+graph TD
+  sh-enter["handleStopHooks entry"] --> save-params["Main thread/SDK save cacheSafeParams for /btw and side_question reads"]
+  save-params --> job-classify{"TEMPLATES on + has JOB_DIR + main thread?"}
+  job-classify -->|Yes| classify["Classify task status, write state.json with 60s timeout guard"]
+  job-classify -->|No| bare-check{"Not bare mode?"}
+  classify --> bare-check
+  bare-check -->|Yes| bg-tasks["Fire-and-forget: prompt suggestion, memory extraction, autoDream"]
+  bare-check -->|No| cu-cleanup{"CHICAGO_MCP + main thread?"}
+  bg-tasks --> cu-cleanup
+  cu-cleanup -->|Yes| cu-release["Release ComputerUse lock, auto-unhide"]
+  cu-cleanup -->|No| run-stop["executeStopHooks: run user Stop hooks"]
+  cu-release --> run-stop
+  run-stop --> hook-iter{"Iterate hook results"}
+  hook-iter -->|Has blockingError| collect-block["Collect blocking errors to feed back to model"]
+  hook-iter -->|preventContinuation| mark-prevented["Mark prevented, emit hook_stopped_continuation attachment"]
+  hook-iter -->|Abort signal| abort-return["Interrupt return preventContinuation=true"]
+  hook-iter -->|Finished| summary{"hookCount&gt;0?"}
+  summary -->|Yes| summary-msg["Emit Stop hook summary message + error notifications"]
+  summary -->|No| teammate-check{"Is teammate?"}
+  summary-msg --> teammate-check
+  teammate-check -->|Yes| teammate-hooks["Run TaskCompleted (per in_progress task) + TeammateIdle"]
+  teammate-check -->|No| return-ok["Return no block"]
+  teammate-hooks --> return-ok
+  mark-prevented --> return-prevented["Return preventContinuation=true"]
+  collect-block --> return-blocks["Return blockingErrors"]
+</pre>
+
+<ul>
+  <li>Main-thread determination relies on !toolUseContext.agentId — sub-agents skip task classification, memory extraction, autoDream, and ComputerUse cleanup to avoid polluting the main timeline or releasing process-level locks by mistake.</li>
+  <li>Stop hook results take four forms: success with no output, success with output, non-blocking error, and execution error; the latter two both count toward hasOutput and hookErrors for the summary message.</li>
+  <li>Teammate TaskCompleted hooks run per in_progress task, each generating an independent toolUseID.</li>
+  <li>The whole flow is wrapped in try/catch: a hook crash won't hang the query loop; it only produces a warning system message and a tengu_stop_hook_error report.</li>
+</ul>
+
+<h2>IV. Conversation History Persistence</h2>
+
+<p>From the user perspective: when the user presses Enter in the REPL to submit a prompt, that prompt enters the "Up-arrow history" and "Ctrl+R search." The system appends each prompt as a JSONL line to the global file ~/.claude/history.jsonl, with each line carrying display text, project root, sessionId, timestamp, and pasted content. Reading is done in reverse order so the latest appears first. Pasted content (images, large text) goes through the paste store separately; history lines only store inline small text or hash references, preventing the history file from ballooning.</p>
+
+<pre class="mermaid">
+graph TD
+  user-submit["User presses Enter to submit prompt"] --> add["addToHistory entry"]
+  add --> skip-check{"CLAUDE_CODE_SKIP_PROMPT_HISTORY?"}
+  skip-check -->|Yes| skip["Skip, do not write"]
+  skip-check -->|No| reg-cleanup["First time: register cleanup hook, wait for in-flight flush + final fallback flush"]
+  reg-cleanup --> build-entry["addToPromptHistory: assemble LogEntry"]
+  build-entry --> paste-loop{"Iterate pasted content"}
+  paste-loop -->|Image| skip-img["Skip, image stored in image-cache"]
+  paste-loop -->|Small text ≤1024| inline["Store content inline"]
+  paste-loop -->|Large text| hash["hashPastedText compute hash, store contentHash, fire-and-forget write to paste store"]
+  paste-loop -->|Done| push-pending["Push to pendingEntries, set lastAddedEntry, start flush"]
+  inline --> push-pending
+  hash --> push-pending
+  push-pending --> flush{"isWriting or pending empty?"}
+  flush -->|Yes| no-op["Return directly"]
+  flush -->|No| retries-check{"retries &gt; 5?"}
+  retries-check -->|Yes| give-up["Give up, retry on next user prompt"]
+  retries-check -->|No| lock["Acquire lockfile stale=10s"]
+  lock --> append["appendFile append JSONL"]
+  append --> remaining{"Still pending?"}
+  remaining -->|Yes| sleep500["Sleep 500ms, backoff recursively retries+1"]
+  remaining -->|No| done["Done"]
+  sleep500 --> flush
+</pre>
+
+<ul>
+  <li>The read side makeLogEntryReader first emits pendingEntries (not yet flushed), then reads history.jsonl in reverse; this ensures the Up arrow immediately sees the just-submitted prompt.</li>
+  <li>getHistory prioritizes entries from the current session, then emits other sessions later, avoiding interleaving across sessions; cap is MAX_HISTORY_ITEMS=100.</li>
+  <li>removeLastFromHistory cooperates with Esc undo: pop if found in pending, otherwise add the timestamp to skippedTimestamps so the read side skips it — ensuring an undone flushed entry doesn't appear twice on Up arrow.</li>
+  <li>lockfile timeout stale=10s, 3 retries, minTimeout 50ms, preventing concurrent appends from multiple processes from stepping on each other.</li>
+  <li>Large text pastes are written fire-and-forget; the hash reference enters history immediately, without blocking user submission.</li>
+</ul>
+
+<h2>V. Session State Foundation and Plan Mode Switching</h2>
+
+<p>bootstrap/state.ts is the "singleton state box" for the whole session. It does not directly drive the loop, but almost every judgment in the loop reads it: current cwd, original cwd, stable project root, sessionId, cumulative tokens and cost, this-round budget baseline, post-compaction flag, registered hook matchers, plan/auto mode switch attachment flags. Here we only expand the two segments directly related to the agent loop — the cwd/project-root triplet and plan/auto mode switching — the OTel provider mapped segment is not expanded.</p>
+
+<p>Business meaning of the cwd triplet: originalCwd is the working directory at session startup (the EnterWorktree tool can change it); cwd is the current working directory (updated whenever a tool switches it); projectRoot is the stable project root, unaffected by mid-session worktrees, and is used specifically to anchor history/skills/session identity. The separation exists so that "when entering a temporary worktree to work, history and skills still point to the original project."</p>
+
+<p>Plan mode switching logic is lightweight: entering plan clears the pending plan_mode_exit attachment flag (preventing plan_mode and plan_mode_exit from being sent simultaneously during rapid toggling); exiting plan sets needsPlanModeExitAttachment=true, consumed later by message assembly. Auto mode is similar, but auto↔plan is bidirectionally skipped and handled by prepareContextForPlanMode / ExitPlanMode instead.</p>
+
+<p>Token-budget-related state also lives at this layer: snapshotOutputTokensForTurn takes a baseline snapshot of "cumulative output tokens up to the start of this round" + sets this-round budget + resets continuationCount at the beginning of each round; getTurnOutputTokens = total output - baseline, used by tokenBudget.ts as turnTokens.</p>
+
+<h2>VI. Hook Matching and Total Execution Chain (utils/hooks.ts supplement)</h2>
+
+<p>This section supplements the main execution chain in src/utils/hooks.ts. Every execute*Hooks function (PreToolUse / PostToolUse / Stop / TeammateIdle / TaskCompleted / UserPromptSubmit / SessionStart, etc.) has the same structure: construct hookInput → hasHookForEvent fast short-circuit → call executeHooks. executeHooks is the core: first trust check and SIMPLE mode short-circuit, then getMatchingHooks pulls hooks matching this event, groups them by type and executes them in parallel (callback/function/command/prompt/agent/http), yielding progress messages and results one by one.</p>
+
+<p>Matching logic: getMatchingHooks decides matchQuery based on hookEvent (PreToolUse/PostToolUse use tool_name, SessionStart uses source, Notification uses notification_type, FileChanged uses basename, etc.), then compares it to each matcher's matcher field using matchesPattern. matchesPattern supports three semantics: wildcard '*' or empty → match all; pure alphanumeric/underscore/pipe → exact match or pipe-delimited multiple choice; otherwise → regex. It also tries the legacy tool name with regex to ensure old patterns like ^Task$ still hit.</p>
+
+<pre class="mermaid">
+graph TD
+  ex-event["execute*Hooks entry: construct hookInput"] --> has-hook{"hasHookForEvent fast check?"}
+  has-hook -->|No| skip-ret["Return directly, do not execute"]
+  has-hook -->|Yes| ex-hooks["executeHooks"]
+  ex-hooks --> disable-check{"Disable all hooks or SIMPLE mode?"}
+  disable-check -->|Yes| skip-ret
+  disable-check -->|No| trust-check{"Workspace not trusted?"}
+  trust-check -->|Yes| skip-trust["Skip to prevent RCE"]
+  trust-check -->|No| match["getMatchingHooks: pull + match + dedupe"]
+  match --> query-switch{"Determine matchQuery by hookEvent"}
+  query-switch -->|PreToolUse/PostToolUse etc.| q-tool["tool_name"]
+  query-switch -->|SessionStart| q-source["source"]
+  query-switch -->|Notification| q-ntype["notification_type"]
+  query-switch -->|FileChanged| q-base["basename"]
+  query-switch -->|Other| q-none["No matchQuery"]
+  q-tool --> mp["matchesPattern"]
+  q-source --> mp
+  q-ntype --> mp
+  q-base --> mp
+  q-none --> dedup
+  mp --> dedup["Dedupe by type: command/prompt/agent each Map"]
+  dedup --> internal-fast{"All internal callbacks?"}
+  internal-fast -->|Yes| fast-batch["Fast path: batch callbacks directly, skip span/progress/abort"]
+  internal-fast -->|No| yield-progress["Yield progress message per hook"]
+  yield-progress --> parallel["Execute in parallel, each with independent timeout"]
+  parallel --> type-dispatch{"Dispatch by hook.type"}
+  type-dispatch -->|callback| cb["executeHookCallback with timeout signal"]
+  type-dispatch -->|function| fn["executeFunctionHook needs messages"]
+  type-dispatch -->|command| cmd["execCommandHook"]
+  type-dispatch -->|prompt| pr["execPromptHook"]
+  type-dispatch -->|agent| ag["agent hook"]
+  type-dispatch -->|http| http["HTTP hook"]
+  cb --> results["Aggregate AggregatedHookResult"]
+  fn --> results
+  cmd --> results
+  pr --> results
+  ag --> results
+  http --> results
+  results --> yield-out["Yield progress + blocking + attachments"]
+</pre>
+
+<ul>
+  <li>matchesPattern has three states: wildcard / exact (including pipe-delimited multiple choice) / regex; regex failures are debug-logged only, not thrown.</li>
+  <li>Dedup groups by command+shell+if / prompt+if / agent+if; hookDedupKey uses pluginRoot/skillRoot as a namespace prefix, preventing the same template hook from different plugins from swallowing each other.</li>
+  <li>All-callback batches take the fast path, skipping span/progress/abortSignal/processHookJSONOutput, roughly 70% faster than the generic path.</li>
+  <li>Stop / SubagentStop determine hookEvent by whether subagentId exists; SubagentStop additionally carries agent_id, agent_transcript_path, and agent_type.</li>
+  <li>registerHookCallbacks is the SDK entry point for injecting callback hooks; STATE.registeredHooks accumulates and merges by event (does not overwrite); clearRegisteredPluginHooks only clears hooks with a pluginRoot, preserving pure callback hooks.</li>
+</ul>
+
+<script>
+window.__sourceMap = {
+  "loop-start": { "file": "src/query/transitions.ts", "startLine": 1, "endLine": 37 },
+  "after-model": { "file": "src/query/transitions.ts", "startLine": 8, "endLine": 37 },
+  "terminal-completed": { "file": "src/query/transitions.ts", "startLine": 9, "endLine": 23 },
+  "terminal-aborted": { "file": "src/query/transitions.ts", "startLine": 14, "endLine": 16 },
+  "terminal-model-error": { "file": "src/query/transitions.ts", "startLine": 13, "endLine": 14 },
+  "terminal-prompt-too-long": { "file": "src/query/transitions.ts", "startLine": 17, "endLine": 17 },
+  "terminal-max-turns": { "file": "src/query/transitions.ts", "startLine": 20, "endLine": 20 },
+  "terminal-stop-hook": { "file": "src/query/transitions.ts", "startLine": 18, "endLine": 18 },
+  "terminal-hook-stopped": { "file": "src/query/transitions.ts", "startLine": 19, "endLine": 19 },
+  "terminal-blocking": { "file": "src/query/transitions.ts", "startLine": 12, "endLine": 12 },
+  "continue-tool-use": { "file": "src/query/transitions.ts", "startLine": 28, "endLine": 28 },
+  "continue-compact-retry": { "file": "src/query/transitions.ts", "startLine": 29, "endLine": 29 },
+  "continue-output-recovery": { "file": "src/query/transitions.ts", "startLine": 30, "endLine": 30 },
+  "continue-output-escalate": { "file": "src/query/transitions.ts", "startLine": 31, "endLine": 31 },
+  "continue-collapse-drain": { "file": "src/query/transitions.ts", "startLine": 32, "endLine": 32 },
+  "continue-stop-blocking": { "file": "src/query/transitions.ts", "startLine": 33, "endLine": 33 },
+  "continue-budget": { "file": "src/query/transitions.ts", "startLine": 34, "endLine": 34 },
+  "continue-queued": { "file": "src/query/transitions.ts", "startLine": 35, "endLine": 35 },
+  "budget-entry": { "file": "src/query/tokenBudget.ts", "startLine": 45, "endLine": 53 },
+  "gate-check": { "file": "src/query/tokenBudget.ts", "startLine": 51, "endLine": 53 },
+  "stop-null": { "file": "src/query/tokenBudget.ts", "startLine": 52, "endLine": 53 },
+  "calc-pct": { "file": "src/query/tokenBudget.ts", "startLine": 55, "endLine": 57 },
+  "diminishing-check": { "file": "src/query/tokenBudget.ts", "startLine": 59, "endLine": 62 },
+  "stop-diminishing": { "file": "src/query/tokenBudget.ts", "startLine": 78, "endLine": 90 },
+  "threshold-check": { "file": "src/query/tokenBudget.ts", "startLine": 64, "endLine": 64 },
+  "continue-nudge": { "file": "src/query/tokenBudget.ts", "startLine": 64, "endLine": 76 },
+  "stop-budget": { "file": "src/query/tokenBudget.ts", "startLine": 78, "endLine": 90 },
+  "done-cont": { "file": "src/query/tokenBudget.ts", "startLine": 22, "endLine": 29 },
+  "done-stop": { "file": "src/query/tokenBudget.ts", "startLine": 31, "endLine": 43 },
+  "sh-enter": { "file": "src/query/stopHooks.ts", "startLine": 65, "endLine": 82 },
+  "save-params": { "file": "src/query/stopHooks.ts", "startLine": 84, "endLine": 98 },
+  "job-classify": { "file": "src/query/stopHooks.ts", "startLine": 108, "endLine": 113 },
+  "classify": { "file": "src/query/stopHooks.ts", "startLine": 117, "endLine": 132 },
+  "bare-check": { "file": "src/query/stopHooks.ts", "startLine": 136, "endLine": 136 },
+  "bg-tasks": { "file": "src/query/stopHooks.ts", "startLine": 138, "endLine": 157 },
+  "cu-cleanup": { "file": "src/query/stopHooks.ts", "startLine": 164, "endLine": 164 },
+  "cu-release": { "file": "src/query/stopHooks.ts", "startLine": 166, "endLine": 172 },
+  "run-stop": { "file": "src/query/stopHooks.ts", "startLine": 175, "endLine": 189 },
+  "hook-iter": { "file": "src/query/stopHooks.ts", "startLine": 200, "endLine": 295 },
+  "collect-block": { "file": "src/query/stopHooks.ts", "startLine": 257, "endLine": 267 },
+  "mark-prevented": { "file": "src/query/stopHooks.ts", "startLine": 269, "endLine": 280 },
+  "abort-return": { "file": "src/query/stopHooks.ts", "startLine": 283, "endLine": 294 },
+  "summary": { "file": "src/query/stopHooks.ts", "startLine": 298, "endLine": 298 },
+  "summary-msg": { "file": "src/query/stopHooks.ts", "startLine": 299, "endLine": 323 },
+  "teammate-check": { "file": "src/query/stopHooks.ts", "startLine": 335, "endLine": 335 },
+  "teammate-hooks": { "file": "src/query/stopHooks.ts", "startLine": 346, "endLine": 441 },
+  "return-ok": { "file": "src/query/stopHooks.ts", "startLine": 455, "endLine": 455 },
+  "return-prevented": { "file": "src/query/stopHooks.ts", "startLine": 325, "endLine": 327 },
+  "return-blocks": { "file": "src/query/stopHooks.ts", "startLine": 330, "endLine": 332 },
+  "user-submit": { "file": "src/history.ts", "startLine": 411, "endLine": 416 },
+  "add": { "file": "src/history.ts", "startLine": 411, "endLine": 434 },
+  "skip-check": { "file": "src/history.ts", "startLine": 414, "endLine": 416 },
+  "skip": { "file": "src/history.ts", "startLine": 415, "endLine": 415 },
+  "reg-cleanup": { "file": "src/history.ts", "startLine": 419, "endLine": 431 },
+  "build-entry": { "file": "src/history.ts", "startLine": 355, "endLine": 409 },
+  "paste-loop": { "file": "src/history.ts", "startLine": 364, "endLine": 395 },
+  "skip-img": { "file": "src/history.ts", "startLine": 367, "endLine": 369 },
+  "inline": { "file": "src/history.ts", "startLine": 372, "endLine": 379 },
+  "hash": { "file": "src/history.ts", "startLine": 380, "endLine": 393 },
+  "push-pending": { "file": "src/history.ts", "startLine": 397, "endLine": 408 },
+  "flush": { "file": "src/history.ts", "startLine": 329, "endLine": 337 },
+  "no-op": { "file": "src/history.ts", "startLine": 330, "endLine": 332 },
+  "retries-check": { "file": "src/history.ts", "startLine": 335, "endLine": 337 },
+  "give-up": { "file": "src/history.ts", "startLine": 336, "endLine": 336 },
+  "lock": { "file": "src/history.ts", "startLine": 297, "endLine": 314 },
+  "append": { "file": "src/history.ts", "startLine": 316, "endLine": 319 },
+  "remaining": { "file": "src/history.ts", "startLine": 346, "endLine": 352 },
+  "sleep500": { "file": "src/history.ts", "startLine": 347, "endLine": 351 },
+  "done": { "file": "src/history.ts", "startLine": 352, "endLine": 352 },
+  "ex-event": { "file": "src/utils/hooks.ts", "startLine": 3394, "endLine": 3436 },
+  "has-hook": { "file": "src/utils/hooks.ts", "startLine": 3410, "endLine": 3412 },
+  "skip-ret": { "file": "src/utils/hooks.ts", "startLine": 3411, "endLine": 3412 },
+  "ex-hooks": { "file": "src/utils/hooks.ts", "startLine": 1952, "endLine": 1977 },
+  "disable-check": { "file": "src/utils/hooks.ts", "startLine": 1978, "endLine": 1984 },
+  "trust-check": { "file": "src/utils/hooks.ts", "startLine": 1994, "endLine": 1999 },
+  "skip-trust": { "file": "src/utils/hooks.ts", "startLine": 1995, "endLine": 1999 },
+  "match": { "file": "src/utils/hooks.ts", "startLine": 2004, "endLine": 2013 },
+  "query-switch": { "file": "src/utils/hooks.ts", "startLine": 1616, "endLine": 1670 },
+  "q-tool": { "file": "src/utils/hooks.ts", "startLine": 1617, "endLine": 1623 },
+  "q-source": { "file": "src/utils/hooks.ts", "startLine": 1624, "endLine": 1626 },
+  "q-ntype": { "file": "src/utils/hooks.ts", "startLine": 1634, "endLine": 1636 },
+  "q-base": { "file": "src/utils/hooks.ts", "startLine": 1665, "endLine": 1667 },
+  "q-none": { "file": "src/utils/hooks.ts", "startLine": 1649, "endLine": 1652 },
+  "mp": { "file": "src/utils/hooks.ts", "startLine": 1346, "endLine": 1381 },
+  "dedup": { "file": "src/utils/hooks.ts", "startLine": 1731, "endLine": 1782 },
+  "internal-fast": { "file": "src/utils/hooks.ts", "startLine": 2024, "endLine": 2027 },
+  "fast-batch": { "file": "src/utils/hooks.ts", "startLine": 2041, "endLine": 2066 },
+  "yield-progress": { "file": "src/utils/hooks.ts", "startLine": 2095, "endLine": 2116 },
+  "parallel": { "file": "src/utils/hooks.ts", "startLine": 2143, "endLine": 2146 },
+  "type-dispatch": { "file": "src/utils/hooks.ts", "startLine": 2147, "endLine": 2192 },
+  "cb": { "file": "src/utils/hooks.ts", "startLine": 2147, "endLine": 2163 },
+  "fn": { "file": "src/utils/hooks.ts", "startLine": 2165, "endLine": 2192 },
+  "cmd": { "file": "src/utils/hooks.ts", "startLine": 2194, "endLine": 2198 },
+  "pr": { "file": "src/utils/hooks.ts", "startLine": 2224, "endLine": 2239 },
+  "ag": { "file": "src/utils/hooks.ts", "startLine": 2194, "endLine": 2198 },
+  "http": { "file": "src/utils/hooks.ts", "startLine": 2194, "endLine": 2198 },
+  "results": { "file": "src/utils/hooks.ts", "startLine": 2143, "endLine": 2146 },
+  "yield-out": { "file": "src/utils/hooks.ts", "startLine": 2095, "endLine": 2116 }
+};
+</script>
+
+<aside id="source-panel"><div id="source-header"></div><div id="monaco-container"></div></aside>
+<script src="../assets/codeindex-runtime.js"></script>
+<script src="../assets/codeindex.js"></script>
+</body></html>

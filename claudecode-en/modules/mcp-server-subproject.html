@@ -1,29 +1,22 @@
 <!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>MCP Exploration Server (lets external AI clients browse this repo)</title>
-<link rel="stylesheet" href="../assets/codeindex.css">
-</head>
-<body>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>MCP Exploration Server (Let external AI clients browse this repository's source code)</title><link rel="stylesheet" href="../assets/codeindex.css"></head><body>
 <nav class="topnav"><a href="../index.html">← Back to overview</a></nav>
-<h1>MCP Exploration Server (lets external AI clients browse this repo)</h1>
+<h1>MCP Exploration Server (Let external AI clients browse this repository's source code)</h1>
 
-<p>This is a stand-alone MCP (Model Context Protocol) server with a straightforward purpose: any MCP-compatible AI client (Claude Desktop, Cursor, VS Code Copilot, etc.) that connects to it can browse this repository's source code like flipping through a book—listing directories, reading files, searching by regex, viewing architecture overviews, and even listing all built-in "tools" and "slash commands" of Claude Code and reading their implementations. In other words, it turns a local source tree into a set of AI-callable tools, so a remote client can "look at the code" without cloning the repository.</p>
+<p>This is a standalone MCP (Model Context Protocol) server with a straightforward purpose: after any MCP-compatible AI client (Claude Desktop, Cursor, VS Code Copilot, etc.) connects to it, the client can browse this repository's source code like flipping through a book — listing directories, reading files, searching by regex, viewing architecture overviews, and even listing all built-in Claude Code "tools" and "slash commands" and reading their implementations. In other words, it turns a local source tree into a set of AI-callable tools, so a remote client can "see the code" without cloning the repository.</p>
 
-<p>It is not coupled to the main Claude Code project: the main project is the object it "displays", while the server itself only exposes capabilities externally. There are two deployment forms—local STDIO (the client spawns a node process directly) and remote HTTP (deployed on Railway/Vercel/Docker, shared by multiple clients via Bearer Token auth). Three transport protocols coexist: STDIO, Streamable HTTP (modern MCP), and Legacy SSE (for older clients).</p>
+<p>It is not coupled to the main Claude Code project: the main project is the object it "displays," while the server itself only exposes capabilities externally. It has two deployment forms — local STDIO (the client directly spawns a node process to communicate) and remote HTTP (deployed on Railway/Vercel/Docker, shared by multiple clients authenticated via Bearer Token). Three transport protocols coexist: STDIO, Streamable HTTP (modern MCP), and Legacy SSE (for older clients).</p>
 
 <dl>
   <dt>Input</dt>
-  <dd>MCP requests from an external AI client: invoking a tool (e.g. read_source_file with a relative path), reading a resource URI, or rendering a prompt template. In HTTP mode a Bearer Token is also attached for auth.</dd>
+  <dd>MCP requests from an external AI client: calling a tool (e.g., read_source_file with a relative path), reading a resource URI, or rendering a prompt template. In HTTP mode, a Bearer Token is also included for authentication.</dd>
   <dt>Output</dt>
-  <dd>The corresponding tool execution result: file content snippets, directory listings, search hit lines, architecture JSON, tool/command lists, etc., packaged in MCP protocol format and returned to the client for display or for feeding into its own LLM.</dd>
+  <dd>The execution result of the corresponding tool: file content snippets, directory listings, search hit lines, architecture JSON, tool/command lists, etc., wrapped in MCP protocol format and returned to the client, where it is shown to the user or fed to the client's own LLM.</dd>
 </dl>
 
-<h2>Entry Points and Transport Layer</h2>
+<h2>Entry points and transport layer</h2>
 
-<p>The user (external AI client) can trigger three entry paths, all converging on the same "shared MCP server". The local scenario is simplest: the client writes a command in its config that spawns <code>node dist/index.js</code>, and the process exchanges JSON-RPC messages with the client over STDIO. The remote scenario is a persistent Express process; the client sends HTTP requests to <code>/mcp</code> (modern) or <code>/sse + /messages</code> (legacy protocol).</p>
+<p>The user (external AI client) triggers one of three paths, all converging on the same "shared MCP server." The local scenario is simplest: the client writes a command in its config to spawn <code>node dist/index.js</code>, and the process exchanges JSON-RPC messages with the client over STDIO. The remote scenario is a long-running Express process; clients send HTTP requests to <code>/mcp</code> (modern) or <code>/sse + /messages</code> (legacy protocol).</p>
 
 <pre class="mermaid">
 graph TD
@@ -33,14 +26,14 @@ graph TD
   stdio-entry --> validate-stdio["validateSrcRoot validates source root"]
   http-entry --> validate-http["validateSrcRoot validates source root"]
   http-entry --> auth-mw{"MCP_API_KEY set?"}
-  auth-mw -->|No| skip-auth["Allow directly"]
-  auth-mw -->|Yes| check-bearer{"Authorization: Bearer matches?"}
-  check-bearer -->|No| unauth["Return 401 Unauthorized"]
-  check-bearer -->|Yes| skip-auth
+  auth-mw -->|"No"| skip-auth["Allow directly"]
+  auth-mw -->|"Yes"| check-bearer{"Authorization: Bearer matches?"}
+  check-bearer -->|"No"| unauth["Return 401 Unauthorized"]
+  check-bearer -->|"Yes"| skip-auth
   validate-stdio --> create-server-stdio["createServer() creates shared MCP instance"]
   skip-auth --> create-server-http["createServer() creates shared MCP instance"]
   create-server-stdio --> connect-stdio["StdioServerTransport connects"]
-  create-server-http --> route-mcp{"Route dispatch"}
+  create-server-http --> route-mcp{"Route by path"}
   route-mcp -->|"/mcp POST"| stream-http["StreamableHTTP transport handles"]
   route-mcp -->|"/mcp GET"| stream-http
   route-mcp -->|"/sse"| legacy-sse["SSE transport establishes/reuses session"]
@@ -49,31 +42,31 @@ graph TD
   route-mcp -->|"/mcp DELETE"| delete-sess["Close and clean up session"]
 </pre>
 
-<p>The STDIO entry point is only 25 lines and does three things before exiting: validate the source root, create the shared MCP instance, and attach StdioServerTransport. The HTTP entry point is more complex; its core is three middleware/route pieces: auth, health check, and session management for the two transport protocols.</p>
+<p>The STDIO entry point is only 25 lines and does three things before exiting: validate the source root directory, create the shared MCP instance, and attach StdioServerTransport. The HTTP entry point is more complex, with three core middleware/routing parts: authentication, health check, and session management for both transport protocols.</p>
 
 <ul>
-  <li>Auth is optional: it only takes effect when <code>MCP_API_KEY</code> is set, and <code>/health</code> is always exempt (convenient for deployment platform health probes).</li>
-  <li>Streamable HTTP uses a <code>Map&lt;sessionId, transport&gt;</code> to maintain multiple sessions in memory; <code>POST /mcp</code> creates/reuses a session, <code>GET /mcp</code> pulls the SSE stream, and <code>DELETE /mcp</code> actively cleans up.</li>
-  <li>Legacy SSE follows the old protocol: the client first <code>GET /sse</code> to establish a long-lived connection and obtain a sessionId, then sends subsequent commands via <code>POST /messages?sessionId=xxx</code>.</li>
-  <li>Every HTTP session calls <code>createServer()</code> once—meaning each session gets its own independent MCP instance, isolated from the others; STDIO has only one instance for the whole run.</li>
+  <li>Authentication is optional: it only takes effect when <code>MCP_API_KEY</code> is set, and <code>/health</code> is always exempt (convenient for deployment platform liveness probes).</li>
+  <li>Streamable HTTP maintains multiple sessions in memory using a <code>Map&lt;sessionId, transport&gt;</code>; <code>POST /mcp</code> creates/reuses a session, <code>GET /mcp</code> pulls the SSE stream, and <code>DELETE /mcp</code> actively cleans up.</li>
+  <li>Legacy SSE follows the old protocol: the client first calls <code>GET /sse</code> to establish a long connection and obtain a sessionId, then sends commands via <code>POST /messages?sessionId=xxx</code>.</li>
+  <li>Each HTTP session calls <code>createServer()</code> once — meaning each session gets an independent MCP instance, so they don't interfere with each other; STDIO has only one instance throughout.</li>
 </ul>
 
-<h2>Shared MCP Server: How Requests Arrive, Read Source, and Return</h2>
+<h2>Shared MCP server: how requests arrive, how source code is read, how results are returned</h2>
 
-<p>All transport protocols eventually hand JSON-RPC requests to the Server instance produced by the same factory function <code>createServer()</code>. At construction time this instance registers handlers for three categories of capabilities: <b>resources</b> (passively readable data, fetched by URI), <b>tools</b> (callable functions with input schemas), and <b>prompts</b> (prebuilt prompt templates, injected with source context and handed to the client's LLM). The client first calls list-style interfaces to get the menu, then calls the specific call/read/get to retrieve actual content.</p>
+<p>All transport protocols ultimately hand JSON-RPC requests to the Server instance produced by the same factory function <code>createServer()</code>. At construction, this instance registers handlers for three categories of capabilities at once: <b>resources</b> (passively readable data fetched by URI), <b>tools</b> (callable functions with input schemas), and <b>prompts</b> (prebuilt prompt templates, injected with source context and handed to the client's LLM). The client first calls the list family of methods to get the menu, then calls the specific call/read/get to fetch actual content.</p>
 
-<p>There are only three underlying source-reading primitives: <code>fs.readFile</code> (read a single file), <code>fs.readdir</code> (list a directory), and <code>walkFiles</code> (recursively walk the whole tree for search). Every user-supplied path first passes through <code>safePath()</code>—it uses <code>path.resolve</code> to join the relative path under <code>SRC_ROOT</code>, then verifies the result still starts with <code>SRC_ROOT</code>; otherwise it returns null. This blocks directory-traversal attacks like <code>../../etc/passwd</code> and is the service's sole permission boundary.</p>
+<p>All source code reading boils down to only three low-level actions: <code>fs.readFile</code> (read a single file), <code>fs.readdir</code> (list a directory), and <code>walkFiles</code> (recursively walk the tree for search). Every user-supplied path must pass through <code>safePath()</code> — it uses <code>path.resolve</code> to join the relative path under <code>SRC_ROOT</code>, then checks that the result still starts with <code>SRC_ROOT</code>; otherwise it returns null. This blocks directory traversal attacks such as <code>../../etc/passwd</code> and is the service's only permission boundary.</p>
 
 <dl>
   <dt>Input</dt>
-  <dd>Three list requests (ListTools / ListResources / ListPrompts) only return static menus; three call requests (CallTool / ReadResource / GetPrompt) carry tool name/URI/prompt name plus parameters, where parameters are usually a relative path or tool name.</dd>
+  <dd>Three list requests (ListTools / ListResources / ListPrompts) only return static menus; three call requests (CallTool / ReadResource / GetPrompt) carry a tool name/URI/prompt name plus parameters, where the parameter is usually a relative path or tool name.</dd>
   <dt>Output</dt>
-  <dd>Responses in MCP protocol format: tools return <code>content: [{type:"text", text:...}]</code>; resources return <code>contents: [{uri, mimeType, text}]</code>; prompts return <code>messages: [{role:"user", content:{type:"text", text}}]</code>. Text content is the original file, directory listing, search hit lines, or assembled prompt.</dd>
+  <dd>Response in MCP protocol format: tools return <code>content: [{type:"text", text:...}]</code>; resources return <code>contents: [{uri, mimeType, text}]</code>; prompts return <code>messages: [{role:"user", content:{type:"text", text}}]</code>. The text content is the raw file, directory listing, search hit lines, or assembled prompt.</dd>
 </dl>
 
-<h3>Main Data Flow: Tool Calls (CallTool)</h3>
+<h3>Main data flow: tool call (CallTool)</h3>
 
-<p>When a client invokes a tool, the request carries <code>name</code> and <code>arguments</code>; the server dispatches via a switch to one of eight tools. The core of each tool is "locate file → read content → assemble text return"; only the locate logic differs.</p>
+<p>When a client calls a tool, the request carries <code>name</code> and <code>arguments</code>, and the server dispatches via a switch to one of 8 tools. The core of each tool is "locate file → read content → assemble into text and return," differing only in the location logic.</p>
 
 <pre class="mermaid">
 graph TD
@@ -86,63 +79,63 @@ graph TD
   switch -->|"search_source"| t-search{"pattern required?"}
   switch -->|"list_directory"| t-listdir["safePath validates directory"]
   switch -->|"get_architecture"| t-arch["Aggregate top-level dirs + tools + commands"]
-  t-get-tool -->|Missing| err-tool["Throw: toolName required"]
-  t-get-tool -->|Present| safe-tool["safePath tools/toolName"]
-  safe-tool -->|Invalid path / not exists| err-tool2["Throw: Tool not found"]
-  safe-tool -->|Exists| pick-main["Pick main file if fileName not provided"]
-  pick-main --> read-tool["fs.readFile source code"]
+  t-get-tool -->|"Missing"| err-tool["Throw: toolName required"]
+  t-get-tool -->|"Present"| safe-tool["safePath tools/toolName"]
+  safe-tool -->|"Invalid path / doesn't exist"| err-tool2["Throw: Tool not found"]
+  safe-tool -->|"Exists"| pick-main["Pick main file if fileName not provided"]
+  pick-main --> read-tool["fs.readFile reads source"]
   read-tool --> out-tool["Return source with line count comments"]
-  t-read -->|Missing| err-path["Throw: path required"]
-  t-read -->|Present| safe-read["safePath validation"]
-  safe-read -->|Invalid / not exists| err-read["Throw: File not found"]
-  safe-read -->|Exists| slice-read["Slice by startLine/endLine"]
+  t-read -->|"Missing"| err-path["Throw: path required"]
+  t-read -->|"Present"| safe-read["safePath validates"]
+  safe-read -->|"Invalid / doesn't exist"| err-read["Throw: File not found"]
+  safe-read -->|"Exists"| slice-read["Slice by startLine/endLine"]
   slice-read --> out-read["Return code snippet with line numbers"]
-  t-search -->|Missing| err-pat["Throw: pattern required"]
-  t-search -->|Present| compile-regex["new RegExp(pattern, 'i')"]
-  compile-regex -->|Invalid regex| err-regex["Throw: Invalid regex"]
-  compile-regex -->|OK| walk-all["walkFiles recursively lists all files"]
+  t-search -->|"Missing"| err-pat["Throw: pattern required"]
+  t-search -->|"Present"| compile-regex["new RegExp(pattern, 'i')"]
+  compile-regex -->|"Invalid regex"| err-regex["Throw: Invalid regex"]
+  compile-regex -->|"OK"| walk-all["walkFiles recursively lists all files"]
   walk-all --> filter-ext["Filter extensions by filePattern"]
-  filter-ext --> scan-lines["Regex.test file by file, line by line"]
+  filter-ext --> scan-lines["Regex.test line by line per file"]
   scan-lines --> cap-max{"Reached maxResults?"}
-  cap-max -->|Yes| stop-scan["Stop scanning"]
-  cap-max -->|No| out-search["Return hit lines file:line: content"]
+  cap-max -->|"Yes"| stop-scan["Stop scanning"]
+  cap-max -->|"No"| out-search["Return hit lines file:line: content"]
   stop-scan --> out-search
 </pre>
 
-<h3>Resource Reading Flow (ReadResource)</h3>
+<h3>Resource read flow (ReadResource)</h3>
 
-<p>Resources are read-only data "fetched directly by URI". The server registers 3 fixed URIs and 1 template URI <code>claude-code://source/{path}</code>. The template URI also goes through safePath, sharing the same secure path as the <code>read_source_file</code> tool, only at the protocol layer differently.</p>
+<p>Resources are read-only data fetched directly by URI. The server registers 3 fixed URIs and 1 template URI <code>claude-code://source/{path}</code>. The template URI also goes through safePath, sharing the same secure path as the <code>read_source_file</code> tool, just at the protocol layer.</p>
 
 <pre class="mermaid">
 graph TD
   readres["Client ReadResource(uri)"] --> arch?{"uri = architecture?"}
-  arch -->|Yes| read-readme["Read SRC_ROOT/../README.md"]
+  arch -->|"Yes"| read-readme["Read SRC_ROOT/../README.md"]
   read-readme --> out-arch["Return markdown"]
-  arch -->|No| tools?{"uri = tools?"}
-  tools -->|Yes| call-gettools["getToolList scans directory"]
+  arch -->|"No"| tools?{"uri = tools?"}
+  tools -->|"Yes"| call-gettools["getToolList scans directory"]
   call-gettools --> out-tools["Return tool list JSON"]
-  tools -->|No| cmds?{"uri = commands?"}
-  cmds -->|Yes| call-getcmds["getCommandList scans directory"]
+  tools -->|"No"| cmds?{"uri = commands?"}
+  cmds -->|"Yes"| call-getcmds["getCommandList scans directory"]
   call-getcmds --> out-cmds["Return command list JSON"]
-  cmds -->|No| src?{"uri starts with source/?"}
-  src -->|Yes| safe-res["safePath validates relative path"]
-  safe-res -->|Invalid| err-res["Throw: Invalid path"]
-  safe-res -->|OK| read-res["fs.readFile reads file"]
+  cmds -->|"No"| src?{"uri starts with source/?"}
+  src -->|"Yes"| safe-res["safePath validates relative path"]
+  safe-res -->|"Invalid"| err-res["Throw: Invalid path"]
+  safe-res -->|"OK"| read-res["fs.readFile reads file"]
   read-res --> out-res["Return text/plain full text"]
-  src -->|No| err-unknown["Throw: Unknown resource"]
+  src -->|"No"| err-unknown["Throw: Unknown resource"]
 </pre>
 
-<h3>Prompt Rendering Flow (GetPrompt)</h3>
+<h3>Prompt rendering flow (GetPrompt)</h3>
 
-<p>The 5 prompt templates serve the purpose of "pre-feeding source context for the client's LLM". After the server receives the request, it locates the relevant source files by prompt name, reads them, and stuffs them into a preset question text, assembling the whole thing into a single user message returned to the client. What the client gets is a prompt ready to feed to its LLM.</p>
+<p>The 5 prompt templates serve the purpose of "preparing source context for the client's LLM." After the server receives the request, it locates the relevant source files by prompt name, reads them, and stuffs them into a preset question text, assembling the whole thing into a user message to return. What the client gets is a prompt ready to feed directly to an LLM.</p>
 
 <pre class="mermaid">
 graph TD
   getprompt["Client GetPrompt(name, args)"] --> pswitch{"Dispatch by prompt name"}
   pswitch -->|"explain_tool"| p-tool["Locate tools/toolName main file"]
   pswitch -->|"explain_command"| p-cmd["Locate commands/commandName"]
-  pswitch -->|"architecture_overview"| p-arch["Read README + scan top level + tool/command lists"]
-  pswitch -->|"how_does_it_work"| p-how["Look up featureMap for related paths"]
+  pswitch -->|"architecture_overview"| p-arch["Read README + scan top-level + tool/command lists"]
+  pswitch -->|"how_does_it_work"| p-how["Look up featureMap for relevant paths"]
   pswitch -->|"compare_tools"| p-cmp["Read main source of two tools"]
   p-tool --> p-tool-read["Read main file source"]
   p-tool-read --> p-tool-out["Assemble 6-dimension analysis question"]
@@ -150,8 +143,8 @@ graph TD
   p-cmd-find --> p-cmd-out["Assemble command explanation question"]
   p-arch --> p-arch-out["Assemble architecture overview question"]
   p-how --> p-how-map{"feature in featureMap?"}
-  p-how-map -->|Yes| p-how-read["Read files/list dirs by path (first 200 lines)"]
-  p-how-map -->|No| p-how-empty["Prompt to use search/read to find it yourself"]
+  p-how-map -->|"Yes"| p-how-read["Read files/list dirs per path (first 200 lines)"]
+  p-how-map -->|"No"| p-how-empty["Prompt to use search/read to find it yourself"]
   p-how-read --> p-how-out["Assemble subsystem explanation question"]
   p-how-empty --> p-how-out
   p-cmp --> p-cmp-read["Read main source of both tools"]
@@ -159,40 +152,40 @@ graph TD
 </pre>
 
 <ul>
-  <li><code>how_does_it_work</code> has a built-in featureMap that maps human colloquialisms ("permission system", "mcp client", "bridge") to a set of source paths—this is the only place in the service that carries "business knowledge"; all other tools are pure filesystem operations.</li>
-  <li>All prompts return a single user message with no system message; the client can overlay its own system prompt.</li>
-  <li>When reading source, <code>how_does_it_work</code> only takes the first 200 lines to avoid overly long prompts; the <code>read_source_file</code> tool supports precise startLine/endLine slicing so the client can page through itself.</li>
+  <li><code>how_does_it_work</code> has a built-in featureMap that maps human phrases ("permission system", "mcp client", "bridge") to a set of source paths — this is the only place in the service that carries "business knowledge"; all other tools are pure filesystem operations.</li>
+  <li>All prompts return a single user message with no system message; the client can layer its own system prompt on top.</li>
+  <li>When reading source, <code>how_does_it_work</code> only takes the first 200 lines to avoid overly long prompts; the <code>read_source_file</code> tool supports precise slicing by startLine/endLine, so clients can paginate themselves.</li>
 </ul>
 
-<h2>Auxiliary View: Permission Boundary</h2>
+<h2>Supporting view: permission boundary</h2>
 
-<p>The service's permission model is very thin, with only two layers: HTTP-layer Bearer Token (optional), and filesystem-layer safePath (mandatory).</p>
+<p>The service's permission model is very thin, with only two layers: HTTP-layer Bearer Token (optional) and file-layer safePath (mandatory).</p>
 
 <pre class="mermaid">
 graph TD
   req["Incoming request"] --> http-layer{"HTTP mode &amp; MCP_API_KEY set?"}
-  http-layer -->|Yes| bearer{"Authorization: Bearer matches?"}
-  http-layer -->|No| pass-http["Allow"]
-  bearer -->|No| deny-401["401 Unauthorized"]
-  bearer -->|Yes| pass-http
+  http-layer -->|"Yes"| bearer{"Authorization: Bearer matches?"}
+  http-layer -->|"No"| pass-http["Allow"]
+  bearer -->|"No"| deny-401["401 Unauthorized"]
+  bearer -->|"Yes"| pass-http
   pass-http --> tool-call["Enter tool/resource handler"]
   tool-call --> path-arg{"Parameter contains relative path?"}
-  path-arg -->|Yes| safepath["safePath: resolve + startsWith validation"]
-  path-arg -->|No| direct["Scan fixed directories directly"]
-  safepath -->|Escapes SRC_ROOT| deny-null["Return null → throw"]
-  safepath -->|Inside SRC_ROOT| allow-read["Allow fs.readFile/readdir"]
+  path-arg -->|"Yes"| safepath["safePath: resolve + startsWith validation"]
+  path-arg -->|"No"| direct["Scan fixed directories directly"]
+  safepath -->|"Traverses out of SRC_ROOT"| deny-null["Return null → throw"]
+  safepath -->|"Inside SRC_ROOT"| allow-read["Allow fs.readFile/readdir"]
 </pre>
 
 <ul>
-  <li><code>/health</code> (and Vercel's <code>/api</code>) is always exempt from auth for deployment platform health probes.</li>
-  <li>STDIO mode has no HTTP auth—the client that can spawn this process is already considered trusted.</li>
-  <li>safePath uses <code>resolved.startsWith(SRC_ROOT)</code>; note that SRC_ROOT itself is an absolute path from <code>path.resolve</code> with no trailing slash, so paths exactly equal to SRC_ROOT also pass.</li>
-  <li>There is no per-tool permission granularity—any authenticated client can call all 8 tools and read any file under SRC_ROOT. This is a read-only exploration service, so the model is sufficient.</li>
+  <li><code>/health</code> (and Vercel's <code>/api</code>) is always exempt from authentication for deployment platform liveness probes.</li>
+  <li>STDIO mode has no HTTP authentication — any client that can spawn this process is already considered trusted.</li>
+  <li>safePath uses <code>resolved.startsWith(SRC_ROOT)</code> for the check; note that SRC_ROOT itself is an absolute path produced by <code>path.resolve</code>, with no trailing slash, so paths exactly equal to SRC_ROOT also pass.</li>
+  <li>There is no per-tool permission differentiation — any authenticated client can call all 8 tools and read any file under SRC_ROOT. This is a read-only exploration service that doesn't write or modify, so the model is sufficient.</li>
 </ul>
 
-<h2>Auxiliary View: Session Lifecycle and State Machine</h2>
+<h2>Supporting view: session lifecycle and state machine</h2>
 
-<p>In HTTP mode each session has its own independent lifecycle. Streamable HTTP identifies sessions via the <code>mcp-session-id</code> header, Legacy SSE uses the query parameter <code>sessionId</code>. Both maintain transports in an in-memory Map; they are lost when the process restarts.</p>
+<p>In HTTP mode, each session has an independent lifecycle. Streamable HTTP uses the <code>mcp-session-id</code> header to identify sessions; Legacy SSE uses the query parameter <code>sessionId</code>. Both maintain transports in an in-memory Map, lost when the process restarts.</p>
 
 <pre class="mermaid">
 graph TD
@@ -201,29 +194,29 @@ graph TD
   gen-id --> store-map["Store in transports Map"]
   store-map --> state-active["State: active"]
   reuse-req["Request with sessionId"] --> lookup{"Exists in Map?"}
-  lookup -->|Yes| reuse-sess["Reuse transport to handle"]
-  lookup -->|No| reject-400["400 Invalid/Missing session"]
+  lookup -->|"Yes"| reuse-sess["Reuse transport to handle"]
+  lookup -->|"No"| reject-400["400 Invalid/Missing session"]
   reuse-sess --> state-active
   state-active -->|"Client DELETE /mcp"| close-sess["transport.close()"]
   state-active -->|"transport.onclose fires"| del-map["Remove from Map"]
   close-sess --> del-map
   del-map --> state-gone["State: destroyed"]
-  state-gone -->|"Client comes again"| reject-400
+  state-gone -->|"Client returns"| reject-400
 </pre>
 
 <ul>
-  <li>Each session independently calls <code>createServer()</code>, meaning each session has its own MCP Server instance, but all read the same on-disk source underneath—stateless business, naturally concurrent.</li>
-  <li>Vercel deployment is serverless: the Map does not persist across invocations, so Streamable HTTP session reuse basically fails; legacy SSE and stateless tool calls still work. The README explicitly recommends Railway/Docker for production.</li>
-  <li>STDIO mode has no "session" concept; there is one transport for the whole run, and it ends when the process exits.</li>
+  <li>Each session independently calls <code>createServer()</code>, meaning each session has its own MCP Server instance, but they all read the same disk source underneath — stateless business logic, naturally supporting concurrency.</li>
+  <li>Vercel deployment is serverless: the Map doesn't persist across invocations, so Streamable HTTP session reuse essentially fails; legacy SSE and stateless tool calls still work. The README explicitly recommends Railway/Docker for production.</li>
+  <li>STDIO mode has no "session" concept; there is one transport throughout, ending when the process exits.</li>
 </ul>
 
-<h2>Deployment Forms</h2>
+<h2>Deployment forms overview</h2>
 
-<p>The same <code>createServer()</code> core wrapped in different shells becomes different deployment options: local STDIO (<code>src/index.ts</code>), remote HTTP (<code>src/http.ts</code>), and Vercel serverless (<code>api/vercelApp.ts</code> exports an Express app). The Dockerfile copies the whole repository into the image, builds <code>dist/</code>, then starts with <code>node dist/http.js</code>, with <code>CLAUDE_CODE_SRC_ROOT=/app/src</code> pointing to the source copy inside the image. Railway uses the same Dockerfile with healthcheckPath=/health for automatic health probes.</p>
+<p>The same <code>createServer()</code> core, wrapped in different shells, becomes different deployment methods: local STDIO (<code>src/index.ts</code>), remote HTTP (<code>src/http.ts</code>), Vercel serverless (<code>api/vercelApp.ts</code> exports an Express app). The Dockerfile copies the entire repository into the image, builds <code>dist/</code>, then starts with <code>node dist/http.js</code>, with <code>CLAUDE_CODE_SRC_ROOT=/app/src</code> pointing to the source copy inside the image. Railway uses the same Dockerfile, configured with healthcheckPath=/health for automatic liveness probes.</p>
 
 <ul>
-  <li>The Docker image bundles both mcp-server/dist and the main project's src/—the "source" this server explores is baked into the image at deployment time and does not depend on the host filesystem.</li>
-  <li><code>src/index.ts.new</code> is a same-name copy of index.ts (content identical), likely leftover from development and not part of the build.</li>
+  <li>The Docker image packages both mcp-server/dist and the main project's src/ — the "source code" explored by this server is baked into the image at deployment time and does not depend on the host filesystem.</li>
+  <li><code>src/index.ts.new</code> is a same-name copy of index.ts (content identical), suspected to be a leftover from development and not involved in the build.</li>
 </ul>
 
 <script>
@@ -338,5 +331,4 @@ window.__sourceMap = {
 <aside id="source-panel"><div id="source-header"></div><div id="monaco-container"></div></aside>
 <script src="../assets/codeindex-runtime.js"></script>
 <script src="../assets/codeindex.js"></script>
-</body>
-</html>
+</body></html>

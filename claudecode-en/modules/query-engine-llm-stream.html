@@ -1,47 +1,40 @@
 <!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Conversation Engine and LLM Streaming</title>
-<link rel="stylesheet" href="../assets/codeindex.css">
-</head>
-<body>
-<nav class="topnav"><a href="../index.html">← Back to overview</a></nav>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Conversation Engine and LLM Streaming</title><link rel="stylesheet" href="../assets/codeindex.css"></head><body>
+<nav class="topnav"><a href="../index.html">← Back to Overview</a></nav>
 <h1>Conversation Engine and LLM Streaming</h1>
 
-<p>This is the core channel of Claude Code from "one user question" to "final response." When the user types a question in the REPL (or the SDK calls <code>ask</code> once), the engine's job is not simply to forward it to the model — it must first digest slash commands, attachments, and skill discovery in the user input, then call the Claude API with complete context; while the model streams tokens, the engine parses them on the fly, decides whether to call tools, feeds tool results back for another round, and loops until the model gives a final response; along the way it also handles thinking, rate-limit retries, model fallback, prompt-too-long / overlong-output recovery, context compression, budget caps, and turn limits. No step in this chain is allowed to "freeze" the conversation; there must be a clear exit and report for any failure.</p>
+<p>This is the core channel in Claude Code from "one question" to "final reply." When the user types a question in the REPL (or an SDK call invokes <code>ask</code>), the engine's job is not simply to forward it to the model—it must first digest slash commands, attachments, and skill discovery in the input, then call the Claude API with full context; as the model streams tokens, the engine parses them incrementally, decides whether tools need to be called, feeds tool results back for another round, and loops until the model gives a final reply; along the way it also handles thinking, rate-limit retries, model fallback, prompt-too-long/overlong-output recovery, context compression, budget and turn limits. No step on this chain is allowed to "freeze" the conversation; every failure must have a clear exit and report.</p>
 
 <dl>
   <dt>Input</dt>
-  <dd>A user question (text or content blocks with attachments) + current conversation history + tool/MCP/skill/permission context</dd>
+  <dd>A single user question (text or content blocks with attachments) + current conversation history + tool/MCP/skill/permission context</dd>
   <dt>Output</dt>
-  <dd>A <code>result</code> message (success / over budget / over turn limit / execution error), with final text, cumulative token usage, cost, model usage, and permission-denial records</dd>
+  <dd>A <code>result</code> message (success / over budget / over turns / execution error), carrying final text, cumulative token usage, cost, model usage, and permission-denial records</dd>
 </dl>
 
 <ul>
-  <li>The outer <code>QueryEngine.submitMessage</code> handles "session-level" transactions: assembling the system prompt, running user-input preprocessing, converting messages yielded by query() into SDK messages, writing transcript, and watching budget/turn/structured-output retry limits.</li>
-  <li>The inner <code>query.ts</code> <code>queryLoop</code> is the real "model-tool" loop: <code>while(true)</code> compresses context each round, then calls the model in streaming mode, then decides whether to "finish" or "run tools and go to next round."</li>
-  <li>The bottom layer <code>claude.ts:queryModel</code> is responsible for sending the request into Anthropic SDK's streaming interface, parsing events one by one and accumulating them into an assistant message; <code>withRetry</code> wraps it with retry / fallback / rate-limit backoff.</li>
+  <li>The outer <code>QueryEngine.submitMessage</code> handles "session-level" affairs: assemble system prompt, run user-input preprocessing, convert messages yielded by query() into SDK messages, write transcript, and monitor budget/turn/structured-output retry limits.</li>
+  <li>The inner <code>queryLoop</code> in <code>query.ts</code> is the real "model-tool" loop: a <code>while(true)</code> that compresses context each round, then streams from the model, then decides "wrap up" or "run tools and go to next round."</li>
+  <li>The bottom layer, <code>claude.ts:queryModel</code>, is responsible for sending requests into the Anthropic SDK's streaming interface, parsing events incrementally and accumulating them into an assistant message; <code>withRetry</code> wraps it outside with retry/fallback/rate-limit backoff.</li>
 </ul>
 
-<h2>I. Overall Data Flow: From User Question to Result Message</h2>
+<h2>1. Overall Data Flow: From User Question to result Message</h2>
 
-<p>First, the full chain in one pass. After the user hits Enter, the message enters <code>QueryEngine.submitMessage</code> for session-level preparation (system prompt, user input processing, transcript persistence), then enters the <code>query()</code> loop. Each iteration either ends with "model didn't ask for tools → wrap up and return," or "model asked for tools → execute them → return to the top of the loop with results." After the loop, <code>submitMessage</code> performs a final result check (<code>isResultSuccessful</code>): failure yields <code>error_during_execution</code>, success yields <code>success</code>.</p>
+<p>First, a full-chain overview. After the user hits Enter, the message enters <code>QueryEngine.submitMessage</code> for session-level preparation (system prompt, user-input processing, transcript persistence), then enters the <code>query()</code> loop. Each loop iteration either ends with "model didn't ask for tools → wrap up and return," or "model asked for tools → execute tools → back to top of loop." After the loop, <code>submitMessage</code> does a final result validation (<code>isResultSuccessful</code>): on failure it yields <code>error_during_execution</code>, on success <code>success</code>.</p>
 
 <pre class="mermaid">
 graph TD
   user-prompt["User question / SDK ask()"] --> qe-submit["QueryEngine.submitMessage entry"]
-  qe-submit --> qe-sysprompt["Assemble system prompt + user context&lt;br/&gt;fetchSystemPromptParts"]
-  qe-sysprompt --> qe-process-input["Process user input&lt;br/&gt;processUserInput: slash commands / attachments / skills"]
+  qe-submit --> qe-sysprompt["Assemble system prompt + user context<br/>fetchSystemPromptParts"]
+  qe-sysprompt --> qe-process-input["Process user input<br/>processUserInput: slash commands / attachments / skills"]
   qe-process-input --> should-query{"shouldQuery?"}
-  should-query -->|No, local-only command| qe-local-result["Yield local command output + success result"]
-  should-query -->|Yes| qe-transcript["Write user message to transcript&lt;br/&gt;(so kill-resume works)"]
+  should-query -->|No, pure local command| qe-local-result["Yield local command output + success result"]
+  should-query -->|Yes| qe-transcript["Write user message to transcript<br/>(so kill can resume)"]
   qe-transcript --> qe-enter-loop["Enter query() main loop"]
   qe-enter-loop --> loop-iter["queryLoop iteration"]
   loop-iter --> loop-decision{"Model wants tools?"}
   loop-decision -->|No, wrap up| qe-post["submitMessage wrap-up: isResultSuccessful?"]
-  loop-decision -->|Yes| loop-tools["Execute tools, collect results / attachments"]
+  loop-decision -->|Yes| loop-tools["Execute tools, collect results/attachments"]
   loop-tools --> loop-iter
   qe-post --> qe-success["Yield result: success"]
   qe-post --> qe-ede["Yield result: error_during_execution"]
@@ -50,22 +43,22 @@ graph TD
   qe-ede --> qe-end
 </pre>
 
-<h2>II. QueryEngine.submitMessage: Session-Level Orchestration</h2>
+<h2>2. QueryEngine.submitMessage: Session-Level Orchestration</h2>
 
-<p><code>submitMessage</code> is the entry point called by the SDK/REPL (<code>ask</code> is just a one-shot wrapper around it). It does not call the model directly; instead it owns "all preparation before calling the model" and "all cleanup after." Key design: each <code>QueryEngine</code> instance corresponds to one session, with <code>mutableMessages</code>, <code>totalUsage</code>, and <code>readFileState</code> persisting across turns; <code>submitMessage</code> starts a new turn each time it is called.</p>
+<p><code>submitMessage</code> is the entry point for SDK/REPL calls (<code>ask</code> is just a one-shot wrapper around it). It doesn't call the model directly; instead it owns "all preparation before model call" and "all cleanup after model call." Key design: each <code>QueryEngine</code> instance corresponds to one session, with <code>mutableMessages</code>, <code>totalUsage</code>, and <code>readFileState</code> persisting across turns; <code>submitMessage</code> starts a new turn on each call.</p>
 
-<p>A few points worth noting: ① <code>canUseTool</code> is wrapped here to secretly record permission denials (later packed into the result for SDK reporting). ② User messages are written to transcript before entering the query loop — if the user hits Stop seconds after sending a message and the process is killed, resume can still recover from this message instead of "session not found." ③ After entering the <code>query()</code> <code>for await</code>, every assistant/user/compact_boundary message is pushed to <code>mutableMessages</code> and written to transcript; stream_event is used to accumulate token usage and stop_reason. ④ Each loop step checks budget limits and structured-output retry limits; exceeding them immediately yields the corresponding error result and returns.</p>
+<p>A few points worth noting: ① <code>canUseTool</code> is wrapped here to silently record permission denials (finally stuffed into the result for SDK reporting). ② The user message is written to transcript before entering the query loop—if the user clicks Stop a few seconds after sending and the process is killed, resume can still recover from this message instead of "session not found." ③ After entering the <code>for await</code> of <code>query()</code>, every assistant/user/compact_boundary message is pushed to <code>mutableMessages</code> and written to transcript; stream_event accumulates token usage and stop_reason. ④ Each step of the loop checks budget limits and structured-output retry limits; if exceeded it immediately yields the corresponding error result and returns.</p>
 
 <pre class="mermaid">
 graph TD
-  qe-entry["submitMessage(prompt, options)"] --> qe-wrap-can["Wrap canUseTool&lt;br/&gt;record permission denials"]
+  qe-entry["submitMessage(prompt, options)"] --> qe-wrap-can["Wrap canUseTool<br/>record denials"]
   qe-wrap-can --> qe-model-pick["Determine model + thinking config"]
-  qe-model-pick --> qe-sys["fetchSystemPromptParts&lt;br/&gt;+ memory / coordinator injection"]
+  qe-model-pick --> qe-sys["fetchSystemPromptParts<br/>+ memory/coordinator injection"]
   qe-sys --> qe-ctx["Build processUserInputContext"]
   qe-ctx --> qe-orphan{"Orphaned permissions?"}
   qe-orphan -->|Yes, once| qe-handle-orphan["handleOrphanedPermission"]
   qe-handle-orphan --> qe-process
-  qe-orphan -->|No| qe-process["processUserInput&lt;br/&gt;parse slash commands / attachments"]
+  qe-orphan -->|No| qe-process["processUserInput<br/>parse slash commands / attachments"]
   qe-process --> qe-should{"shouldQuery?"}
   qe-should -->|No| qe-local["Yield local command output + success"]
   qe-should -->|Yes| qe-persist["recordTranscript user message"]
@@ -87,55 +80,55 @@ graph TD
   qe-push-user --> qe-budget
   qe-sys-msg --> qe-budget
   qe-att --> qe-budget
-  qe-loop --> qe-result["Loop ended: isResultSuccessful?"]
-  qe-result -->|Failure| qe-ede2["Yield error_during_execution&lt;br/&gt;errors taken from logs after this turn's watermark"]
-  qe-result -->|Success| qe-success2["Yield success result&lt;br/&gt;with textResult/usage/cost"]
+  qe-loop --> qe-result["Loop end: isResultSuccessful?"]
+  qe-result -->|Failure| qe-ede2["Yield error_during_execution<br/>errors from logs after this turn watermark"]
+  qe-result -->|Success| qe-success2["Yield success result<br/>with textResult/usage/cost"]
 </pre>
 
-<h2>III. query() Main Loop: Model-Tool while(true)</h2>
+<h2>3. query() Main Loop: The Model-Tool while(true)</h2>
 
-<p>This is the heart of the engine. <code>query()</code> is just a thin shell around <code>queryLoop</code>, responsible for marking consumed command UUIDs as completed on normal return. <code>queryLoop</code> is a <code>while(true)</code> that does three things each round: ① compress context (snip → microcompact → context-collapse → autocompact, in order, not mutually exclusive); ② call the model in streaming mode and receive an assistant message; ③ see whether the model asked for tools — if not, take the wrap-up path (including prompt-too-long / overlong-output recovery, stop hooks, token-budget continuation); if yes, run the tools, collect attachments/memory prefetch/skill prefetch, assemble them into messages for the next round, and continue.</p>
+<p>This is the heart of the engine. <code>query()</code> is just a thin shell around <code>queryLoop</code>, responsible for marking consumed command UUIDs as completed on normal return. <code>queryLoop</code> is a <code>while(true)</code> that does three things each round: ① compress context (snip→microcompact→context-collapse→autocompact, in order, none exclusive); ② stream from the model to get an assistant message; ③ see if the model wants tools—if not, take the wrap-up path (including prompt-too-long/overlong-output recovery, stop hooks, token-budget continuation); if yes, run tools, collect attachments/memory prefetch/skill prefetch, assemble them into messages for the next round, and continue.</p>
 
-<p>State is passed between iterations via the <code>state: State</code> object (messages, turnCount, compression tracking, recovery counts, previous round's transition reason). Every <code>continue</code> point explicitly constructs a new <code>State</code> to avoid scattered mutations. A few recovery paths worth remembering: ① <b>Model fallback</b>: if a <code>FallbackTriggeredError</code> is thrown during streaming, switch to fallbackModel and retry the same request, clearing already-generated assistant messages (using tombstones so the UI removes them). ② <b>prompt-too-long</b>: during streaming, the error is "held back" instead of being yielded, and at wrap-up time context-collapse is tried first to drain, then reactive compact; if neither works, the held error is yielded and early-returned (without stop hooks, to avoid infinite loops). ③ <b>max_output_tokens</b>: first try raising max_tokens from the default 8k to 64k for one retry, then try "continuation message" recovery up to 3 times; only if all are exhausted is the held error surfaced. ④ <b>Empty streaming response</b>: if streaming ends without message_start or any content block, throw and fall back to non-streaming.</p>
+<p>State is passed between iterations via a <code>state: State</code> object (messages, turnCount, compression tracking, recovery counts, previous transition reason). Every <code>continue</code> point explicitly writes a new <code>State</code> to avoid scattered assignments. A few recovery paths worth remembering: ① <b>Model fallback</b>: if streaming throws a <code>FallbackTriggeredError</code>, switch to fallbackModel and retry the same request, clearing already-generated assistant messages (using tombstones so the UI removes them). ② <b>prompt-too-long</b>: during streaming the error is "held back" instead of surfacing; at wrap-up time it first tries context-collapse drain, then reactive compact; if neither works it surfaces the error and early returns (without entering stop hooks, to avoid infinite loops). ③ <b>max_output_tokens</b>: first try raising max_tokens from the default 8k to 64k and retry once, then try "continuation message" recovery up to 3 times; only if exhausted does it surface the held-back error. ④ <b>streaming empty response</b>: if streaming ends without message_start or any content block, throw and fall back to non-streaming.</p>
 
 <pre class="mermaid">
 graph TD
   loop-top["while true: take this round's state"] --> loop-prefetch["Start skill/memory prefetch (async)"]
   loop-prefetch --> loop-compact["Compression chain: snip→microcompact→contextCollapse→autocompact"]
-  loop-compact --> loop-block{"Reached blocking limit?&lt;br/&gt;(when autoCompact off)"}
+  loop-compact --> loop-block{"Reached blocking limit?<br/>(when autoCompact off)"}
   loop-block -->|Yes| loop-block-err["Yield prompt-too-long error, return blocking_limit"]
-  loop-block -->|No| loop-callmodel["callModel streaming call&lt;br/&gt;(with fallback retry inner loop)"]
-  loop-callmodel --> loop-stream["Receive assistant message event by event&lt;br/&gt;streaming tools can execute in parallel"]
-  loop-stream --> loop-abort{"Streaming interrupted?"}
-  loop-abort -->|Yes| loop-abort-handle["Fill in tool results / synthetic tool_result&lt;br/&gt;yield interrupt message, return aborted_streaming"]
-  loop-abort -->|No| loop-followup{"needsFollowUp?&lt;br/&gt;(tool_use block appeared)"}
-  loop-followup -->|No, wrap up| loop-recover["Held-error recovery check"]
-  loop-recover --> loop-ptl{"Holding prompt-too-long?"}
+  loop-block -->|No| loop-callmodel["callModel stream<br/>(includes fallback retry inner loop)"]
+  loop-callmodel --> loop-stream["Receive assistant message event by event<br/>streaming tools can execute in parallel"]
+  loop-stream --> loop-abort{"Stream interrupted?"}
+  loop-abort -->|Yes| loop-abort-handle["Pad tool results / synthetic tool_result<br/>yield interruption message, return aborted_streaming"]
+  loop-abort -->|No| loop-followup{"needsFollowUp?<br/>(tool_use block appeared)"}
+  loop-followup -->|No, wrap up| loop-recover["Held-back error recovery check"]
+  loop-recover --> loop-ptl{"Held back prompt-too-long?"}
   loop-ptl -->|Yes| loop-collapse-drain["context-collapse drain retry"]
   loop-collapse-drain --> loop-reactive{"reactive compact?"}
-  loop-ptl -->|No| loop-maxout{"Holding max_output_tokens?"}
-  loop-maxout -->|Yes| loop-escalate["Raise max_tokens to 64k and retry"]
+  loop-ptl -->|No| loop-maxout{"Held back max_output_tokens?"}
+  loop-maxout -->|Yes| loop-escalate["Raise max_tokens to 64k retry"]
   loop-escalate --> loop-resume-msg["Send continuation message retry (max 3)"]
   loop-resume-msg --> loop-surface{"Recovery exhausted?"}
-  loop-surface -->|Yes| loop-yield-err["Yield held error, early return"]
+  loop-surface -->|Yes| loop-yield-err["Yield held-back error, early return"]
   loop-surface -->|No| loop-stop
   loop-reactive -->|Success| loop-compact-retry["Retry this round with compressed messages"]
   loop-reactive -->|Failure| loop-yield-err
-  loop-maxout -->|No| loop-api-err{"Is it an API error?"}
+  loop-maxout -->|No| loop-api-err{"API error?"}
   loop-api-err -->|Yes| loop-fail-hooks["executeStopFailureHooks, return completed"]
   loop-api-err -->|No| loop-stop["handleStopHooks"]
   loop-stop --> loop-stop-block{"Stop hook blocking?"}
   loop-stop-block -->|Yes| loop-stop-retry["Inject blocking error and retry this round"]
   loop-stop-block -->|No| loop-budget{"Token budget continuation?"}
-  loop-budget -->|Yes| loop-budget-cont["Inject nudge continuation and retry"]
+  loop-budget -->|Yes| loop-budget-cont["Inject nudge continuation retry"]
   loop-budget -->|No| loop-done["return completed"]
   loop-followup -->|Yes| loop-tools["Execute remaining tools runTools/getRemainingResults"]
   loop-tools --> loop-abort2{"Interrupted during tool execution?"}
-  loop-abort2 -->|Yes| loop-abort-tools["Yield interrupt, check maxTurns, return aborted_tools"]
+  loop-abort2 -->|Yes| loop-abort-tools["Yield interruption, check maxTurns, return aborted_tools"]
   loop-abort2 -->|No| loop-attach["Collect attachments: queued commands / memory prefetch / skill prefetch"]
   loop-attach --> loop-maxturns{"Over maxTurns?"}
   loop-maxturns -->|Yes| loop-maxturns-yield["Yield max_turns_reached, return"]
-  loop-maxturns -->|No| loop-next["state = next round's messages, continue"]
+  loop-maxturns -->|No| loop-next["state = messages for next round, continue"]
   loop-next --> loop-top
   loop-compact-retry --> loop-top
   loop-stop-retry --> loop-top
@@ -143,17 +136,17 @@ graph TD
   loop-budget-cont --> loop-top
 </pre>
 
-<h2>IV. Streaming Parsing: claude.ts queryModel</h2>
+<h2>4. Stream Parsing: claude.ts queryModel</h2>
 
-<p><code>queryModelWithStreaming</code> calls <code>queryModel</code> after being wrapped by <code>withStreamingVCR</code>. <code>queryModel</code> does two things: ① construct request parameters (model resolution, beta headers, tool schema, tool search filtering, prompt caching, cached microcompact, advisor, task_budget, etc.), and ② use <code>withRetry</code> to obtain a <code>Stream</code>, then <code>for await</code> over it to parse events one by one.</p>
+<p><code>queryModelWithStreaming</code> is wrapped by <code>withStreamingVCR</code> before calling <code>queryModel</code>. <code>queryModel</code> does two things: ① construct request parameters (model parsing, beta headers, tool schema, tool search filtering, prompt caching, cached microcompact, advisor, task_budget, etc.), and ② use <code>withRetry</code> to get a <code>Stream</code>, then <code>for await</code> parse it event by event.</p>
 
-<p>Streaming event handling is state-machine-like: <code>message_start</code> creates partialMessage and initial usage; <code>content_block_start</code> initializes a mutable block by type (text/thinking/tool_use/server_tool_use/advisor_tool_result); <code>content_block_delta</code> increments text/thinking/input_json/signature into the corresponding block; <code>content_block_stop</code> wraps the block into an AssistantMessage and yields it (so one assistant message may be split into multiple yields, one per content block); <code>message_delta</code> writes final usage and stop_reason back into the last yielded message (mutating in place rather than replacing the object, because the transcript write queue still holds the reference), and here it also calculates cost, detects max_tokens/context_window_exceeded, and yields the corresponding errors; <code>message_stop</code> is a no-op.</p>
+<p>Stream event handling is state-machine-like: <code>message_start</code> creates partialMessage and initial usage; <code>content_block_start</code> initializes a mutable block by type (text/thinking/tool_use/server_tool_use/advisor_tool_result); <code>content_block_delta</code> accumulates text/thinking/input_json/signature deltas into the corresponding block; <code>content_block_stop</code> wraps the block into an AssistantMessage and yields it (so one assistant message may be split into multiple yields, one per content block); <code>message_delta</code> writes final usage and stop_reason back into the last yielded message (mutating directly, not replacing the object, because the transcript write queue still holds the reference), and here it calculates cost, detects max_tokens/context_window_exceeded, and yields the corresponding errors; <code>message_stop</code> wraps up.</p>
 
-<p>Robustness has two watchdogs: ① <b>stream idle watchdog</b> — if no chunk is received for N milliseconds (default 90s), proactively abort the stream and fall back to non-streaming; ② <b>stall detection</b> — gaps between chunks over 30s are logged but do not interrupt. After the stream ends, it also validates that "message_start was actually received and at least one content block or stop_reason exists"; otherwise it is treated as the proxy returning an empty response, and an error is thrown to fall back to non-streaming.</p>
+<p>Robustness has two watchdogs: ① <b>stream idle watchdog</b>—if no chunk is received for N milliseconds (default 90s), actively abort the stream and fall back to non-streaming; ② <b>stall detection</b>—if chunk interval exceeds 30s, log but don't interrupt. After the stream ends it also validates "did we actually get message_start and at least one content block or stop_reason"; otherwise it treats it as the proxy returning an empty response, throws, and falls back to non-streaming.</p>
 
 <pre class="mermaid">
 graph TD
-  qm-entry["queryModel(messages, ...)"] --> qm-offswitch{"Off-switch active?&lt;br/&gt;(non-subscriber + Opus)"}
+  qm-entry["queryModel(messages, ...)"] --> qm-offswitch{"off-switch active?<br/>(non-subscriber + Opus)"}
   qm-offswitch -->|Yes| qm-off-err["Yield off-switch error, return"]
   qm-offswitch -->|No| qm-params["Build params: betas/toolSchema/toolSearch/caching/advisor"]
   qm-params --> qm-normalize["normalizeMessagesForAPI"]
@@ -162,11 +155,11 @@ graph TD
   qm-watchdog --> qm-forawait["for await part of stream"]
   qm-forawait --> qm-reset["resetStreamIdleTimer"]
   qm-reset --> qm-switch{"part.type"}
-  qm-switch -->|message_start| qm-ms["partialMessage=part.message&lt;br/&gt;ttftMs/usage"]
+  qm-switch -->|message_start| qm-ms["partialMessage=part.message<br/>ttftMs/usage"]
   qm-switch -->|content_block_start| qm-cbs["Initialize mutable block by type"]
   qm-switch -->|content_block_delta| qm-cbd["Accumulate text/thinking/json/signature"]
-  qm-switch -->|content_block_stop| qm-cbstop["Wrap AssistantMessage and yield"]
-  qm-switch -->|message_delta| qm-md["Write back usage/stop_reason&lt;br/&gt;calculate cost / detect max_tokens"]
+  qm-switch -->|content_block_stop| qm-cbstop["Wrap AssistantMessage yield"]
+  qm-switch -->|message_delta| qm-md["Write back usage/stop_reason<br/>calculate cost / detect max_tokens"]
   qm-switch -->|message_stop| qm-mstop["No-op"]
   qm-ms --> qm-yield-evt["Yield stream_event to upper layer"]
   qm-cbs --> qm-yield-evt
@@ -179,19 +172,19 @@ graph TD
   qm-idle-abort -->|Yes| qm-idle-throw["Throw idle timeout, fall back to non-streaming"]
   qm-idle-abort -->|No| qm-empty{"Empty response?"}
   qm-empty -->|Yes| qm-empty-throw["Throw 'no events', fall back to non-streaming"]
-  qm-empty -->|No| qm-done["Streaming ended normally"]
+  qm-empty -->|No| qm-done["Streaming ends normally"]
   qm-md --> qm-maxtokens{"stop_reason=max_tokens?"}
   qm-maxtokens -->|Yes| qm-maxtokens-err["Yield max_output_tokens error message"]
-  qm-maxtokens -->|No| qm-refusal{"Refusal?"}
+  qm-maxtokens -->|No| qm-refusal{"refusal?"}
   qm-refusal -->|Yes| qm-refusal-err["Yield refusal error"]
   qm-refusal -->|No| qm-yield-evt
 </pre>
 
-<h2>V. Retry and Fallback: withRetry</h2>
+<h2>5. Retry and Fallback: withRetry</h2>
 
-<p><code>withRetry</code> is a request-level retry shell wrapping <code>anthropic.beta.messages.create(stream:true)</code>. Default max 10 retries, with 529 (capacity overload) capped at 3 consecutive. Retry decisions: ① 529 on non-foreground sources is abandoned directly (avoid cascading amplification); ② 529 three times in a row and a fallbackModel is configured throws <code>FallbackTriggeredError</code> for the upper layer to switch models; ③ <code>shouldRetry</code> decides whether the error is retryable (rate limit, gateway 5xx, etc.); ④ max_tokens context-overflow errors call <code>parsetMaxTokensContextOverflowError</code> to compute available space, lowering the next round's max_tokens to continue; ⑤ persistent retry mode uses long backoff for 429/529 (up to 5 minutes, capped at 6 hours), yielding an <code>api_retry</code> system message every 30s so the upper layer/user knows it is waiting.</p>
+<p><code>withRetry</code> is the request-level retry shell wrapped around <code>anthropic.beta.messages.create(stream:true)</code>. Default max 10 retries, 529 (capacity overload) max 3 consecutive. Retry decisions: ① 529 on non-foreground sources is abandoned directly (avoid cascading amplification); ② 529 three times in a row with fallbackModel configured throws <code>FallbackTriggeredError</code> for the upper layer to switch models; ③ <code>shouldRetry</code> decides whether the error is retryable (rate limits, gateway 5xx, etc.); ④ max_tokens context-overflow errors call <code>parseMaxTokensContextOverflowError</code> to compute available space, lower next round's max_tokens, and continue; ⑤ persistent retry mode for 429/529 with long backoff (up to 5 minutes, capped at 6 hours), yielding an <code>api_retry</code> system message every 30s so the upper layer/user knows it's waiting.</p>
 
-<p>Backoff duration prefers the server's <code>retry-after</code> header, otherwise exponential backoff (500ms × 2^n, capped at 32s). Before each retry it yields a <code>SystemAPIErrorMessage</code>, which in <code>QueryEngine.submitMessage</code> is converted into an <code>api_retry</code> SDK message for the frontend. The client instance is re-fetched after auth errors, and stale connections (ECONNRESET/EPIPE) close keep-alive and retry.</p>
+<p>Backoff duration prefers the server's <code>retry-after</code> header, otherwise exponential backoff (500ms × 2^n, capped at 32s). Before each retry it yields a <code>SystemAPIErrorMessage</code>, which <code>QueryEngine.submitMessage</code> converts into an <code>api_retry</code> SDK message to the frontend. The client instance is re-fetched after auth errors; stale connections (ECONNRESET/EPIPE) close keep-alive and retry.</p>
 
 <pre class="mermaid">
 graph TD
@@ -199,44 +192,44 @@ graph TD
   wr-loop --> wr-client["getClient (rebuild after auth error)"]
   wr-client --> wr-op["operation(anthropic, attempt)"]
   wr-op --> wr-ok{"Success?"}
-  wr-ok -->|Yes| wr-return["Return Stream/result"]
+  wr-ok -->|Yes| wr-return["return Stream/result"]
   wr-ok -->|No| wr-err["Catch error"]
   wr-err --> wr-529-bg{"529 and non-foreground?"}
   wr-529-bg -->|Yes| wr-cannot["throw CannotRetryError"]
-  wr-529-bg -->|No| wr-529-count{"529 consecutive ≥3 and fallback exists?"}
+  wr-529-bg -->|No| wr-529-count{"529 consecutive ≥3 and has fallback?"}
   wr-529-count -->|Yes| wr-fallback["throw FallbackTriggeredError"]
   wr-529-count -->|No| wr-retry-able{"shouldRetry?"}
   wr-retry-able -->|No| wr-cannot
   wr-retry-able -->|Yes| wr-overflow{"max_tokens overflow error?"}
   wr-overflow -->|Yes| wr-adjust["Lower maxTokensOverride, continue"]
   wr-overflow -->|No| wr-delay["Compute backoff: retry-after or exponential"]
-  wr-delay --> wr-yield["Yield SystemAPIErrorMessage&lt;br/&gt;(api_retry system message)"]
+  wr-delay --> wr-yield["Yield SystemAPIErrorMessage<br/>(api_retry system message)"]
   wr-yield --> wr-sleep["sleep delayMs (abortable)"]
   wr-sleep --> wr-persistent{"Persistent mode?"}
-  wr-persistent -->|Yes, attempt exhausted| wr-clamp["Clamp attempt back to maxRetries, continue"]
-  wr-persistent -->|No, attempt exhausted| wr-cannot-final["throw CannotRetryError"]
+  wr-persistent -->|Yes, attempt full| wr-clamp["Clamp attempt to maxRetries, continue"]
+  wr-persistent -->|No, attempt full| wr-cannot-final["throw CannotRetryError"]
   wr-clamp --> wr-loop
   wr-adjust --> wr-loop
   wr-sleep --> wr-loop
 </pre>
 
-<h2>VI. Tool Execution Loop</h2>
+<h2>6. Tool Execution Loop</h2>
 
-<p>When the model produces <code>tool_use</code> blocks in the streaming response, <code>queryLoop</code> marks <code>needsFollowUp=true</code>. Tool execution has two paths: ① <b>StreamingToolExecutor</b> — while the model is still streaming, already-determined tool_use blocks are thrown in and run in parallel (only concurrency-safe read-only tools), <code>getCompletedResults</code> yields results as they arrive; after the stream, <code>getRemainingResults</code> cleans up. ② <b>runTools</b> — serial/concurrent batch execution when the streaming executor is closed: <code>partitionToolCalls</code> splits tool calls into batches, concurrency-safe batches use <code>runToolsConcurrently</code>, write batches use <code>runToolsSerially</code>. Each tool result is pushed into toolResults as a user message (with tool_result blocks) and fed back to the model as messages in the next round.</p>
+<p>When the model produces a <code>tool_use</code> block during the streaming response, <code>queryLoop</code> marks <code>needsFollowUp=true</code>. Tool execution has two paths: ① <b>StreamingToolExecutor</b>—while the model is still streaming, already-determined tool_use blocks are thrown in and run in parallel (only concurrency-safe read-only tools); <code>getCompletedResults</code> yields results as they complete during the streaming loop; after the stream, <code>getRemainingResults</code> cleans up. ② <b>runTools</b>—serial/concurrent batch execution when the streaming executor closes: <code>partitionToolCalls</code> splits tools into batches, concurrency-safe batches use <code>runToolsConcurrently</code>, write batches use <code>runToolsSerially</code>. Each tool result is pushed into toolResults as a user message (with tool_result block) and fed back to the model as messages in the next round.</p>
 
-<p>Permissions are enforced here for real: <code>canUseTool</code> (wrapped in submitMessage to record denials) is called and decides allow/deny/ask; denied tools produce a tool_result with <code>tool_use_error</code>, which the model sees next round. Interruption handling: if the abort signal fires during streaming/tool execution, the executor generates synthetic tool_results for queued-but-not-finished tools (avoiding unpaired tool_use without tool_result that would cause API 400).</p>
+<p>Permissions are enforced here for real: <code>canUseTool</code> (wrapped in submitMessage to record denials) is called to decide allow/deny/ask; denied tools produce a tool_result with <code>tool_use_error</code>, which the model sees next round. Interruption handling: if the abort signal fires during streaming/tool execution, the executor generates synthetic tool_results for queued but unfinished tools (avoiding API 400 from unpaired tool_use without tool_result).</p>
 
 <pre class="mermaid">
 graph TD
   te-stream{"Streaming tool execution enabled?"}
   te-stream -->|Yes| te-se["new StreamingToolExecutor"]
-  te-stream -->|No| te-runtools["runTools (serial/batched)"]
-  te-se --> te-add["During streaming: addTool for each tool_use block"]
-  te-add --> te-completed["getCompletedResults: yield as ready"]
-  te-completed --> te-remaining["After stream ends: getRemainingResults"]
+  te-stream -->|No| te-runtools["runTools (serial/batch)"]
+  te-se --> te-add["During stream: addTool for each tool_use block"]
+  te-add --> te-completed["getCompletedResults: yield as completed"]
+  te-completed --> te-remaining["After stream: getRemainingResults"]
   te-runtools --> te-partition["partitionToolCalls into batches"]
   te-partition --> te-batch{"Batch type?"}
-  te-batch -->|Concurrency-safe| te-concurrent["runToolsConcurrently"]
+  te-batch -->|Concurrency safe| te-concurrent["runToolsConcurrently"]
   te-batch -->|Write| te-serial["runToolsSerially"]
   te-concurrent --> te-perm["canUseTool permission check"]
   te-serial --> te-perm
@@ -246,72 +239,72 @@ graph TD
   te-exec --> te-push["toolResults push user message"]
   te-deny --> te-push
   te-remaining --> te-push
-  te-push --> te-abort{"Abort signal?"}
-  te-abort -->|Yes| te-synthetic["Synthetic tool_result fill-in&lt;br/&gt;avoid unpaired tool_use"]
-  te-abort -->|No| te-next["Return to queryLoop for next round"]
+  te-push --> te-abort{"abort signal?"}
+  te-abort -->|Yes| te-synthetic["synthetic tool_result padding<br/>avoid unpaired tool_use"]
+  te-abort -->|No| te-next["Return to queryLoop to assemble next round"]
   te-synthetic --> te-next
 </pre>
 
-<h2>VII. Context Compression Chain</h2>
+<h2>7. Context Compression Chain</h2>
 
-<p>Compression is not a single mechanism but four processes run in fixed order at the top of each loop, not mutually exclusive (tokens freed by an earlier step may make later steps no-ops): ① <b>snip</b> (HISTORY_SNIP feature gate) — removes "zombie" messages and expired markers, used by long SDK sessions to limit memory growth. ② <b>microcompact</b> — replaces large tool_result content (images / long output) by tool_use_id with placeholders, based on time or cached edits; cached MC delays boundary messages until after the API response, using real <code>cache_deleted_input_tokens</code>. ③ <b>context-collapse</b> — folds history paragraphs into granular summaries (read-time projection, originals not deleted), and when overflowing <code>recoverFromOverflow</code> drains already-staged folds. ④ <b>autocompact</b> — threshold-triggered (when context nears the window limit) complete forked-agent summary, compressing a whole segment of history into one summary message + attachments, producing a compact_boundary. autocompact has a circuit breaker: after N consecutive failures it stops retrying.</p>
+<p>Compression is not a single mechanism but four sequential steps run at the top of every loop round, none exclusive (tokens freed by an earlier step may make later steps no-ops): ① <b>snip</b> (HISTORY_SNIP feature gate)—removes "zombie" messages and expired markers; used by long SDK sessions to limit memory growth. ② <b>microcompact</b>—replaces large tool_result content (images/long outputs) with placeholders by tool_use_id, editable by time or cache; cached MC delays boundary messages until after the API response, using real <code>cache_deleted_input_tokens</code>. ③ <b>context-collapse</b>—folds history segments into granular summaries (read-time projection, original messages not deleted); when overflowing, <code>recoverFromOverflow</code> drains already-staged folds. ④ <b>autocompact</b>—threshold-triggered (when context nears the window limit) runs a full forked-agent summary, compressing the whole history into one summary message + attachments, producing a compact_boundary. autocompact has a circuit breaker: after N consecutive failures it stops retrying.</p>
 
-<p>In addition to these four "active" compression methods, there is <b>reactive compact</b> — triggered only when the model's streaming response returns prompt-too-long or media-too-large errors (errors are held during streaming and one reactive compact is attempted at wrap-up). After any successful compression, a post-compact message is yielded (summary + attachments + hook results), and <code>messagesForQuery</code> is replaced with the compressed array; the next round continues from the compressed context. task_budget deducts the final pre-compression context token count during compression.</p>
+<p>Besides these four "proactive" compressions, there's <b>reactive compact</b>—triggered only when the model stream returns prompt-too-long or media-too-large errors (errors are held during streaming, then one compression retry is attempted at wrap-up). After every successful compression, a post-compact message is yielded (summary + attachments + hook results), and <code>messagesForQuery</code> is replaced with the compressed array; the next round continues from the compressed context. task_budget deducts the final pre-compression context token count at compression time.</p>
 
 <pre class="mermaid">
 graph TD
-  compact-entry["Top of each loop iteration"] --> snip{"HISTORY_SNIP?"}
-  snip -->|Yes| snip-run["snipCompactIfNeeded&lt;br/&gt;remove zombie messages / expired markers"]
+  compact-entry["Top of each loop round"] --> snip{"HISTORY_SNIP?"}
+  snip -->|Yes| snip-run["snipCompactIfNeeded<br/>remove zombie messages / expired markers"]
   snip -->|No| mc
-  snip-run --> mc["microcompactMessages&lt;br/&gt;replace large tool_result with placeholder"]
+  snip-run --> mc["microcompactMessages<br/>replace large tool_result with placeholder"]
   mc --> cc{"CONTEXT_COLLAPSE?"}
-  cc -->|Yes| cc-run["applyCollapsesIfNeeded&lt;br/&gt;fold history paragraphs"]
+  cc -->|Yes| cc-run["applyCollapsesIfNeeded<br/>fold history segments"]
   cc -->|No| ac
-  cc-run --> ac["autoCompactIfNeeded&lt;br/&gt;run full summary when over threshold"]
+  cc-run --> ac["autoCompactIfNeeded<br/>run full summary when over threshold"]
   ac --> ac-result{"Compression succeeded?"}
-  ac-result -->|Yes| ac-yield["Yield post-compact message&lt;br/&gt;replace messagesForQuery"]
+  ac-result -->|Yes| ac-yield["Yield post-compact message<br/>replace messagesForQuery"]
   ac-result -->|No, circuit broken| ac-skip["Skip, continue with original messages"]
   ac-result -->|No, retryable| ac-track["Record consecutiveFailures"]
-  ac-yield --> main["Enter main model call"]
+  ac-yield --> main["Enter main model call flow"]
   ac-skip --> main
   ac-track --> main
-  main --> reactive{"Streaming returned PTL/media error?"}
+  main --> reactive{"Stream returned PTL/media error?"}
   reactive -->|Yes| reactive-try["Try reactive compact at wrap-up"]
   reactive-try --> reactive-ok{"Success?"}
   reactive-ok -->|Yes| reactive-retry["Retry this round with compressed messages"]
-  reactive-ok -->|No| reactive-surface["Yield held error, early return"]
+  reactive-ok -->|No| reactive-surface["Yield held-back error, early return"]
   reactive -->|No| done["Normal wrap-up"]
 </pre>
 
-<h2>VIII. Token / Cost Counting</h2>
+<h2>8. Token / Cost Counting</h2>
 
-<p>Token and cost accumulation happens in the <code>message_delta</code> branch of <code>claude.ts:queryModel</code>: each time a message_delta with usage is received, first <code>updateUsage</code> accumulates this message's usage, then <code>calculateUSDCost</code> computes this message's USD cost, then <code>addToTotalSessionCost</code> adds it to the session ledger. <code>QueryEngine.submitMessage</code> calls <code>updateUsage</code> / <code>accumulateUsage</code> on message_start/message_delta/message_stop stream_events, accumulating each message's usage into <code>totalUsage</code>, which ends up in the result message. <code>cost-tracker.ts</code> maintains per-model usage (input/output/cacheRead/cacheCreation/webSearch/costUSD) and exposes <code>getTotalCost</code> / <code>getModelUsage</code> for results and budget checks.</p>
+<p>Token and cost accumulation happens in <code>claude.ts:queryModel</code>'s <code>message_delta</code> branch: each time a message_delta with usage arrives, <code>updateUsage</code> accumulates this message's usage, then <code>calculateUSDCost</code> computes the USD cost for this message, and <code>addToTotalSessionCost</code> adds it to the session ledger. <code>QueryEngine.submitMessage</code> calls <code>updateUsage</code> / <code>accumulateUsage</code> on stream_event message_start/message_delta/message_stop, accumulating each message's usage into <code>totalUsage</code> and finally stuffing it into the result message. <code>cost-tracker.ts</code> maintains per-model usage (input/output/cacheRead/cacheCreation/webSearch/costUSD) and exposes <code>getTotalCost</code> / <code>getModelUsage</code> for result and budget checking.</p>
 
-<p>Token estimation (<code>tokenEstimation.ts</code>) is used for compression threshold decisions and blocking-limit checks: without calling the API, <code>roughTokenCountEstimationForMessages</code> produces a rough estimate (by bytes/type conversion), and both autocompact's <code>shouldAutoCompact</code> and the blocking limit check at the top of queryLoop rely on it. Note: tokens freed by snip must be explicitly subtracted from the estimate (<code>snipTokensFreed</code>); otherwise snip may have already compressed context below the threshold, but stale usage still shows above threshold, causing a false blocking trigger.</p>
+<p>Token estimation (<code>tokenEstimation.ts</code>) is used for compression threshold decisions and blocking-limit checks: without calling the API, <code>roughTokenCountEstimationForMessages</code> gives a rough estimate (by bytes/type conversion); autocompact's <code>shouldAutoCompact</code> and the blocking limit check at the top of queryLoop rely on it. Note: tokens freed by snip must be explicitly subtracted from the estimate (<code>snipTokensFreed</code>); otherwise snip may have already pushed context below the threshold, but stale usage still shows above threshold, falsely triggering blocking.</p>
 
 <pre class="mermaid">
 graph TD
-  md["claude.ts: message_delta event"] --> upd-usage["updateUsage accumulates this message's usage"]
+  md["claude.ts: message_delta event"] --> upd-usage["updateUsage accumulate this message usage"]
   upd-usage --> calc-cost["calculateUSDCost(model, usage)"]
-  calc-cost --> add-cost["addToTotalSessionCost&lt;br/&gt;accumulate in cost-tracker by model"]
-  add-cost --> adv-usage["Advisor usage also recursively counted"]
+  calc-cost --> add-cost["addToTotalSessionCost<br/>accumulate by model in cost-tracker"]
+  add-cost --> adv-usage["advisor usage also recursively counted"]
   qe-start["QueryEngine: message_start/delta/stop"] --> qe-upd["updateUsage/accumulateUsage"]
   qe-upd --> qe-total["totalUsage accumulated"]
   qe-total --> result["result message: usage + total_cost_usd + modelUsage"]
-  add-cost --> budget-check["queryLoop: budget check&lt;br/&gt;getTotalCost &gt;= maxBudgetUsd?"]
+  add-cost --> budget-check["queryLoop: budget check<br/>getTotalCost >= maxBudgetUsd?"]
   budget-check -->|Over| budget-err["Yield error_max_budget_usd"]
-  te-est["tokenEstimation: rough token estimate for messages"] --> ac-threshold["autocompact threshold decision"]
-  te-est --> block-check["blocking limit check&lt;br/&gt;(when autoCompact off)"]
+  te-est["tokenEstimation: rough messages token"] --> ac-threshold["autocompact threshold decision"]
+  te-est --> block-check["blocking limit check<br/>(when autoCompact off)"]
   snip-freed["snipTokensFreed"] --> ac-threshold
   snip-freed --> block-check
 </pre>
 
 <ul>
-  <li><b>State machine view</b>: queryLoop's <code>state.transition.reason</code> (next_turn / collapse_drain_retry / reactive_compact_retry / max_output_tokens_escalate / max_output_tokens_recovery / stop_hook_blocking / token_budget_continuation) is an implicit state machine — every continue point carries a reason, making it easy for tests to assert "which recovery path was triggered."</li>
-  <li><b>Permission view</b>: canUseTool is wrapped in submitMessage to record denials; it is called during tool execution; deny does not throw but produces a tool_use_error for the model to see; permission context (allowedTools, additionalWorkingDirectories) is updated into AppState after user input processing.</li>
-  <li><b>Lifecycle view</b>: QueryEngine is one instance per session, state persists across turns; submitMessage is once per turn; queryLoop is one state per round; withRetry is multiple attempts per request; streaming is one stream per request. The abort signal (abortController) runs through every layer, each with its own abort handling (stream fills synthetic results, tools fill synthetic results, stop hooks are skipped).</li>
-  <li><b>Transcript persistence</b>: user messages are written to transcript before entering query (so kill-resume doesn't fail); assistant messages are written fire-and-forget (to avoid blocking message_delta); compact_boundary flushes first to preserve the tail of the retained segment; result is force-flushed before yield in cowork/eager modes.</li>
-  <li><b>Non-streaming fallback</b>: streaming empty response, idle timeout, proxy returning non-SSE body, etc., all trigger <code>executeNonStreamingRequest</code> — using <code>messages.create(stream:false)</code> to retry, default timeout 300s (120s for remote), then the result goes through the same usage/cost accumulation path.</li>
+  <li><b>State-machine perspective</b>: queryLoop's <code>state.transition.reason</code> (next_turn / collapse_drain_retry / reactive_compact_retry / max_output_tokens_escalate / max_output_tokens_recovery / stop_hook_blocking / token_budget_continuation) is an implicit state machine—every continue point carries a reason, making test assertions like "which recovery path was triggered" easy.</li>
+  <li><b>Permission perspective</b>: canUseTool is wrapped in submitMessage to record denials; it's called during tool execution; deny doesn't throw but produces tool_use_error for the model to see; permission context (allowedTools, additionalWorkingDirectories) is updated into AppState after user-input processing.</li>
+  <li><b>Lifecycle perspective</b>: one QueryEngine instance per session, state persists across turns; submitMessage once per turn; queryLoop one state per round; withRetry multiple attempts per request; streaming one stream per request. The abort signal threads through all layers, each with its own abort handling (pad synthetic results for streaming, pad synthetic results for tools, skip stop hooks).</li>
+  <li><b>Transcript persistence</b>: user message is written to transcript before entering query (preventing resume failure after kill); assistant messages are written fire-and-forget (avoid blocking message_delta); compact_boundary flushes the retained segment tail first; result yields force flush in cowork/eager modes.</li>
+  <li><b>Non-streaming fallback</b>: streaming empty response, idle timeout, proxy returning non-SSE body, etc. all trigger <code>executeNonStreamingRequest</code>—using <code>messages.create(stream:false)</code> with default 300s timeout (120s remote), then feeding the result through the same usage/cost accumulation path.</li>
 </ul>
 
 <script>
@@ -496,5 +489,4 @@ window.__sourceMap = {
 <aside id="source-panel"><div id="source-header"></div><div id="monaco-container"></div></aside>
 <script src="../assets/codeindex-runtime.js"></script>
 <script src="../assets/codeindex.js"></script>
-</body>
-</html>
+</body></html>

@@ -1,25 +1,18 @@
 <!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>CLI Startup and Session Initialization</title>
-<link rel="stylesheet" href="../assets/codeindex.css">
-</head>
-<body>
-<nav class="topnav"><a href="../index.html">← Back to overview</a></nav>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>CLI Startup and Session Initialization</title><link rel="stylesheet" href="../assets/codeindex.css"></head><body>
+<nav class="topnav"><a href="../index.html">← Back to Overview</a></nav>
 <h1>CLI Startup and Session Initialization</h1>
 
-<p>This module covers what happens inside the program between the moment the user types <code>claude</code> and hits Enter in the terminal, and the moment an interactive REPL input box appears on screen. The core goal of the entire chain is to "enter the conversation state quickly and reliably" — speed comes from lots of parallel prefetching and fast-path early returns that avoid loading the whole CLI; reliability comes from a series of gates like trust dialogs, permission sandbox checks, and configuration error handling. From a data-flow perspective, the input is the command line typed by the user (argv), and the output is either a running interactive REPL process or a one-off headless result printed before exit.</p>
+<p>This module covers: after the user types <code>claude</code> in a terminal and hits Enter, before the interactive REPL prompt appears on screen, what path does the program actually take internally? The core goal of the entire chain is to "enter the conversation state quickly and reliably"—quick means lots of parallel prefetching and fast-path early returns to avoid loading the whole CLI unnecessarily; reliable means checkpoints like the trust dialog, permission sandbox validation, and configuration error handling. From a data-flow perspective, the input is the command line the user typed (argv), and the output is either a running interactive REPL process or a one-off headless result printed before exit.</p>
 
 <dl>
   <dt>Input</dt>
-  <dd>The <code>claude</code> command the user typed in the terminal plus any trailing arguments (subcommands, flags, prompt text, stdin piped content)</dd>
+  <dd>The <code>claude</code> command the user typed in a terminal plus any following arguments (subcommands, flags, prompt text, stdin piped content)</dd>
   <dt>Output</dt>
-  <dd>A ready interactive REPL (screen rendered, context assembled, permission mode determined), or a one-off print-and-exit result (<code>--print</code> mode)</dd>
+  <dd>A ready interactive REPL (screen rendered, context assembled, permission mode determined), or a one-off print-then-exit result (<code>--print</code> mode)</dd>
 </dl>
 
-<p>The whole chain is roughly divided into four segments, each expanded in a diagram below. The first segment is the "fast-path dispatch" in the entry file <code>cli.tsx</code> — it acts like a gatekeeper, recognizing a set of special invocations that don't need the full CLI loaded and handling them directly.</p>
+<p>The whole chain is roughly divided into four stages, shown in the four diagrams below. The first stage is the entry file <code>cli.tsx</code>'s "fast-path dispatch"—it acts like a gatekeeper, recognizing a set of special invocation patterns that don't require loading the full CLI and handling them directly.</p>
 
 <pre class="mermaid">
 graph TD
@@ -30,50 +23,50 @@ graph TD
   version-check -->|Yes| print-version["Print MACRO.VERSION then return"]
   version-check -->|No| load-profiler["Dynamic import startupProfiler, mark cli_entry"]
   load-profiler --> dump-check{"--dump-system-prompt?"}
-  dump-check -->|Yes| dump-prompt["Render system prompt and print, then return"]
+  dump-check -->|Yes| dump-prompt["Render system prompt and print then return"]
   dump-check -->|No| chrome-check{"--claude-in-chrome-mcp / --chrome-native-host?"}
-  chrome-check -->|Yes| chrome-path["Run Chrome integration MCP/NativeHost, then return"]
+  chrome-check -->|Yes| chrome-path["Run Chrome integration MCP/NativeHost then return"]
   chrome-check -->|No| daemon-worker-check{"--daemon-worker?"}
-  daemon-worker-check -->|Yes| daemon-worker-path["Run runDaemonWorker, then return"]
+  daemon-worker-check -->|Yes| daemon-worker-path["Run runDaemonWorker then return"]
   daemon-worker-check -->|No| bridge-check{"remote-control/rc/remote/sync/bridge?"}
-  bridge-check -->|Yes| bridge-path["enableConfigs→auth→GrowthBook→version→policy→bridgeMain, then return"]
+  bridge-check -->|Yes| bridge-path["enableConfigs→auth→GrowthBook→version→policy→bridgeMain then return"]
   bridge-check -->|No| daemon-cmd-check{"daemon subcommand?"}
-  daemon-cmd-check -->|Yes| daemon-cmd-path["enableConfigs+initSinks→daemonMain, then return"]
+  daemon-cmd-check -->|Yes| daemon-cmd-path["enableConfigs+initSinks→daemonMain then return"]
   daemon-cmd-check -->|No| bg-check{"ps/logs/attach/kill/--bg?"}
-  bg-check -->|Yes| bg-path["enableConfigs→bg handlers, then return"]
+  bg-check -->|Yes| bg-path["enableConfigs→bg handlers then return"]
   bg-check -->|No| templates-check{"new/list/reply?"}
   templates-check -->|Yes| templates-path["templatesMain then process.exit(0)"]
   templates-check -->|No| runner-check{"environment-runner / self-hosted-runner?"}
-  runner-check -->|Yes| runner-path["Corresponding runner main, then return"]
+  runner-check -->|Yes| runner-path["Corresponding runner main then return"]
   runner-check -->|No| tmux-wt-check{"--tmux + --worktree?"}
   tmux-wt-check -->|Yes| tmux-wt-path["enableConfigs→isWorktreeModeEnabled→execIntoTmuxWorktree"]
   tmux-wt-path --> tmux-result{"Handled?"}
   tmux-result -->|Yes| tmux-return["return"]
-  tmux-result -->|No, with error| tmux-error["exitWithError"]
+  tmux-result -->|No, has error| tmux-error["exitWithError"]
   tmux-wt-check -->|No| update-redirect{"Only --update/--upgrade?"}
-  update-redirect -->|Yes| rewrite-argv["Rewrite argv as update subcommand, fall through"]
+  update-redirect -->|Yes| rewrite-argv["Rewrite argv as update subcommand, fall to next stage"]
   update-redirect -->|No| bare-flag{"Contains --bare?"}
   bare-flag -->|Yes| set-simple["Set CLAUDE_CODE_SIMPLE=1"]
   bare-flag -->|No| load-full-cli["Load full CLI"]
   set-simple --> load-full-cli
   load-full-cli --> early-input["startCapturingEarlyInput + mark"]
   early-input --> import-main["Dynamic import main from ../main.js"]
-  import-main --> call-cli-main["await cliMain(), mark end"]
+  import-main --> call-cli-main["await cliMain() mark end"]
 </pre>
 
-<p>In the diagram above, every "Yes" branch is an "early return," meaning the corresponding scenario never loads the bulky <code>main.tsx</code>; that is the key design for startup speed — for example, <code>--version</code> doesn't even require a dynamic import. Only when all fast paths miss does execution fall through to the bottom, loading the full CLI and calling <code>main()</code>. Note that <code>--update/--upgrade</code> gets rewritten into the <code>update</code> subcommand and continues downward (rather than returning directly).</p>
+<p>In the diagram above, every "Yes" branch is an "early return"—meaning the corresponding scenario never loads the huge <code>main.tsx</code>; this is the key design for startup speed. For example, <code>--version</code> doesn't even need a dynamic import. Only when none of the fast paths match does it fall through to the bottom, load the full CLI, and call <code>main()</code>. Note that <code>--update/--upgrade</code> is rewritten as the <code>update</code> subcommand and continues downward (rather than returning directly).</p>
 
-<p>The second segment enters <code>main()</code> and <code>run()</code> in <code>main.tsx</code>: <code>main()</code> performs a batch of security and state initialization that must happen before any code runs, and strips special invocation forms (<code>cc://</code> URLs, <code>ssh</code>, <code>assistant</code>) from argv and stashes them in a global pending object for the default action handler to take over later; <code>run()</code> builds the commander program and registers a <code>preAction</code> hook — this hook runs before any command actually executes, and is responsible for centralizing config system setup, MDM/keychain prefetching, init(), log sinks, migrations, remote settings, and other "common initialization."</p>
+<p>The second stage enters <code>main.tsx</code>'s <code>main()</code> and <code>run()</code>: <code>main()</code> does a batch of safety and state initializations that "must happen before any code runs," and strips special invocation forms (<code>cc://</code> URLs, <code>ssh</code>, <code>assistant</code>) from argv into a global pending object for the default action handler to take over later; <code>run()</code> builds the commander program and registers a <code>preAction</code> hook—this hook runs before any command actually executes, responsible for centralizing "common initialization" like config system, MDM/keychain prefetch, init(), log sinks, migrations, remote settings, etc.</p>
 
 <pre class="mermaid">
 graph TD
   cli-main-called["cliMain() called"] --> security-env["Set NoDefaultCurrentDirectoryInExePath to prevent PATH hijacking"]
   security-env --> warn-handler["Attach warning handler + exit/SIGINT handling"]
   warn-handler --> cc-url-check{"argv contains cc:// or cc+unix://?"}
-  cc-url-check -->|Yes| cc-rewrite["Rewrite argv: headless goes through open subcommand, interactive strips URL into _pendingConnect"]
+  cc-url-check -->|Yes| cc-rewrite["Rewrite argv: headless goes to open subcommand, interactive strips URL into _pendingConnect"]
   cc-url-check -->|No| uri-check{"--handle-uri / macOS URL scheme?"}
   cc-rewrite --> uri-check
-  uri-check -->|Yes| uri-path["enableConfigs→process deep link URI→process.exit"]
+  uri-check -->|Yes| uri-path["enableConfigs→handle deep link URI→process.exit"]
   uri-check -->|No| assistant-check{"argv[0]===assistant?"}
   assistant-check -->|Yes| assistant-stash["Strip and stash into _pendingAssistantChat"]
   assistant-check -->|No| ssh-check{"argv[0]===ssh?"}
@@ -82,7 +75,7 @@ graph TD
   ssh-check -->|No| mode-detect["Determine isNonInteractive: -p/--init-only/--sdk-url/!TTY"]
   ssh-extract --> mode-detect
   mode-detect --> set-state["setIsInteractive + initializeEntrypoint + clientType determination"]
-  set-state --> eager-settings["eagerLoadSettings: early parse --settings/--setting-sources"]
+  set-state --> eager-settings["eagerLoadSettings: pre-parse --settings/--setting-sources"]
   eager-settings --> call-run["await run()"]
   call-run --> build-program["Build commander program + createSortedHelpConfig"]
   build-program --> hook-preaction["Register preAction hook"]
@@ -102,24 +95,24 @@ graph TD
   settings-sync --> action-handler["Enter default .action handler"]
 </pre>
 
-<p>Note that <code>init()</code> (in <code>entrypoints/init.ts</code>, memoized to run once) is where the config system is actually "opened": it calls <code>enableConfigs()</code>, applies "safe" environment variables (the subset before trust dialog), applies extra CA certificates, hooks graceful shutdown, initializes 1P event logging and GrowthBook, configures mTLS/global HTTP agent, preconnects to Anthropic API, CCR upstream proxy, JetBrains/GitHub repo detection, etc. Config parse errors are handled differently for interactive vs non-interactive modes (dialog or stderr exit). After <code>preAction</code>, execution enters the specific command's action handler.</p>
+<p>Note that <code>init()</code> (in <code>entrypoints/init.ts</code>, memoized to run once) is the real place where the "config system opens": it calls <code>enableConfigs()</code>, applies "safety" environment variables (a subset before the trust dialog), applies extra CA certificates, attaches graceful shutdown, initializes 1P event logging and GrowthBook, configures mTLS/global HTTP agent, preconnects Anthropic API, CCR upstreamproxy, JetBrains/GitHub repo detection, etc. Config parse errors are handled differently for interactive vs non-interactive (dialog or stderr exit). Only after <code>preAction</code> does it enter the specific command's action handler.</p>
 
-<p>The third segment is the first half of the default action handler — this segment deconstructs user options, performs a pile of validations, kicks off several prefetches in parallel, and then calls <code>setup()</code> to lay the runtime foundation for working directory/session memory/git/worktree. This segment is the densest area of startup optimization: lots of IO is parallelized or deferred until after the first frame.</p>
+<p>The third stage is the first half of the default action handler—this stage deconstructs user options, performs a pile of validations, starts several prefetches in parallel, then calls <code>setup()</code> to lay the runtime foundation of working directory/session memory/git/worktree. This is the most startup-optimization-dense region: much IO is parallelized or deferred until after the first frame.</p>
 
 <pre class="mermaid">
 graph TD
-  action-start["action handler starts"] --> bare-set{"--bare?"}
+  action-start["action handler begins"] --> bare-set{"--bare?"}
   bare-set -->|Yes| set-simple2["Set CLAUDE_CODE_SIMPLE=1"]
-  bare-set -->|No| prompt-tidy["Tidy prompt (code treated as empty, words logged as events)"]
+  bare-set -->|No| prompt-tidy["Clean prompt (code treated as empty, word count event)"]
   set-simple2 --> prompt-tidy
-  prompt-tidy --> kairos-check{"assistant mode + directory already trusted?"}
+  prompt-tidy --> kairos-check{"Assistant mode + directory already trusted?"}
   kairos-check -->|Yes| kairos-on["Set brief/kairosActive + initializeAssistantTeam"]
   kairos-check -->|No| destructure-opts["Destructure debug/print/model/worktree etc. options"]
   kairos-on --> destructure-opts
   destructure-opts --> wt-validate{"--tmux but no --worktree / Windows / tmux not installed?"}
   wt-validate -->|Any true| wt-error["stderr error + process.exit(1)"]
-  wt-validate -->|No| teammate-opts["Extract teammate identity options, validate all three pieces present"]
-  teammate-opts --> session-id-validate{"--session-id invalid / already exists?"}
+  wt-validate -->|No| teammate-opts["Extract teammate identity options, validate all three required"]
+  teammate-opts --> session-id-validate{"--session-id invalid/already exists?"}
   session-id-validate -->|Yes| sid-error["Error + exit(1)"]
   session-id-validate -->|No| file-download{"--file specified?"}
   file-download -->|Yes, no token| file-error["Error exit(1)"]
@@ -127,44 +120,44 @@ graph TD
   file-download -->|Yes, has token| file-download-promise["Start downloadSessionFiles (non-blocking, awaited before render)"]
   file-download-promise --> fallback-validate
   fallback-validate -->|Same| fb-error["Error exit(1)"]
-  fallback-validate -->|Different| sysprompt-opts["Process --system-prompt[-file] / --append-system-prompt[-file]"]
+  fallback-validate -->|Different| sysprompt-opts["Handle --system-prompt[-file] / --append-system-prompt[-file]"]
   sysprompt-opts --> sp-error{"File doesn't exist / mutually exclusive?"}
   sp-error -->|Yes| sp-error-exit["Error exit(1)"]
   sp-error -->|No| perm-mode["initialPermissionModeFromCLI determines permissionMode + notify"]
-  perm-mode --> mcp-parse["Parse --mcp-config (JSON string / file path) and merge into dynamicMcpConfig"]
+  perm-mode --> mcp-parse["Parse --mcp-config (JSON string / file path) merge dynamicMcpConfig"]
   mcp-parse --> claudeai-mcp["Non-interactive and non-strict/enterprise/bare: prefetch claude.ai MCP config and filter by policy"]
   claudeai-mcp --> local-mcp["Start local MCP config loading promise (file read only)"]
-  local-mcp --> format-validate["Validate input/output format combinations + sdkUrl/replay/partial constraints"]
-  format-validate --> fmt-error{"Combination invalid?"}
+  local-mcp --> format-validate["Validate input/output format combos + sdkUrl/replay/partial constraints"]
+  format-validate --> fmt-error{"Combo invalid?"}
   fmt-error -->|Yes| fmt-error-exit["Error exit(1)"]
   fmt-error -->|No| get-input-prompt["getInputPrompt: read stdin pipe (3s timeout warning)"]
-  get-input-prompt --> load-tools["getTools + optional coordinator filter + SyntheticOutput tool"]
-  load-tools --> kick-setup["In parallel: setup() and getCommands/getAgentDefs"]
-  kick-setup --> setup-run["setup(): setCwd→hooks snapshot→worktree→background jobs→prefetch→bypass sandbox check"]
+  get-input-prompt --> load-tools["getTools + optional coordinator filtering + SyntheticOutput tool"]
+  load-tools --> kick-setup["Parallel: setup() and getCommands/getAgentDefs"]
+  kick-setup --> setup-run["setup(): setCwd→hooks snapshot→worktree→background jobs→prefetch→bypass sandbox validation"]
   setup-run --> setup-done["setup() complete"]
   setup-done --> apply-env-print{"Non-interactive?"}
   apply-env-print -->|Yes| apply-env-full["applyConfigEnvironmentVariables + prefetch git/user/model"]
   apply-env-print -->|No| await-commands["await getCommands + merge agentDefs"]
   apply-env-full --> await-commands
-  await-commands --> agent-resolve["Resolve main-thread agent + merge CLI agents + effectiveModel"]
-  agent-resolve --> next-stage["Enter back segment (trust screen / branches)"]
+  await-commands --> agent-resolve["Resolve main thread agent + merge CLI agents + effectiveModel"]
+  agent-resolve --> next-stage["Enter later stage (trust screen / branch)"]
 </pre>
 
-<p>There is a key parallel design here: <code>setup()</code> (<code>src/setup.ts</code>) and <code>getCommands()/getAgentDefinitionsWithOverrides()</code> are kicked off at the same time — because <code>setup()</code> is mostly UDS socket binding (~20ms) and doesn't compete for disk IO, while command reading is file IO, so they naturally overlap. However, <code>--worktree</code> makes <code>setup()</code> call <code>process.chdir()</code>, so in that case commands must wait until chdir completes; they are gated to null and re-fetched after setup. Inside <code>setup()</code> there are a few gates worth knowing: bypassPermissions mode validates "must not run as root/sudo, must be inside an offline Docker/sandbox" (otherwise exit); the <code>tengu_started</code> event is emitted immediately after sinks are attached (the earliest reliable "process has started" signal for publishing health monitoring).</p>
+<p>A key parallel design here: <code>setup()</code> (<code>src/setup.ts</code>) and <code>getCommands()/getAgentDefinitionsWithOverrides()</code> are kicked off simultaneously—because <code>setup()</code> is mainly UDS socket binding (~20ms) and doesn't contend for disk IO, while commands reading is file IO, so they naturally overlap. But <code>--worktree</code> makes <code>setup()</code> call <code>process.chdir()</code>, so in that case commands must wait for chdir to complete before reading; they're therefore gated to null and re-fetched after setup completes. Inside <code>setup()</code> there are a few checkpoints worth knowing: bypassPermissions mode validates "must not run as root/sudo, must be in a networkless Docker/sandbox" (otherwise exit); the <code>tengu_started</code> event fires immediately after sinks are attached (the earliest reliable "process has started" signal for publishing health monitoring).</p>
 
-<p>The fourth segment is the second half of the action handler — it decides which final branch the process takes. In interactive mode it first runs <code>showSetupScreens()</code> (trust dialog/OAuth login/onboarding/resume picker); only after trust is established does it initialize LSP, run startup prefetches, parse MCP config, and initialize versioned plugins. Then, based on <code>--init-only</code>, <code>--print</code>, <code>options.continue</code>, <code>_pendingConnect/_pendingSSH/_pendingAssistantChat</code>, <code>options.resume</code>, etc., it branches to different exits. All interactive exits eventually converge on <code>launchRepl()</code>.</p>
+<p>The fourth stage is the second half of the action handler—deciding the process's final branch. In interactive mode it first runs <code>showSetupScreens()</code> (trust dialog/OAuth login/onboarding/resume selector); only after trust is established does it initialize LSP, run startup prefetches, parse MCP config, and initialize versioned plugins. Then based on <code>--init-only</code>, <code>--print</code>, <code>options.continue</code>, <code>_pendingConnect/_pendingSSH/_pendingAssistantChat</code>, <code>options.resume</code>, etc., it branches to different exits. All interactive exits eventually converge on <code>launchRepl()</code>.</p>
 
 <pre class="mermaid">
 graph TD
-  next-stage["Enter back segment"] --> ink-root{"Interactive mode?"}
-  ink-root -->|Yes| create-root["createRoot(Ink) + record startup timing event"]
+  next-stage["Enter later stage"] --> ink-root{"Interactive mode?"}
+  ink-root -->|Yes| create-root["createRoot(Ink) + record startup timer event"]
   ink-root -->|No, already print path| skip-screens["Skip trust screens (trust implicit)"]
   create-root --> show-screens["showSetupScreens: trust/OAuth/onboarding/resume picker"]
-  show-screens --> trust-rejected{"process exitCode already set (trust rejected)?"}
-  trust-rejected -->|Yes| skip-rest["Skip subsequent init and return directly"]
+  show-screens --> trust-rejected{"process.exitCode already set (trust rejected)?"}
+  trust-rejected -->|Yes| skip-rest["Skip subsequent initialization and return directly"]
   trust-rejected -->|No| rc-gate{"--remote-control/--rc?"}
   rc-gate -->|Yes| rc-resolve["getBridgeDisabledReason decides remoteControl switch"]
-  rc-gate -->|No| lsp-init["initializeLspServerManager (after trust, to prevent plugin LSP from running in untrusted dirs)"]
+  rc-gate -->|No| lsp-init["initializeLspServerManager (after trust, to prevent plugin LSP running in untrusted dirs)"]
   rc-resolve --> lsp-init
   lsp-init --> settings-errors{"Non-interactive and settings has non-MCP errors?"}
   settings-errors -->|Yes| settings-dialog["launchInvalidSettingsDialog"]
@@ -173,7 +166,7 @@ graph TD
   startup-prefetch --> await-mcp["await mcpConfigPromise + split SDK/regular config"]
   await-mcp --> plugin-init["Versioned plugin init (interactive fire-and-forget, non-interactive await)"]
   plugin-init --> init-only-check{"--init-only?"}
-  init-only-check -->|Yes| init-only-path["applyConfigEnv + run Setup+SessionStart hooks synchronously + gracefulShutdownSync(0) + return"]
+  init-only-check -->|Yes| init-only-path["applyConfigEnv + sync run Setup+SessionStart hooks + gracefulShutdownSync(0) + return"]
   init-only-check -->|No| print-check{"Non-interactive (--print)?"}
   print-check -->|Yes| print-path["Build headlessStore + async validate bypass/auto + dynamic import print.ts + void runHeadless(...) + return"]
   print-check -->|No| build-session-config["Build sessionConfig + resumeContext"]
@@ -182,9 +175,9 @@ graph TD
   branch-continue -->|No| branch-connect{"_pendingConnect.url(cc://)?"}
   branch-connect -->|Yes| connect-path["createDirectConnectSession→launchRepl(directConnectConfig)"]
   branch-connect -->|No| branch-ssh{"_pendingSSH.host?"}
-  branch-ssh -->|Yes| ssh-path["createSSHSession (or local)→setCwd→launchRepl(SSHSession)"]
+  branch-ssh -->|Yes| ssh-path["createSSHSession(or local)→setCwd→launchRepl(SSHSession)"]
   branch-ssh -->|No| branch-assistant{"_pendingAssistantChat?"}
-  branch-assistant -->|Yes| assistant-path["discoverAssistantSessions→(install wizard if none / single-select / multi-select)→auth→launchRepl"]
+  branch-assistant -->|Yes| assistant-path["discoverAssistantSessions→(if none install wizard/single-select/multi-select)→auth→launchRepl"]
   branch-assistant -->|No| branch-resume{"options.resume?"}
   branch-resume -->|Yes| resume-path["loadConversationForResume→processResumedConversation→launchRepl"]
   branch-resume -->|No| default-path["Assemble hookMessages/deepLinkBanner→launchRepl(default new session)"]
@@ -195,20 +188,20 @@ graph TD
   resume-path --> repl-render
   default-path --> repl-render
   repl-render["launchRepl: dynamic import App+REPL, renderAndRun render"]
-  print-path --> print-exit["Process exits after runHeadless finishes"]
+  print-path --> print-exit["runHeadless exits after completion"]
   init-only-path --> init-exit["Process exits"]
 </pre>
 
-<p>A few details worth knowing for newcomers: <code>--init-only</code> is a hidden switch that "only runs Setup + SessionStart:startup hooks then exits," used for environment initialization scripts; <code>--print</code> mode trust is implicit (the help text states "use only in trusted directories"), so it skips the trust screen but runs <code>applyConfigEnvironmentVariables</code> to apply the full (potentially dangerous) environment variables; in interactive mode, once the trust screen is rejected, <code>process.exitCode</code> is set and all subsequent steps that might trigger code execution (including apiKeyHelper) are skipped, to prevent plugin code from running in an untrusted directory. <code>launchRepl</code> (<code>src/replLauncher.tsx</code>) itself is very thin — it dynamically imports <code>App</code> and <code>REPL</code> components and hands them to <code>renderAndRun</code> for rendering; the real REPL logic lives in <code>screens/REPL</code>, outside the scope of this module.</p>
+<p>A few details worth knowing for newcomers: <code>--init-only</code> is a hidden "run only Setup + SessionStart:startup hooks then exit" switch, used for environment initialization scripts; <code>--print</code> mode trust is implicit (the help text also states "use only in trusted directories"), so it skips trust screens but does <code>applyConfigEnvironmentVariables</code> to apply the full (potentially dangerous) environment variables; in interactive mode, if the trust screen is rejected, <code>process.exitCode</code> is set and all subsequent steps that could trigger code execution (including apiKeyHelper) are skipped, to prevent running plugin code in untrusted directories. <code>launchRepl</code> (<code>src/replLauncher.tsx</code>) itself is very thin—it dynamically imports <code>App</code> and <code>REPL</code> components and hands them to <code>renderAndRun</code> for rendering; the real REPL logic lives in <code>screens/REPL</code> and is out of scope for this module.</p>
 
-<p>Natural observations from auxiliary perspectives: <strong>State machine</strong>: the most critical state split is "interactive vs non-interactive" (<code>isNonInteractiveSession</code>, determined by <code>-p/--init-only/--sdk-url/!stdout.isTTY</code>), which decides whether trust goes through a dialog or is implicit, and whether MCP/plugin initialization is fire-and-forget or awaited; beneath that are sub-states for session source: continue/resume/connect/ssh/assistant/new. <strong>Permissions</strong>: <code>permissionMode</code> is parsed by <code>initialPermissionModeFromCLI</code> from <code>--permission-mode/--dangerously-skip-permissions</code>; bypass mode has a dedicated sandbox validation gate inside <code>setup()</code> (root/docker/internet), and auto mode has an async GrowthBook-gated validation. <strong>Lifecycle</strong>: the <code>tengu_started</code> event is the earliest reliable "process has started" signal (emitted immediately after sinks are attached), <code>tengu_timer{event:'startup'}</code> records startup latency before the first blocking dialog renders, and at session end <code>setup()</code> reads the previous session's <code>tengu_exit</code> metrics from projectConfig and emits them.</p>
+<p>On auxiliary observational perspectives: <strong>State machine</strong>: the most critical state fork is "interactive vs non-interactive" (<code>isNonInteractiveSession</code>, determined by <code>-p/--init-only/--sdk-url/!stdout.isTTY</code>). It decides whether trust uses a dialog or is implicit, and whether MCP/plugin initialization is fire-and-forget or awaited. Beneath it are sub-states for session source: continue/resume/connect/ssh/assistant/new. <strong>Permissions</strong>: <code>permissionMode</code> is parsed by <code>initialPermissionModeFromCLI</code> from <code>--permission-mode/--dangerously-skip-permissions</code>; bypass mode has a dedicated sandbox validation checkpoint in <code>setup()</code> (root/docker/internet), and auto mode has an async GrowthBook-gated validation. <strong>Lifecycle</strong>: the <code>tengu_started</code> event is the earliest reliable "process has started" signal (fires immediately after sinks are attached); <code>tengu_timer{event:'startup'}</code> records startup latency before the first blocking dialog renders; at session end, <code>setup()</code> also reads the previous session's <code>tengu_exit</code> metric from projectConfig and emits it.</p>
 
 <ul>
-  <li>The entire startup chain relies heavily on "dynamic import + parallelization/deferral" to compress time-to-first-frame: almost every branch in <code>cli.tsx</code> is <code>await import(...)</code>, <code>--version</code> requires zero imports; in <code>main.tsx</code> the action handler parallelizes setup/commands/agents/MCP/git/user/model prefetches.</li>
-  <li><code>--bare</code> (equivalent to <code>CLAUDE_CODE_SIMPLE=1</code>) is a "minimal mode" master switch: it skips UDS messaging, teammate snapshots, iTerm/Terminal backup/restore, plugin prefetching, attribution hooks, release notes, startup prefetches, etc., slimming down the CLI for scripted invocations.</li>
-  <li>Trust is a hard boundary: in interactive mode, code before <code>showSetupScreens</code> deliberately avoids executing plugin LSP / apiKeyHelper in untrusted directories; non-interactive mode trust is implicit but requires "only use -p in directories you trust."</li>
-  <li>The <code>feature('XXX')</code> calls in <code>cli.tsx</code> are build-time dead-code-elimination gates; external builds will cut out those ant-only/experimental branches entirely, so the same source behaves differently internally vs externally.</li>
-  <li>Coverage note: this module focuses on the main data flow of "type claude to REPL ready." Internal details of <code>cli/print.ts</code> (5,596 lines) <code>runHeadless</code>, <code>bridgeMain/daemonMain/templatesMain</code> and other fast paths, and <code>screens/REPL</code> post-render interaction logic were not deeply read; they are marked only as exit nodes in the main flow. Pure option-registration lines in main.tsx (968-1005, 3811-3884 subcommand/option chains) and the 4395-4684 tail subcommand actions are only mapped at the level of responsibilities.</li>
+  <li>The entire startup chain heavily relies on "dynamic import + parallelization/deferral" to compress time-to-first-frame: almost every branch in <code>cli.tsx</code> is <code>await import(...)</code>, <code>--version</code> even requires zero imports; in <code>main.tsx</code>'s action handler, setup/commands/agents/MCP/git/user/model prefetches run heavily in parallel.</li>
+  <li><code>--bare</code> (equivalent to <code>CLAUDE_CODE_SIMPLE=1</code>) is a "minimal mode" master switch: skips UDS messaging, teammate snapshots, iTerm/Terminal backup recovery, plugin prefetch, attribution hooks, release notes, startup prefetches, etc., slimming down for scripted invocation.</li>
+  <li>Trust is a hard boundary: in interactive mode, code before <code>showSetupScreens</code> deliberately avoids executing plugin LSP / apiKeyHelper in untrusted directories; in non-interactive mode trust is implicit but requires "only use -p in directories you trust."</li>
+  <li>The <code>feature('XXX')</code> calls in <code>cli.tsx</code> are build-time dead-code-elimination gates; external builds will strip entire ant-only/experimental branches, so the same source behaves differently internally vs externally.</li>
+  <li>Coverage note: this module focuses on the main data flow from "typing claude" to "REPL ready." The internals of <code>cli/print.ts</code> (5,596 lines) <code>runHeadless</code>, the fast-path implementations of <code>bridgeMain/daemonMain/templatesMain</code>, and the post-render interaction logic in <code>screens/REPL</code> are not deeply read; they're marked only as exit nodes in the main flow. Pure option-registration lines in main.tsx (968-1005, 3811-3884 subcommand/option chains) and the tail subcommand actions at 4395-4684 are mapped for responsibility only.</li>
 </ul>
 
 <script>
@@ -366,5 +359,4 @@ window.__sourceMap = {
 <aside id="source-panel"><div id="source-header"></div><div id="monaco-container"></div></aside>
 <script src="../assets/codeindex-runtime.js"></script>
 <script src="../assets/codeindex.js"></script>
-</body>
-</html>
+</body></html>

@@ -1,71 +1,64 @@
 <!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Tool System Framework and File/Shell Tools</title>
-<link rel="stylesheet" href="../assets/codeindex.css">
-</head>
-<body>
-<nav class="topnav"><a href="../index.html">← Back to overview</a></nav>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Tool System Framework and File/Shell Tools</title><link rel="stylesheet" href="../assets/codeindex.css"></head><body>
+<nav class="topnav"><a href="../index.html">← Back to Overview</a></nav>
 <h1>Tool System Framework and File/Shell Tools</h1>
 
-<p>When Claude (the LLM) decides "read a file, modify some code, or run a shell command," it emits a <code>tool_use</code> request block. This module covers the full lifecycle of that request from landing to being returned to the LLM: how the right tool is found, how inputs are validated, how the permission gate is passed, how it is actually executed, and how the result is assembled back into the message stream so the model can continue reasoning. Scope is limited to built-in file tools (Read/Edit/Write), the Shell tool (Bash), and two search tools (Glob/Grep, the latter wrapping ripgrep).</p>
+<p>When Claude (the LLM) decides "read a file, modify some code, run a shell command," it emits a <code>tool_use</code> request block. This module covers the full lifecycle of that request from landing to being returned to the LLM: how the right tool is found, how inputs are validated, how permissions are gated, how it's actually executed, and how the result is assembled back into the message stream so the model can continue reasoning. Scope is limited to built-in file tools (Read/Edit/Write), the Shell tool (Bash), and two search tools (Glob/Grep, the latter wrapping ripgrep).</p>
 
 <dl>
   <dt>Input</dt>
-  <dd>A tool_use block emitted by the model in an assistant message: tool name + arguments (e.g. <code>{file_path, old_string, new_string}</code> or <code>{command}</code>), plus current session context (permission rule set, file-read cache, abort signal, etc.).</dd>
+  <dd>A tool_use block emitted by the model in an assistant message: tool name + parameters (e.g., <code>{file_path, old_string, new_string}</code> or <code>{command}</code>), plus current session context (permission rule set, file-read cache, abort signal, etc.).</dd>
   <dt>Output</dt>
-  <dd>A user message containing a <code>tool_result</code> block (success returns tool output/summary, failure returns an error description with <code>is_error</code>), which the model sees in the next round and uses to decide.</dd>
+  <dd>A user message containing a <code>tool_result</code> block (on success: tool return content/summary; on failure: error description with <code>is_error</code>), which the model sees and acts on in the next turn.</dd>
 </dl>
 
 <ul>
-  <li>Tools are not loose functions but instances of a unified contract (the <code>Tool</code> interface): each tool carries <code>validateInput</code>, <code>checkPermissions</code>, <code>call</code>, <code>mapToolResultToToolResultBlockParam</code>, and other methods that the framework calls in fixed order.</li>
-  <li>Concurrency safety is the key watershed: read-only tools marked <code>isConcurrencySafe=true</code> (Read/Glob/Grep, and read-only Bash commands) are run in parallel batches, while writes and uncertain commands run serially to avoid overwriting each other.</li>
-  <li>Permission is not a single gate but multiple layers — tool self-check + rule matching + PreToolUse hooks + canUseTool decision — and any layer denying produces an error result returned directly to the model.</li>
-  <li>File-edit tools have a "staleness check": the file must have been Read first and its disk mtime must not have changed before writing is allowed, preventing the model from overwriting the user's latest changes based on stale content.</li>
+  <li>Tools are not loose functions but instances of a unified contract (the <code>Tool</code> interface): each tool carries <code>validateInput</code>, <code>checkPermissions</code>, <code>call</code>, <code>mapToolResultToToolResultBlockParam</code>, and other methods the framework calls in a fixed order.</li>
+  <li>Concurrency safety is the key watershed: read-only tools marked <code>isConcurrencySafe=true</code> (Read/Glob/Grep, plus read-only Bash commands) are run in parallel batches, while writes and uncertain commands run serially to avoid overwriting each other.</li>
+  <li>Permissions are not a single gate but multiple stacked layers: "tool self-check + rule matching + PreToolUse hooks + canUseTool decision"—any layer denying produces an error result returned directly to the model.</li>
+  <li>File-edit tools have a "staleness check": the file must have been Read first and its disk mtime unchanged before writing is allowed, preventing the model from overwriting a user's latest changes based on stale content.</li>
 </ul>
 
-<h2>I. Tool Registration and Tool Pool Assembly</h2>
+<h2>1. Tool Registration and Tool Pool Assembly</h2>
 
-<p>All built-in tools are centrally registered in <code>tools.ts</code>. Whether a tool is "visible" is decided by several filters: environment/feature flags determine whether to load, <code>isEnabled()</code> determines whether it is enabled, and deny rules in the permission context determine whether it is hidden from the model. The final tool list handed to the model is the built-in tools merged with MCP tools, deduplicated by name, with deny rules applied.</p>
+<p>All built-in tools are centrally registered in <code>tools.ts</code>. Whether a tool is "visible" is decided by several filters: environment/feature flags determine whether to load it, <code>isEnabled()</code> determines whether it's enabled, and deny rules in the permission context determine whether to hide it from the model. The final tool list handed to the model is the merged, deduplicated-by-name, deny-filtered result of built-in tools and MCP tools.</p>
 
 <pre class="mermaid">
 graph TD
   base-list["getAllBaseTools list all built-in tools"] --> feat-gate{"feature/env flag enabled?"}
-  feat-gate -->|No| skip["Skip this tool (e.g. SleepTool/WorkflowTool)"]
+  feat-gate -->|No| skip["Skip this tool (e.g., SleepTool/WorkflowTool)"]
   feat-gate -->|Yes| enabled-check["Call tool.isEnabled()"]
-  enabled-check --> deny-check{"Hit by deny rule by whole name?"}
+  enabled-check --> deny-check{"Hit by deny rule on full name?"}
   deny-check -->|Yes| hide["Remove from tool pool: model never sees it"]
   deny-check -->|No| keep["Keep in allowedTools"]
   keep --> merge-mcp["Merge with MCP tools"]
-  merge-mcp --> dedup["Deduplicate by name, built-ins win"]
+  merge-mcp --> dedup["Dedup by name, built-in wins"]
   dedup --> final-pool["Final tool pool handed to model"]
-  simple-mode{"CLAUDE_CODE_SIMPLE?"} -->|Yes| simple-only["Keep only Bash/Read/Edit(+coordinator mode tools)"]
+  simple-mode{"CLAUDE_CODE_SIMPLE?"} -->|Yes| simple-only["Keep only Bash/Read/Edit(+coordination mode tools)"]
   simple-only --> final-pool
 </pre>
 
-<p>Key points: <code>getAllBaseTools</code> is the single source of "theoretically all tools," and comments emphasize it must stay in sync with the Statsig system cache configuration, otherwise cross-user prompt caching breaks. <code>filterToolsByDenyRules</code> uses the same matcher as runtime permission decisions, so a prefix rule like <code>mcp__server</code> hides the entire group from the model before it ever sees the tools, not just at call time.</p>
+<p>Key point: <code>getAllBaseTools</code> is the single source of "theoretically all tools"; comments emphasize it must stay in sync with Statsig's system cache configuration, otherwise cross-user prompt caching breaks. <code>filterToolsByDenyRules</code> uses the same matcher as runtime permission decisions, so a prefix rule like <code>mcp__server</code> masks the whole group from the model before it even sees the tools, not just at call time.</p>
 
-<h2>II. Tool Contract: Tool Interface and buildTool</h2>
+<h2>2. Tool Contract: Tool Interface and buildTool</h2>
 
 <p><code>src/Tool.ts</code> defines the uniform shape for all tools. A tool is an object with a name, input schema (Zod), prompt template, and a set of methods. Several key methods form the fixed pipeline the framework calls:</p>
 
 <ul>
-  <li><code>validateInput</code>: pure logic validation (path format, parameter range, deny-path prediction), no permission-touching I/O. Failure returns an error directly, without entering the permission flow.</li>
-  <li><code>checkPermissions</code>: the tool's own permission opinion (allow/ask/deny), called only after validateInput passes. It is combined with the generic permission system (<code>hasPermissionsToUseTool</code>); a tool saying ask does not mean the user will definitely be asked.</li>
-  <li><code>isConcurrencySafe</code>: decides whether this tool can be batched and run in parallel with other read-only tools. Defaults to false (conservative); Read/Glob/Grep return true, and Bash returns true only when the command is judged read-only.</li>
-  <li><code>isReadOnly</code> / <code>isDestructive</code>: semantic tags affecting UI collapsing, auto-classifier input, etc.</li>
-  <li><code>call</code>: the actual work function, receiving permission-approved input and context, returning a <code>ToolResult</code>.</li>
+  <li><code>validateInput</code>: pure logic validation (path format, parameter range, deny-path pre-check), no permission-sensitive I/O. On failure it returns an error directly without entering the permission flow.</li>
+  <li><code>checkPermissions</code>: the tool's own permission opinion (allow/ask/deny), called only after validateInput passes. It stacks with the generic permission system (<code>hasPermissionsToUseTool</code>); a tool saying ask doesn't guarantee the user will finally be asked.</li>
+  <li><code>isConcurrencySafe</code>: decides whether this tool can run in parallel with other read-only tools. Defaults to false (conservative); Read/Glob/Grep return true; Bash returns true only when the command is judged read-only.</li>
+  <li><code>isReadOnly</code> / <code>isDestructive</code>: semantic tags affecting UI folding, auto-classifier input, etc.</li>
+  <li><code>call</code>: the actual work function, receiving permission-cleared input and context, returning a <code>ToolResult</code>.</li>
   <li><code>mapToolResultToToolResultBlockParam</code>: serializes call output into the <code>tool_result</code> text/image block sent to the model.</li>
-  <li><code>renderToolUseMessage</code> / <code>renderToolResultMessage</code>: pure UI rendering, does not affect what is sent to the model.</li>
+  <li><code>renderToolUseMessage</code> / <code>renderToolResultMessage</code>: pure UI rendering, doesn't affect content sent to the model.</li>
 </ul>
 
-<p><code>buildTool(def)</code> is a factory: it merges the tool definition with a set of "safe defaults" (isEnabled defaults to true, isConcurrencySafe defaults to false, checkPermissions defaults to allow), so individual tools can omit common stub methods and callers always receive a complete object. The defaults are fail-closed — uncertain means unsafe, unsafe means permission required.</p>
+<p><code>buildTool(def)</code> is a factory: it merges the tool definition with a set of "safe defaults" (isEnabled defaults to true, isConcurrencySafe defaults to false, checkPermissions defaults to allow), so individual tools can omit common stub methods and callers always get a complete object. Defaults are fail-closed—uncertain means unsafe/needs permission.</p>
 
-<h2>III. Complete Data Flow for a Single Tool Call</h2>
+<h2>3. Complete Data Flow of a Single Tool Call</h2>
 
-<p>This is the core of the module. The model may emit several tool_use blocks in one turn. <code>runTools</code> first splits them by "concurrency safety": consecutive read-only tools merge into one concurrent batch, each write/uncertain tool becomes its own serial batch. Then each block follows the <code>runToolUse</code> → <code>checkPermissionsAndCallTool</code> main pipeline. The diagram below shows the key phases, branches, and error exits for one call.</p>
+<p>This is the core of the module. A model may emit several tool_use blocks in one turn. <code>runTools</code> first splits them by "concurrency safety": consecutive read-only tools merge into one concurrent batch, each write/uncertain tool becomes its own serial batch. Then each block goes through the main pipeline of <code>runToolUse</code> → <code>checkPermissionsAndCallTool</code>. The diagram below shows the key stages, branches, and error exits of one call.</p>
 
 <pre class="mermaid">
 graph TD
@@ -73,19 +66,19 @@ graph TD
   tool-found -->|No| unknown-tool["Return tool_result: No such tool available"]
   tool-found -->|Yes| aborted{"Session already aborted?"}
   aborted -->|Yes| cancel-msg["Return tool_result: cancelled"]
-  aborted -->|No| parse-input["Zod parse inputSchema.safeParse"]
+  aborted -->|No| parse-input["Zod parse input inputSchema.safeParse"]
   parse-input --> parse-ok{"Type valid?"}
   parse-ok -->|No| zod-err["Return InputValidationError + schema hint"]
   parse-ok -->|Yes| validate-input["Call tool.validateInput business validation"]
-  validate-input --> validate-ok{"Passed?"}
+  validate-input --> validate-ok{"Pass?"}
   validate-ok -->|No| validate-err["Return tool custom error message"]
   validate-ok -->|Yes| backfill["backfillObservableInput: expand ~/relative paths for hooks"]
   backfill --> pre-hooks["Run PreToolUse hooks"]
-  pre-hooks --> hook-stop{"Hook requested stop?"}
+  pre-hooks --> hook-stop{"Hook requests stop?"}
   hook-stop -->|Yes| stop-msg["Return Execution stopped by hook"]
   hook-stop -->|No| resolve-perm["resolveHookPermissionDecision + canUseTool"]
   resolve-perm --> perm-decision{"Decision?"}
-  perm-decision -->|deny / ask rejected| deny-msg["Return is_error permission-denial message + trigger PermissionDenied hook"]
+  perm-decision -->|deny / ask rejected| deny-msg["Return is_error permission denial + trigger PermissionDenied hook"]
   perm-decision -->|allow| call-tool["Call tool.call to perform actual operation"]
   call-tool --> call-ok{"Execution succeeded?"}
   call-ok -->|No| classify-err["classifyToolError + run PostToolUseFailure hook"]
@@ -93,29 +86,29 @@ graph TD
   call-ok -->|Yes| map-result["mapToolResultToToolResultBlockParam serialize"]
   map-result --> post-hooks["Run PostToolUse hooks (can rewrite MCP output)"]
   post-hooks --> assemble["Assemble tool_result + acceptFeedback + extra content blocks"]
-  assemble --> yield-msg["Produce user message, flow back into model context"]
+  assemble --> yield-msg["Produce user message, flow back to model context"]
 </pre>
 
-<p>A few easy-to-overlook details:</p>
+<p>A few easily overlooked details:</p>
 
 <ul>
-  <li><b>Input goes through Zod first, then business validation</b>. The model often generates malformed arguments (arrays written as strings, etc.). The Zod gate returns an error with a "schema not sent" hint, guiding the model to use ToolSearch to load the deferred tool and retry.</li>
-  <li><b>backfill happens before permissions/hooks</b>. <code>backfillObservableInput</code> expands <code>~</code> / relative paths into absolute paths so hook allowlists cannot be bypassed by a tilde. But it only changes the "copy for hooks"; <code>call()</code> still receives the model's original fields — keeping embedded path strings in tool results ("File created at: X") and transcript/VCR hashes stable.</li>
-  <li><b>Permission decisions draw from three stacked sources</b>: PreToolUse hooks can directly give allow/deny/modify input; <code>resolveHookPermissionDecision</code> prioritizes hook conclusions; only when there is no hook conclusion does it fall through to <code>canUseTool</code> (i.e. <code>hasPermissionsToUseTool</code>).</li>
-  <li><b>Permission denials also run hooks</b>: in auto mode, after the classifier denies, the <code>PermissionDenied</code> hook runs; if the hook says retry, an extra "this command is now approved, retry" meta-message is inserted for the model.</li>
-  <li><b>Errors also run hooks</b>: <code>runPostToolUseFailureHooks</code> lets hooks intervene when a tool throws (e.g. auto-fix). AbortError and Shell errors have dedicated branches and are not blindly logErrored.</li>
-  <li><b>Results larger than 30K/100K characters</b>: exceeding <code>maxResultSizeChars</code> is persisted to a disk file, and the model receives a <code>persisted-output</code> wrapper with preview; the Read tool is an exception (set to Infinity) to avoid a "read file → triggers another read" loop.</li>
+  <li><b>Input passes Zod then business validation</b>. Models often generate mistyped parameters (arrays written as strings, etc.); Zod returns an error with a "schema not sent" hint, guiding the model to load the deferred tool via ToolSearch and retry.</li>
+  <li><b>backfill happens before permissions/hooks</b>. <code>backfillObservableInput</code> expands <code>~</code>/relative paths into absolute paths so hook allowlists can't be bypassed by tildes. But it only modifies the "copy for hooks"; <code>call()</code> still receives the model's original fields—so path strings embedded in tool results ("File created at: X") and transcript/VCR hashes remain stable.</li>
+  <li><b>Permission decisions come from three stacked sources</b>: PreToolUse hooks can directly give allow/deny/modify input; <code>resolveHookPermissionDecision</code> prioritizes hook conclusions; only with no hook conclusion does it fall back to <code>canUseTool</code> (i.e., <code>hasPermissionsToUseTool</code>).</li>
+  <li><b>Permission denials also run hooks</b>: in auto mode, after the classifier denies, the <code>PermissionDenied</code> hook runs; if the hook says retry, an extra meta-message "this command is now approved, you may retry" is inserted for the model.</li>
+  <li><b>Errors also run hooks</b>: <code>runPostToolUseFailureHooks</code> lets hooks intervene when a tool throws (e.g., auto-fix). AbortError and Shell errors have dedicated branches and don't blindly logError.</li>
+  <li><b>Results may exceed 30K/100K characters</b>: beyond <code>maxResultSizeChars</code> they are persisted to a disk file, and the model receives a <code>persisted-output</code> wrapper with preview; Read tool is the exception (set to Infinity, avoiding a loop of "read file → trigger read of persisted file").</li>
 </ul>
 
-<h2>IV. Concurrent Batching: Why Read-Only Can Run in Parallel</h2>
+<h2>4. Concurrent Batching: Why Read-Only Can Run in Parallel</h2>
 
-<p><code>partitionToolCalls</code> scans the model's tool_use sequence for this turn and calls <code>tool.isConcurrencySafe(input)</code> for each block. Consecutive blocks returning true are merged into one batch handled by <code>runToolsConcurrently</code> (tools are launched with <code>all</code>, capped at 10 concurrent); a false breaks the run, and that write operation goes alone through <code>runToolsSerially</code>. In serial batches, each tool updates <code>currentContext</code> after it finishes (because writes may change shared state like readFileState); concurrent batches defer contextModifier application until the end of the batch — reads do not affect each other, so they can safely run in parallel.</p>
+<p><code>partitionToolCalls</code> scans the model's tool_use sequence for this turn and calls <code>tool.isConcurrencySafe(input)</code> for each block. Consecutive blocks returning true merge into one batch and go through <code>runToolsConcurrently</code> (all tools launched concurrently up to a limit of 10); encountering false breaks the batch, and that write/uncertain operation goes through <code>runToolsSerially</code> alone. Within a serial batch each tool updates <code>currentContext</code> after finishing (because writes may modify shared state like readFileState); concurrent batches defer contextModifier until the end of the batch—reads don't affect each other, so parallel execution is safe.</p>
 
-<p>Note: <code>isConcurrencySafe</code> parse failures (e.g. shell-quote parse throws) are caught and treated as false, conservatively downgrading to serial. Bash concurrency safety equals "whether the command is read-only": <code>isReadOnly</code> calls <code>checkReadOnlyConstraints</code> to decide; compound commands containing <code>cd</code> are handled specially.</p>
+<p>Note: if <code>isConcurrencySafe</code> parsing fails (e.g., shell-quote parse throws), it's caught and downgraded to false, conservatively becoming serial. Bash concurrency safety equals "whether the command is read-only": <code>isReadOnly</code> calls <code>checkReadOnlyConstraints</code>; compound commands containing <code>cd</code> are handled specially.</p>
 
-<h2>V. Permission Gate Internals: Rules + Hooks + Classifier</h2>
+<h2>5. Permission Gate Internals: Rules + Hooks + Classifier</h2>
 
-<p><code>hasPermissionsToUseTool</code> (<code>src/utils/permissions/permissions.ts</code>) is the generic permission layer. It combines the tool's self-reported <code>checkPermissions</code>, the user's configured allow/ask/deny rules, PreToolUse hook decisions, and (in auto mode) an AI classifier conclusion, ultimately giving allow/ask/deny. Mode switches affect the exit: <code>dontAsk</code> mode turns ask directly into deny (no user prompt); <code>auto</code> mode hands ask to the classifier instead of popping an interactive dialog.</p>
+<p><code>hasPermissionsToUseTool</code> (<code>src/utils/permissions/permissions.ts</code>) is the generic permission layer. It combines the tool's self-reported <code>checkPermissions</code>, user-configured allow/ask/deny rules, PreToolUse hook decisions, and (in auto mode) an AI classifier conclusion, ultimately producing allow/ask/deny. Mode switches affect the exit: <code>dontAsk</code> turns ask directly into deny (don't ask the user); <code>auto</code> hands ask to the classifier instead of popping an interactive dialog.</p>
 
 <pre class="mermaid">
 graph TD
@@ -133,57 +126,57 @@ graph TD
   cls-verdict -->|unsafe| deny-out
   cls-verdict -->|error/unavailable| fallback{"fail-closed?"}
   fallback -->|Yes| deny-out
-  mode -->|default| prompt-user["Show interactive dialog asking user"]
+  mode -->|default| prompt-user["Pop interactive dialog to ask user"]
   prompt-user --> user-say{"User choice?"}
   user-say -->|Accept| allow-out
   user-say -->|Reject| deny-out
 </pre>
 
-<p>Bash permissions are more complex, handled in <code>bashToolHasPermission</code>: first it uses tree-sitter for AST-level safe parsing (detecting command injection, eval, zsh builtins, etc.), parses into SimpleCommand[], then goes through "exact match → sandbox auto-allow → prefix/wildcard rules → deny/ask classifier." AST judged too complex (command substitution / control flow) respects deny rules and then downgrades to ask, never silently allowing. When sandbox is enabled and the command is suitable, it auto-allows (still respecting explicit deny/ask rules).</p>
+<p>Bash permissions are more complex, in <code>bashToolHasPermission</code>: first tree-sitter AST-level safe parsing (detects command injection, eval, zsh builtins, etc.); after parsing into SimpleCommand[], it goes through "exact match → sandbox auto-allow → prefix/wildcard rules → deny/ask classifier." AST judged too-complex (containing command substitution/control flow) respects deny rules and downgrades to ask, never silently allowing. When sandbox is enabled and the command is sandbox-suitable, it automatically allows (still respecting explicit deny/ask rules).</p>
 
-<h2>VI. FileReadTool: Read Deduplication and Multiple Types</h2>
+<h2>6. FileReadTool: Read Deduplication and Multi-Type Support</h2>
 
-<p>From the user's perspective: "Claude wants to look at a file." The Read tool's <code>call</code> first checks the <code>readFileState</code> cache: if the same file, same offset/limit range has already been read and the disk mtime hasn't changed, it returns a <code>file_unchanged</code> stub ("file unchanged," not resending the full text, saving cache tokens). Otherwise it branches by extension: text (with line numbers + cyber-risk reminder), image (base64 image block), PDF (page-extracted images or document blocks), notebook (mapped cells). On ENOENT it tries to find similar filenames for a "Did you mean" hint.</p>
+<p>User perspective: "Claude wants to look at a file." The Read tool's <code>call</code> first checks the <code>readFileState</code> cache: if the same file with the same offset/limit range has already been read and disk mtime hasn't changed, it returns a <code>file_unchanged</code> stub ("file unchanged," not resending the full text, saving cache tokens). Otherwise it branches by extension: text (with line numbers + cyber-risk reminder), image (base64 image block), PDF (page-extracted images or document blocks), notebook (cell mapping). On ENOENT it tries to find similar filenames for a "Did you mean" hint.</p>
 
 <pre class="mermaid">
 graph TD
   read-start["Read.call(file_path, offset, limit)"] --> dedup-lookup["Check readFileState cache"]
   dedup-lookup --> dedup-hit{"Same range and mtime unchanged?"}
   dedup-hit -->|Yes| unchanged-stub["Return file_unchanged stub"]
-  dedup-hit -->|No| skill-discover["Background discover/activate skills for this path"]
-  skill-discover --> call-inner["Enter callInner, branch by extension"]
+  dedup-hit -->|No| skill-discover["Background discover/activate skills under this path"]
+  skill-discover --> call-inner["Enter callInner branch by extension"]
   call-inner --> ext-switch{"File type?"}
-  ext-switch -->|Text| text-branch["Read bytes → detect encoding → normalize line endings → add line numbers → attach cyber-risk reminder"]
-  ext-switch -->|Image| image-branch["Base64 encode as image block"]
-  ext-switch -->|PDF| pdf-branch["Extract pages by pages param → Document/image blocks"]
-  ext-switch -->|Notebook| nb-branch["Parse cells → map into tool_result text"]
-  ext-switch -->|Other binary| bin-err["Error: cannot Read binary files"]
+  ext-switch -->|Text| text-branch["Read bytes→detect encoding→normalize newlines→add line numbers→attach cyber-risk reminder"]
+  ext-switch -->|Image| image-branch["Encode as base64 image block"]
+  ext-switch -->|PDF| pdf-branch["Extract pages by pages arg→Document/image blocks"]
+  ext-switch -->|Notebook| nb-branch["Parse cells→map into tool_result text"]
+  ext-switch -->|Other binary| bin-err["Error: cannot Read binary"]
   text-branch --> enoent-check
   image-branch --> enoent-check
   pdf-branch --> enoent-check
   nb-branch --> enoent-check
   enoent-check{"ENOENT?"}
-  enoent-check -->|Yes| suggest["Find similar filenames / cwd suggestions for Did you mean"]
+  enoent-check -->|Yes| suggest["Find similar filename/cwd suggestion for Did you mean"]
   enoent-check -->|No| update-state["Update readFileState (mtime/content/range)"]
   suggest --> throw-err["Throw friendly error"]
   update-state --> read-map-result["mapToolResultToToolResultBlockParam serialize by type"]
 </pre>
 
-<p>Key points: <code>validateInput</code> blocks deny paths, UNC paths (to prevent NTLM credential leakage), binary extensions, and blocking device files before permissions — these can be decided without needing permission. <code>checkPermissions</code> delegates to the generic <code>checkReadPermissionForTool</code>. <code>maxResultSizeChars: Infinity</code> is intentional, preventing a "read large file → persist → model reads the persisted file" loop.</p>
+<p>Key points: <code>validateInput</code> blocks deny paths, UNC paths (prevents NTLM credential leak), binary extensions, and blocking device files before permissions—no permission needed to judge these. <code>checkPermissions</code> delegates to the generic <code>checkReadPermissionForTool</code>. <code>maxResultSizeChars: Infinity</code> is intentional, avoiding the loop of "read large file → persist → model reads the persisted file."</p>
 
-<h2>VII. FileEditTool / FileWriteTool: Staleness Checks and Atomic Writes</h2>
+<h2>7. FileEditTool / FileWriteTool: Staleness Check and Atomic Write</h2>
 
-<p>The core defense of the two write tools is the "staleness check": the model must have Read the file first, and disk mtime must not have changed since the last Read, before writing is allowed. This prevents the model from overwriting code the user just changed based on content from several turns ago. Edit does read-modify-write: read original content → use <code>findActualString</code> to handle quote styles → generate patch → write to disk → update readFileState → notify LSP (didChange/didSave) and VSCode diff view. Write is whole-file replacement, additionally requiring the file to have been Read and not be a partial view.</p>
+<p>The core defense of the two write tools is the "staleness check": the model must have Read the file first, and disk mtime must not have changed since the last Read, before writing is allowed. This prevents the model from overwriting code the user just changed based on content from several turns ago. Edit does read-modify-write: read original content → process quote style with <code>findActualString</code> → generate patch → write disk → update readFileState → notify LSP (didChange/didSave) and VS Code diff view. Write is whole-file replacement, additionally requiring the file was Read first and is not a partial view.</p>
 
 <pre class="mermaid">
 graph TD
   write-start["Edit/Write.call"] --> mkdir["Ensure parent directory exists (outside critical section)"]
-  mkdir --> backup["fileHistory backs up old content (idempotent by content hash)"]
-  backup --> load-current["Read current file content + encoding + line endings"]
-  load-current --> stale-check{"Has been Read and mtime unchanged?"}
+  mkdir --> backup["fileHistory backup old content (idempotent by content hash)"]
+  backup --> load-current["Read current file content + encoding + newlines"]
+  load-current --> stale-check{"Already Read and mtime unchanged?"}
   stale-check -->|No| stale-err["Throw FILE_UNEXPECTEDLY_MODIFIED_ERROR"]
   stale-check -->|Yes| compute-new["Edit: getPatchForEdit generates new content / Write: use input.content directly"]
-  compute-new --> write-disk["writeTextContent atomic write"]
+  compute-new --> write-disk["writeTextContent atomic write to disk"]
   write-disk --> lsp-notify["Notify LSP didChange/didSave + VSCode"]
   lsp-notify --> update-state["Update readFileState (post-write mtime)"]
   update-state --> return-diff["Return filePath/patch/userModified etc."]
@@ -192,58 +185,58 @@ graph TD
 <p>Important constraints:</p>
 
 <ul>
-  <li><b>No await inside the critical section</b>: from "read current content" to "write to disk" the event loop must not yield, otherwise concurrent edits could interleave. mkdir and backup are explicitly placed outside the critical section.</li>
-  <li><b>Write does not change line endings</b>: whatever line endings the model provides in content are used, avoiding writing CRLF bash scripts on Linux.</li>
-  <li><b>UNC paths skip I/O validation</b>: <code>validateInput</code> returns true directly for UNC paths, leaving the decision to the permission layer — because <code>fs.existsSync</code> on Windows UNC paths can trigger SMB authentication and potentially leak credentials.</li>
-  <li><b>Team memory leak prevention</b>: before writing team memory files, secrets are scanned; a hit causes rejection.</li>
+  <li><b>No await inside the critical section</b>: from "read current content" to "write disk" the event loop must not yield, otherwise concurrent edits could interleave. mkdir and backup are explicitly placed outside the critical section.</li>
+  <li><b>Write does not rewrite line endings</b>: whatever line endings the model gives in content are used as-is, avoiding writing bash scripts with CRLF on Linux.</li>
+  <li><b>UNC paths skip I/O validation</b>: <code>validateInput</code> returns true directly for UNC paths, deferring judgment to the permission layer—because <code>fs.existsSync</code> on Windows UNC paths can trigger SMB authentication and leak credentials.</li>
+  <li><b>Team memory leak prevention</b>: before writing team memory files, secrets are scanned; hits are rejected.</li>
 </ul>
 
-<h2>VIII. BashTool: From Command to Shell Process</h2>
+<h2>8. BashTool: From Command to Shell Process</h2>
 
-<p>From the user's perspective: "Claude runs a shell command." BashTool's <code>call</code> first handles special "simulated sed edit" (writes directly to disk so the user preview matches what was written); otherwise it enters <code>runShellCommand</code>, an async generator: it uses <code>exec</code> to spawn a shell process, and as it runs, feeds the latest output back through the <code>onProgress</code> callback, yielding <code>bash_progress</code> events from the generator. Timeout, explicit <code>run_in_background</code>, or assistant-mode blocking-budget overrun all move the command to background, returning a <code>backgroundTaskId</code> for the model to later fetch results with TaskOutput.</p>
+<p>User perspective: "Claude runs a shell command." BashTool's <code>call</code> first handles the special "simulated sed edit" (writes directly to disk so the user preview matches what was written), otherwise enters <code>runShellCommand</code>, an async generator: it spawns a shell process with <code>exec</code>, and while running feeds the latest output to the generator via the <code>onProgress</code> callback, yielding <code>bash_progress</code> events. Timeout, explicit <code>run_in_background</code>, or assistant-mode blocking-budget overrun all move the command to background, returning a <code>backgroundTaskId</code> for the model to later fetch results via TaskOutput.</p>
 
 <pre class="mermaid">
 graph TD
   bash-start["Bash.call(input)"] --> sed-check{"_simulatedSedEdit?"}
-  sed-check -->|Yes| apply-sed["applySedEdit writes directly to disk"]
-  sed-check -->|No| start-exec["exec spawns shell process (timeout/sandbox/onProgress)"]
+  sed-check -->|Yes| apply-sed["applySedEdit write to disk directly"]
+  sed-check -->|No| start-exec["exec spawn shell process (timeout/sandbox/onProgress)"]
   start-exec --> bg-req{"run_in_background?"}
-  bg-req -->|Yes| spawn-bg["spawnShellTask moves to background, return backgroundTaskId"]
+  bg-req -->|Yes| spawn-bg["spawnShellTask move to background, return backgroundTaskId"]
   spawn-bg --> bg-return["Return empty stdout + backgroundTaskId"]
   bg-req -->|No| race["Promise.race(result vs progress threshold)"]
-  race --> early-done{"Command finishes quickly?"}
+  race --> early-done{"Command ends quickly?"}
   early-done -->|Yes| return-result["Return ExecResult directly"]
   early-done -->|No| auto-bg{"Timeout / assistant budget reached?"}
-  auto-bg -->|Yes and allowed| to-bg["Move to background to continue, notify on completion"]
+  auto-bg -->|Yes and allowed| to-bg["Move to background continue, notify on completion later"]
   auto-bg -->|No| stream-progress["Loop yield bash_progress events"]
   stream-progress --> final-result["Get final stdout/code/interrupted"]
   return-result --> final-result
   to-bg --> final-result
   final-result --> interpret["interpretCommandResult semantic exit-code interpretation"]
-  interpret --> persist-check{"Output file &gt; threshold?"}
-  persist-check -->|Yes| copy-dest["Copy to tool-results directory, model reads via Read"]
+  interpret --> persist-check{"Output file > threshold?"}
+  persist-check -->|Yes| copy-dest["Copy to tool-results dir, model reads via Read"]
   persist-check -->|No| use-stdout["Use stdout directly"]
   copy-dest --> assemble-out["Assemble Out(stdout/isImage/persistedOutputPath...)"]
   use-stdout --> assemble-out
-  assemble-out --> bash-map-result["mapToolResult...: large output wrapped persisted-output, images as image blocks"]
+  assemble-out --> bash-map-result["mapToolResult...: large output wraps persisted-output, images go as image block"]
 </pre>
 
-<p>Bash concurrency safety depends on whether the command is read-only: <code>isReadOnly</code> calls <code>checkReadOnlyConstraints</code>, and <code>isConcurrencySafe</code> directly reuses the <code>isReadOnly</code> result. So <code>ls</code> / <code>cat</code> run in parallel with other read-only tools, while <code>git push</code> runs serially. <code>preparePermissionMatcher</code> splits compound commands into subcommand lists so hook rules like <code>Bash(git *)</code> can hit the git subcommand inside <code>ls && git push</code> — if it can't split, it fails safely and lets hooks run.</p>
+<p>Bash concurrency safety depends on whether the command is read-only: <code>isReadOnly</code> calls <code>checkReadOnlyConstraints</code>, and <code>isConcurrencySafe</code> directly reuses the <code>isReadOnly</code> result. So <code>ls</code>/<code>cat</code> run in parallel with other read-only tools, while <code>git push</code> runs serially. <code>preparePermissionMatcher</code> splits compound commands into subcommand lists so hook rules like <code>Bash(git *)</code> can hit the git subcommand inside <code>ls && git push</code>—if it can't split, it fails safe and lets hooks run.</p>
 
-<h2>IX. GlobTool / GrepTool: ripgrep Wrappers</h2>
+<h2>9. GlobTool / GrepTool: ripgrep Wrappers</h2>
 
-<p>Both search tools are read-only, concurrency-safe, and go through <code>checkReadPermissionForTool</code>. Glob calls the internal <code>glob</code> function to find filenames by pattern; Grep actually invokes ripgrep (<code>rg</code>) for content search. Grep's <code>call</code> translates model parameters into rg command-line flags: <code>--hidden</code>, excludes VCS directories, <code>--max-columns 500</code> (prevents base64/compressed files from flooding), <code>-l/-c/-n/-i/-C/-A/-B/-U</code>, etc., plus ignore patterns from the permission context and plugin-cache exclusions. Paths are passed as absolute paths to <code>ripgrep</code>, then results are relativized back to cwd-relative paths to save tokens.</p>
+<p>Both search tools are read-only, concurrency-safe, and use <code>checkReadPermissionForTool</code>. Glob calls the internal <code>glob</code> function to find filenames by pattern; Grep actually invokes ripgrep (<code>rg</code>) for content search. Grep's <code>call</code> translates model parameters into rg command-line flags: <code>--hidden</code>, exclude VCS dirs, <code>--max-columns 500</code> (prevents base64/compressed files from flooding output), <code>-l/-c/-n/-i/-C/-A/-B/-U</code>, etc., plus ignore patterns from the permission context and plugin-cache exclusions. Paths are passed as absolute paths to <code>ripgrep</code>, and results are relativized back to cwd-relative paths to save tokens.</p>
 
 <pre class="mermaid">
 graph TD
-  grep-start["Grep.call(pattern, path, output_mode, ...)"] --> build-args["Assemble rg args: --hidden / exclude VCS / --max-columns / pattern flags"]
-  build-args --> add-ignore["Add readFile ignore pattern + plugin cache exclusions"]
+  grep-start["Grep.call(pattern, path, output_mode, ...)"] --> build-args["Assemble rg args: --hidden/exclude VCS/--max-columns/pattern flags"]
+  build-args --> add-ignore["Add readFile ignore patterns + plugin-cache exclusions"]
   add-ignore --> call-rg["ripgrep(args, absolutePath, abortSignal)"]
   call-rg --> rg-done{"rg returned?"}
   rg-done --> timeout{"RipgrepTimeoutError?"}
-  timeout -->|Yes| propagate["Propagate upward (let model know search didn't finish, rather than assuming no matches)"]
+  timeout -->|Yes| propagate["Throw upward (let model know search didn't finish, rather than falsely thinking no matches)"]
   timeout -->|No| mode-switch{"output_mode?"}
-  mode-switch -->|content| content-branch["Apply head_limit/offset → relativize paths → assemble content lines"]
+  mode-switch -->|content| content-branch["Apply head_limit/offset→relativize paths→assemble content lines"]
   mode-switch -->|count| count-branch["Output filename:count + total summary"]
   mode-switch -->|files_with_matches| files-branch["Found N files + filename list"]
   content-branch --> map-out
@@ -251,7 +244,7 @@ graph TD
   files-branch --> map-out["mapToolResultToToolResultBlockParam serialize"]
 </pre>
 
-<p>Grep's <code>validateInput</code> only checks path existence (UNC skipped). <code>head_limit</code> is applied before relativizing paths, avoiding useless per-line processing on a thousand-line result that will be truncated to a few dozen wide lines. Glob's <code>call</code> is similar but simpler: call <code>glob</code> for the file list, relativize, return filenames + whether truncated.</p>
+<p>Grep's <code>validateInput</code> only checks path existence (skipping UNC). <code>head_limit</code> is applied before relativizing paths, avoiding useless per-line processing for wide patterns that would be truncated from thousands of lines down to dozens. Glob's <code>call</code> is similar but simpler: call <code>glob</code> for file list, relativize, return filenames + whether truncated.</p>
 
 <script>
 window.__sourceMap = {
@@ -372,5 +365,4 @@ window.__sourceMap = {
 <aside id="source-panel"><div id="source-header"></div><div id="monaco-container"></div></aside>
 <script src="../assets/codeindex-runtime.js"></script>
 <script src="../assets/codeindex.js"></script>
-</body>
-</html>
+</body></html>

@@ -1,133 +1,126 @@
 <!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>IDE Bridge (IDE Integration)</title>
-<link rel="stylesheet" href="../assets/codeindex.css">
-</head>
-<body>
-<nav class="topnav"><a href="../index.html">← Back to overview</a></nav>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>IDE Bridge (IDE Integration)</title><link rel="stylesheet" href="../assets/codeindex.css"></head><body>
+<nav class="topnav"><a href="../index.html">← Back to Overview</a></nav>
 <h1>IDE Bridge (IDE Integration)</h1>
 
-<p>When a user installs the Claude Code extension in VS Code or JetBrains, the extension needs to connect to the local CLI backend to do the actual work. This module is the complete communication framework after the CLI is started in "bridge mode": it turns the CLI into a long-running process, establishes a bidirectional WebSocket channel with the IDE, uses JWT for authentication, routes IDE actions (editing files, viewing diffs, permission confirmation, initiating sessions) to the CLI core, and streams the results back to the IDE.</p>
+<p>When a user installs the Claude Code extension in VS Code or JetBrains, the extension needs to connect to the local CLI backend to do the real work. This module is the entire communication skeleton after the CLI starts in "bridge mode": it turns the CLI into a long-running process that establishes a bidirectional WebSocket channel with the IDE, authenticates with JWT, routes various IDE-initiated actions (editing files, viewing diffs, permission confirmations, starting sessions) to the CLI core, and streams the results back to the IDE panel.</p>
 
-<p>From the user's perspective: you open the Claude Code panel in the IDE, type a message, and click an "Apply edits" button—these actions are not executed by the IDE extension itself, but are handed over to the local CLI through this bridge channel. After the CLI finishes, it pushes changes, diffs, and pending permissions back to the IDE. This module explains how this channel is established, how authentication works, how messages travel back and forth, and how sessions are started and torn down.</p>
+<p>From the user's perspective: you open the Claude Code panel in the IDE, type a sentence, and click an "Apply edits" button—these actions are not executed by the IDE extension itself, but handed over to the local CLI through this bridge channel. After the CLI finishes, it pushes changes, diffs, and pending permissions back to the IDE. This module explains how that channel is established, how authentication works, how messages travel back and forth, and how sessions start and end.</p>
 
 <dl>
   <dt>Input</dt>
-  <dd>Connection requests initiated by the IDE extension (including a JWT token) + subsequent operation commands (start a session, send a user message, approve/reject permissions, view diffs, etc.)</dd>
+  <dd>Connection request from the IDE extension (including JWT token) + subsequent operation commands (start session, send user message, confirm/deny permission, view diff, etc.)</dd>
   <dt>Output</dt>
   <dd>A persistent bidirectional channel: every action submitted by the IDE is executed by the CLI, and results (streaming text, file changes, permission requests, errors) flow back to the IDE panel in real time</dd>
 </dl>
 
-<h2>1. Bridge Mode Startup: From Command to Channel Ready</h2>
+<h2>1. Bridge Mode Startup: From Command to Ready Channel</h2>
 
-<p>When the user types <code>claude remote-control</code> in the terminal (or clicks "Connect Remote Control" in the IDE extension), the CLI does not enter an interactive REPL but takes the <code>bridgeMain</code> path. Its work can be broken into several steps: first confirm that this machine is allowed to run bridge (logged in, workspace trusted, multi-session rollout enabled), then register an "environment" with the server, obtain an environmentId + secret pair, and finally enter a long-polling loop waiting for the server to dispatch "work items".</p>
+<p>When the user types <code>claude remote-control</code> in the terminal (or clicks "Connect Remote Control" in the IDE extension), the CLI does not enter an interactive REPL but takes the <code>bridgeMain</code> branch. Its work can be broken into a few steps: confirm this machine is allowed to run bridge (logged in, workspace trusted, multi-session rollout enabled), register an "environment" with the server, get back an environmentId + secret pair, and then enter a long-polling loop waiting for the server to dispatch "work items."</p>
 
-<p>Note that <code>BRIDGE_MODE</code> is a feature flag (GrowthBook rollout). When disabled, the entire bridge command exits directly without even registering—so this capability is rolled out gradually by account/rollout.</p>
+<p>Note that <code>BRIDGE_MODE</code> is a feature flag (GrowthBook rollout); when off the entire bridge command exits immediately, without even registering—so this capability is gradually rolled out per account/flag.</p>
 
 <pre class="mermaid">
 graph TD
-  start["User runs remote-control"] --> parseArgs["Parse args&lt;br/&gt;--spawn/--capacity/--session-id etc."]
-  parseArgs --> checkGate{"BRIDGE_MODE +&lt;br/&gt;multi-session rollout passed?"}
-  checkGate -->|No| denyExit["Print not available/invalid args&lt;br/&gt;exit"]
-  checkGate -->|Yes| checkTrust{"Workspace trusted?"}
-  checkTrust -->|No| trustFail["Prompt to run claude to accept trust dialog&lt;br/&gt;exit"]
-  checkTrust -->|Yes| checkOAuth{"Have OAuth token?"}
-  checkOAuth -->|No| loginFail["Prompt /login&lt;br/&gt;exit"]
-  checkOAuth -->|Yes| remoteDialog{"First time seeing&lt;br/&gt;Remote Control?"}
-  remoteDialog -->|Yes| askConsent["Terminal prompt&lt;br/&gt;enable?"]
-  askConsent -->|Decline| exit0["Exit"]
-  askConsent -->|Agree| saveSeen["Record remoteDialogSeen"]
-  remoteDialog -->|No| resolveSpawn["Determine spawn mode&lt;br/&gt;(resume &gt; flag &gt; project config &gt; default)"]
+  start["User executes remote-control"] --> parseArgs["Parse args&lt;br/&gt;--spawn/--capacity/--session-id, etc."]
+  parseArgs --> checkGate{"BRIDGE_MODE +&lt;br/&gt;multi-session rollout enabled?"}
+  checkGate -->|no| denyExit["Print not available/invalid args&lt;br/&gt;exit"]
+  checkGate -->|yes| checkTrust{"Workspace trusted?"}
+  checkTrust -->|no| trustFail["Prompt to run claude to accept trust dialog&lt;br/&gt;exit"]
+  checkTrust -->|yes| checkOAuth{"Have OAuth token?"}
+  checkOAuth -->|no| loginFail["Prompt /login&lt;br/&gt;exit"]
+  checkOAuth -->|yes| remoteDialog{"First time seeing&lt;br/&gt;Remote Control?"}
+  remoteDialog -->|yes| askConsent["Terminal prompt&lt;br/&gt;enable?"]
+  askConsent -->|decline| exit0["Exit"]
+  askConsent -->|agree| saveSeen["Record remoteDialogSeen"]
+  remoteDialog -->|no| resolveSpawn["Determine spawn mode&lt;br/&gt;(resume > flag > project config > default)"]
   saveSeen --> resolveSpawn
-  resolveSpawn --> register["POST /v1/environments/bridge&lt;br/&gt;register environment to get envId+secret"]
+  resolveSpawn --> register["POST /v1/environments/bridge&lt;br/&gt;register environment, get envId+secret"]
   register --> registerFail{"Registration failed?"}
-  registerFail -->|Yes| regErrExit["Print error&lt;br/&gt;exit"]
-  registerFail -->|No| preCreate["Optional: pre-create an empty session&lt;br/&gt;so the user has somewhere to type immediately"]
+  registerFail -->|yes| regErrExit["Print error&lt;br/&gt;exit"]
+  registerFail -->|no| preCreate["Optional: pre-create an empty session&lt;br/&gt;so the user has somewhere to type immediately"]
   preCreate --> enterLoop["Enter runBridgeLoop polling"]
 </pre>
 
 <ul>
-  <li>BRIDGE_MODE is the master switch; multi-session (--spawn/--capacity) has a separate <code>tengu_ccr_bridge_multi_session</code> rollout, and using these parameters without approval exits directly.</li>
-  <li>The trust check (checkHasTrustDialogAccepted) exists because bridge bypasses the main init flow, so no one pops the trust dialog for it; the user must have run <code>claude</code> normally at least once before.</li>
-  <li>Pre-creating a session (createBridgeSession) is non-blocking—failure does not block startup; the user just has to wait for the server to dispatch the first work item.</li>
+  <li>BRIDGE_MODE is the master switch; multi-session (--spawn/--capacity) has a separate <code>tengu_ccr_bridge_multi_session</code> rollout, and using these parameters without approval causes an immediate exit.</li>
+  <li>The trust check (checkHasTrustDialogAccepted) exists because bridge bypasses the main init flow and no one pops the trust dialog for it, so the user must have run <code>claude</code> normally at least once before.</li>
+  <li>Pre-creating a session (createBridgeSession) is non-blocking—failure does not block startup, it just means the user has to wait for the server to dispatch the first work item.</li>
 </ul>
 
-<h2>2. Authentication: Two Tokens, Two Layers</h2>
+<h2>2. Authentication: Two Tokens, Each for Its Own Segment</h2>
 
-<p>This is the most confusing part of the module, but it has clear layers. Bridge involves two credentials:</p>
+<p>This is the easiest part of the module to get confused about, but it has a clear layering. Bridge involves two credentials:</p>
 
 <ul>
-  <li><b>OAuth access token</b>: the one you get from <code>/login</code>, used by bridge itself to call server-side management APIs directly (register environment, poll for work, stop work, archive session, unregister environment). This uses <code>withOAuthRetry</code>: on 401, it first tries to refresh the OAuth token once; if refresh succeeds, the request is retried once, and only a second 401 is treated as fatal.</li>
-  <li><b>Session ingress JWT</b> (<code>session_ingress_token</code>): when the server dispatches each work item, it sends a short-lived JWT packed into the work secret (base64url-encoded JSON). This JWT is what proves "I am the legitimate worker for this session" on the <i>session communication channel</i> (WebSocket / SSE read stream + POST write stream). It expires (about 5 hours); after expiry the server dispatches the work again, and bridge gets a new JWT and reconnects.</li>
+  <li><b>OAuth access token</b>: the one you get from <code>/login</code>, used by bridge itself to call server-side management APIs directly (register environment, poll for work, stop work, archive session, unregister environment). This goes through <code>withOAuthRetry</code>: on 401 it first tries to refresh OAuth once; if refresh succeeds it retries the request once, and only a second 401 is treated as fatal.</li>
+  <li><b>Session ingress JWT</b> (<code>session_ingress_token</code>): when the server dispatches each work item, it packs a short-lived JWT into the work secret (base64url-encoded JSON) and sends it down. This JWT is what proves "I am the legitimate worker for this session" on the <i>session communication channel</i> (WebSocket / SSE read stream + POST write stream). It expires (about 5 hours), after which the server dispatches a new work item and bridge gets a new JWT to reconnect.</li>
 </ul>
 
-<p>There is also a <b>trusted device token</b> layer: when the <code>tengu_sessions_elevated_auth_enforcement</code> rollout is on, bridge includes it in the <code>X-Trusted-Device-Token</code> header when calling the registration API, so the server can require "elevated sessions must come from a registered trusted device". This token is enrolled at <code>/login</code> via <code>POST /auth/trusted_devices</code>, stored in the system keychain, and rolls over every 90 days.</p>
+<p>There is also a layer of <b>trusted device token</b>: when the <code>tengu_sessions_elevated_auth_enforcement</code> rollout is on, bridge includes it in the <code>X-Trusted-Device-Token</code> header when calling registration APIs, allowing the server to require "high-privilege sessions must come from a registered trusted device." This token is enrolled during <code>/login</code> via <code>POST /auth/trusted_devices</code>, stored in the system keychain, and rolls over with 90-day validity.</p>
 
 <pre class="mermaid">
 graph TD
-  login["/login login"] --> enrollDevice["POST /auth/trusted_devices&lt;br/&gt;enroll trusted device → keychain"]
+  login["/login"] --> enrollDevice["POST /auth/trusted_devices&lt;br/&gt;enroll trusted device → keychain"]
   login --> oauthToken["Get OAuth access token&lt;br/&gt;(valid ~8h)"]
   oauthToken --> bridgeApi["bridge calls management APIs&lt;br/&gt;register/poll/stop work/archive"]
   bridgeApi --> on401{"401?"}
-  on401 -->|Yes| refresh["handleOAuth401Error&lt;br/&gt;refresh OAuth"]
-  refresh --> refreshOk{"Refresh successful?"}
-  refreshOk -->|Yes| retryOnce["Retry once with new token"]
-  refreshOk -->|No| fatalAuth["Throw BridgeFatalError&lt;br/&gt;fatal exit"]
-  on401 -->|No| ok["Return normally"]
+  on401 -->|yes| refresh["handleOAuth401Error&lt;br/&gt;refresh OAuth"]
+  refresh --> refreshOk{"Refresh succeeded?"}
+  refreshOk -->|yes| retryOnce["Retry once with new token"]
+  refreshOk -->|no| fatalAuth["Throw BridgeFatalError&lt;br/&gt;fatal exit"]
+  on401 -->|no| ok["Return normally"]
 
   server["Server dispatches work item"] --> workSecret["work.secret&lt;br/&gt;base64url JSON"]
   workSecret --> decode["decodeWorkSecret"]
   decode --> jwt["Extract session_ingress_token&lt;br/&gt;(JWT, ~5h)"]
-  jwt --> ackHeartbeat["ack/heartbeat use JWT&lt;br/&gt;prove ownership of this session"]
-  jwt --> childSpawn["Pass to child CLI on spawn&lt;br/&gt;as channel credential"]
-  jwt --> refreshJwt["createTokenRefreshScheduler&lt;br/&gt;refresh 5min before expiry"]
+  jwt --> ackHeartbeat["ack/heartbeat use JWT&lt;br/&gt;to prove session ownership"]
+  jwt --> childSpawn["Passed to child CLI on spawn&lt;br/&gt;as communication channel credential"]
+  jwt --> refreshJwt["createTokenRefreshScheduler&lt;br/&gt;refresh 5 min before expiry"]
   refreshJwt --> jwtExpired{"Expired?"}
-  jwtExpired -->|v2| reconnect["reconnectSession triggers&lt;br/&gt;server to re-dispatch work"]
+  jwtExpired -->|v2| reconnect["reconnectSession triggers&lt;br/&gt;server to redispatch work"]
   jwtExpired -->|v1| pushOauth["Push new OAuth to child process&lt;br/&gt;(stdin update_env_var)"]
   reconnect --> server
 </pre>
 
 <ul>
-  <li>The JWT is not verified for signature; bridge only base64url-decodes the payload to read <code>exp</code> and schedules the refresh timer (jwtUtils.ts: decodeJwtExpiry). Signature verification is the server's job.</li>
-  <li>v1 (Session-Ingress) channels can accept either OAuth or JWT; bridge prefers OAuth because it has a standard refresh flow; v2 (CCR /worker/*) must use JWT because register_worker validates the session_id claim in the JWT, which OAuth does not have.</li>
-  <li>On 401/403 (unless it is a suppressible cosmetic 403), bridge fatally exits without retrying—authentication does not fix itself. 404/410 are treated as environment/session expired.</li>
-  <li>URL safety check: non-localhost base URLs must be HTTPS to prevent credentials leaking in plaintext.</li>
+  <li>The JWT is not verified for signature; only the payload is base64url-decoded to read <code>exp</code> and schedule refresh timers (jwtUtils.ts: decodeJwtExpiry). Signature verification is the server's job.</li>
+  <li>v1 (Session-Ingress) channels can accept either OAuth or JWT; bridge prefers OAuth because it has a standard refresh flow; v2 (CCR /worker/*) must use JWT because register_worker validates the session_id claim inside the JWT, which OAuth does not have.</li>
+  <li>On 401/403 (and not a suppressible cosmetic 403) bridge exits fatally without retry—authentication will not fix itself. 404/410 are treated as environment/session expired.</li>
+  <li>URL safety check: non-localhost base URLs must be HTTPS to prevent credentials from leaking in plaintext.</li>
 </ul>
 
 <h2>3. Bidirectional Message Flow: How IDE Clicks Reach the CLI and CLI Output Returns to the IDE</h2>
 
-<p>This is the core of the module. The channel is not actually IDE-to-CLI direct; both sides connect to the server, which relays traffic:</p>
+<p>This is the core of the module. The channel is not actually a direct IDE-to-CLI connection; both sides connect through the server relay:</p>
 
-<p><b>Upstream (CLI → server → IDE)</b>: the child CLI process runs with <code>--print --output-format stream-json</code>. Every NDJSON line it emits (assistant text, tool_use, result, etc.) is read by the bridge parent process from its stdout, parsed into an activity summary ("Editing src/foo.ts") to update the status line; at the same time these SDK messages are POSTed to session-ingress via the transport's <code>writeBatch</code>, and the server distributes them to IDE/Web clients subscribed to that session.</p>
+<p><b>Uplink (CLI → server → IDE)</b>: the child CLI process runs with <code>--print --output-format stream-json</code>; every NDJSON line it produces (assistant text, tool_use, result, etc.) is read by the bridge parent process from its stdout, parsed into an activity summary ("Editing src/foo.ts") to update the status line; at the same time these SDK messages are POSTed to session-ingress via the transport's <code>writeBatch</code>, and the server distributes them to IDE/Web clients subscribed to that session.</p>
 
-<p><b>Downstream (IDE → server → CLI)</b>: when the user types a message in the IDE, clicks "Apply edits", or approves a permission, the IDE extension sends it to the server, which wraps "there is work to do" as a work item and drops it into this environment's queue. The bridge polling loop <code>pollForWork</code> pulls the work, decodes the JWT, acks it, and connects to the ingress channel (v1 WebSocket or v2 SSE). After that, the server pushes user messages and control_request (interrupt, set_model, can_use_tool permission questions) down through this channel; bridge forwards them to the child process or to local permission callbacks.</p>
+<p><b>Downlink (IDE → server → CLI)</b>: when the user types a sentence in the IDE, clicks "Apply edits," or approves a permission, those actions are sent by the IDE extension to the server, which packages "there is work" into a work item and drops it into this environment's queue. The bridge polling loop <code>pollForWork</code> pulls the work, decodes the JWT, acks it, and connects to the ingress channel (v1 WebSocket or v2 SSE). The server then pushes user messages and control_request messages (interrupt, set_model, can_use_tool permission asks) down this channel; bridge forwards them to the child process or local permission callbacks.</p>
 
 <pre class="mermaid">
 graph TD
-  ide["IDE extension&lt;br/&gt;(VS Code/JetBrains)"] -->|"User types/clicks"| server["Server&lt;br/&gt;(environments API)"]
-  server -->|"work item queued"| poll["bridge: pollForWork polling"]
+  ide["IDE extension&lt;br/&gt;(VS Code/JetBrains)"] -->|"user types/clicks"| server["Server&lt;br/&gt;(environments API)"]
+  server -->|"work item enqueued"| poll["bridge: pollForWork polling"]
   poll --> decode["decodeWorkSecret to get JWT"]
   decode --> ack["acknowledgeWork ack"]
   ack --> connect["Connect ingress channel&lt;br/&gt;v1=HybridTransport(WS+POST)&lt;br/&gt;v2=SSETransport+CCRClient"]
-  connect --> pushDown["Server pushes downstream messages&lt;br/&gt;user message/control_request"]
+  connect --> pushDown["Server pushes downlink messages&lt;br/&gt;user message/control_request"]
   pushDown --> route["handleIngressMessage routing"]
   route --> isCtrl{"control_request?"}
-  isCtrl -->|Yes| ctrlReq["handleServerControlRequest&lt;br/&gt;initialize/set_model/interrupt/&lt;br/&gt;set_permission_mode"]
-  isCtrl -->|No| isPermResp{"control_response?"}
-  isPermResp -->|Yes| permResp["onPermissionResponse&lt;br/&gt;permission reply dispatch"]
-  isPermResp -->|No| isUser{"User message?"}
-  isUser -->|Yes| inbound["onInboundMessage&lt;br/&gt;+ parse attachment file_uuid"]
-  isUser -->|No| drop["Ignore&lt;br/&gt;(echo/redelivery/non-user)"]
-  inbound --> childStdin["Write to child stdin&lt;br/&gt;--input-format stream-json"]
+  isCtrl -->|yes| ctrlReq["handleServerControlRequest&lt;br/&gt;initialize/set_model/interrupt/&lt;br/&gt;set_permission_mode"]
+  isCtrl -->|no| isPermResp{"control_response?"}
+  isPermResp -->|yes| permResp["onPermissionResponse&lt;br/&gt;permission reply dispatch"]
+  isPermResp -->|no| isUser{"User message?"}
+  isUser -->|yes| inbound["onInboundMessage&lt;br/&gt;+ parse attachment file_uuid"]
+  isUser -->|no| drop["Ignore&lt;br/&gt;(echo/redelivery/non-user)"]
+  inbound --> childStdin["Write to child process stdin&lt;br/&gt;--input-format stream-json"]
   ctrlReq --> childStdin
   permResp --> childStdin
 
   childCli["Child CLI process&lt;br/&gt;(claude --print --sdk-url ...)"] -->|"stdout NDJSON"| parse["sessionRunner parses lines"]
   parse --> activity["Update activity summary&lt;br/&gt;status line display"]
-  parse --> ctrlReqOut["Detect control_request&lt;br/&gt;(can_use_tool permission question)"]
+  parse --> ctrlReqOut["Detect control_request&lt;br/&gt;(can_use_tool permission ask)"]
   parse --> sdkMsg["Extract SDK message"]
   ctrlReqOut --> forwardPerm["Forward to server&lt;br/&gt;→ IDE shows permission dialog"]
   forwardPerm --> permResp
@@ -137,83 +130,83 @@ graph TD
 </pre>
 
 <ul>
-  <li>Echo deduplication is critical: messages bridge POSTs itself are echoed back by the server. <code>BoundedUUIDSet</code> (ring buffer, capacity 2000) records recently sent UUIDs; echoed ones are dropped.</li>
-  <li>Redelivery deduplication: the server redelivers historical prompts when transport switches or sequence-number negotiation fails; <code>recentInboundUUIDs</code> provides a safety net filter.</li>
-  <li>Permissions form a bidirectional loop: child CLI wants to use a tool → sends control_request(can_use_tool) → bridge forwards to server → IDE shows dialog → user chooses → control_response returns → bridge forwards back to child stdin.</li>
-  <li>Attachment handling: files uploaded from the Web get a file_uuid and are sent down with the message; bridge uses OAuth to call <code>/api/oauth/files/{uuid}/content</code> to download them, writes them to <code>~/.claude/uploads/{sessionId}/</code>, prepends the <code>@"path"</code> prefix to the message content, and the child CLI's Read tool can read them.</li>
-  <li>v1/v2 selection is decided by the server per session (via <code>use_code_sessions</code> in the work secret), not by bridge itself; <code>CLAUDE_BRIDGE_USE_CCR_V2</code> is an internal Anthropic override switch.</li>
+  <li>Echo deduplication is critical: messages POSTed by bridge itself are echoed back by the server. <code>BoundedUUIDSet</code> (ring buffer, capacity 2000) records recently sent UUIDs; echoed ones are dropped.</li>
+  <li>Redelivery deduplication: when the server switches transports or sequence-number negotiation fails, it may redeliver historical prompts; <code>recentInboundUUIDs</code> provides a last-resort filter.</li>
+  <li>Permissions form a bidirectional loop: child CLI wants to use a tool → sends control_request(can_use_tool) → bridge forwards to server → IDE pops a dialog → user chooses → control_response returns → bridge forwards back to child CLI stdin.</li>
+  <li>Attachment handling: files uploaded from the Web get a file_uuid and are sent with the message; bridge downloads them via OAuth call <code>/api/oauth/files/{uuid}/content</code>, writes to <code>~/.claude/uploads/{sessionId}/</code>, prefixes <code>@"path"</code> to the message content, and the child CLI's Read tool can read it.</li>
+  <li>v1/v2 selection is decided by the server per session (work secret's <code>use_code_sessions</code>), not by bridge itself; <code>CLAUDE_BRIDGE_USE_CCR_V2</code> is an internal Anthropic force switch.</li>
 </ul>
 
-<h2>4. Disconnections, Session Expiry, and System Sleep: Recovery Paths</h2>
+<h2>4. Disconnections, Session Expiration, and System Sleep: Recovery Paths</h2>
 
-<p>Long-lived connections break. This module's recovery strategy has several layers, with the key goals of not losing user messages, not retrying forever, and distinguishing "transient network jitter" from "environment is dead".</p>
+<p>Long-lived connections sometimes break. This module's recovery strategy has several layers; the key goals are not to lose user messages, not to retry forever, and to distinguish "brief network jitter" from "the environment is dead."</p>
 
 <pre class="mermaid">
 graph TD
-  pollErr["pollForWork polling error"] --> isAborted{"signal aborted?"}
-  isAborted -->|Yes| break["Exit loop"]
-  isAborted -->|No| isFatal{"BridgeFatalError?"}
-  isFatal -->|Yes| classifyFatal{"401/403 auth?"}
-  classifyFatal -->|Yes| fatalExit["Fatal exit&lt;br/&gt;no retry"]
+  pollErr["pollForWork polling throws"] --> isAborted{"signal aborted?"}
+  isAborted -->|yes| break["Exit loop"]
+  isAborted -->|no| isFatal{"BridgeFatalError?"}
+  isFatal -->|yes| classifyFatal{"401/403 auth?"}
+  classifyFatal -->|yes| fatalExit["Fatal exit&lt;br/&gt;no retry"]
   classifyFatal -->|404/410 expired| fatalExit
-  isFatal -->|No| isConn{"Connection error?&lt;br/&gt;(ECONNRESET/ETIMEDOUT...)"}
-  isConn -->|Yes| sleepDetect{"Interval far greater than&lt;br/&gt;max backoff?&lt;br/&gt;(system sleep)"}
-  sleepDetect -->|Yes| resetBudget["Reset error budget&lt;br/&gt;fresh retry"]
-  sleepDetect -->|No| connBackoff["Exponential backoff 2s→120s&lt;br/&gt;give up after 10min"]
-  connBackoff --> heartbeatDuring["Keep heartbeating during backoff&lt;br/&gt;to keep 300s lease"]
-  isConn -->|No| generalBackoff["Generic error backoff&lt;br/&gt;give up after 10min"]
+  isFatal -->|no| isConn{"Connection error?&lt;br/&gt;(ECONNRESET/ETIMEDOUT...)"}
+  isConn -->|yes| sleepDetect{"Interval far greater than&lt;br/&gt;max backoff?&lt;br/&gt;(system sleep)"}
+  sleepDetect -->|yes| resetBudget["Reset error budget&lt;br/&gt;fresh retry"]
+  sleepDetect -->|no| connBackoff["Exponential backoff 2s→120s&lt;br/&gt;give up after 10 min"]
+  connBackoff --> heartbeatDuring["Keep heartbeating during backoff&lt;br/&gt;maintain 300s lease"]
+  isConn -->|no| generalBackoff["Generic error backoff&lt;br/&gt;give up after 10 min"]
   connBackoff --> reconnectedOk{"Recovered?"}
-  reconnectedOk -->|Yes| logReconnect["Print Reconnected"]
-  reconnectedOk -->|No| giveUp["Give up after 10min&lt;br/&gt;fatal exit"]
+  reconnectedOk -->|yes| logReconnect["Print Reconnected"]
+  reconnectedOk -->|no| giveUp["Give up after 10 min&lt;br/&gt;fatal exit"]
 
   wsClose["ingress channel onClose"] --> closeCode{"Close code"}
-  closeCode -->|Normal 1000| teardown["Tear down"]
-  closeCode -->|Abnormal| wakePoll["Wake polling loop&lt;br/&gt;quickly re-pull work"]
-  wakePoll --> freshWork["Server re-dispatches work&lt;br/&gt;with new JWT"]
+  closeCode -->|normal 1000| teardown["Run teardown"]
+  closeCode -->|abnormal| wakePoll["Wake polling loop&lt;br/&gt;quickly re-pull work"]
+  wakePoll --> freshWork["Server redispatches work&lt;br/&gt;with new JWT"]
   freshWork --> reconnect["onWorkReceived&lt;br/&gt;reconnect channel with new token"]
 
   env404["poll returns 404&lt;br/&gt;(environment deleted)"] --> envLost["onEnvironmentLost"]
-  envLost --> strategy1{"Strategy 1:&lt;br/&gt;re-register with same envId&lt;br/&gt;+ reconnectSession"}
-  strategy1 -->|Success| sameSession["Keep original session&lt;br/&gt;URL still valid"]
-  strategy1 -->|Failure| strategy2["Strategy 2:&lt;br/&gt;archive old session&lt;br/&gt;create new session on new env"]
-  strategy2 --> freshSession["currentSessionId updated&lt;br/&gt;reset sequence numbers / dedup sets"]
-  strategy2 --> retryLimit{"Reconstruction failed &gt; 3 times?"}
-  retryLimit -->|Yes| failed["Status → failed&lt;br/&gt;trigger onFatalError"]
-  retryLimit -->|No| continue["Continue polling"]
+  envLost --> strategy1{"Strategy 1:&lt;br/&gt;re-register same envId&lt;br/&gt;+ reconnectSession"}
+  strategy1 -->|success| sameSession["Keep original session&lt;br/&gt;URL still valid"]
+  strategy1 -->|failure| strategy2["Strategy 2:&lt;br/&gt;archive old session&lt;br/&gt;create new session on new env"]
+  strategy2 --> freshSession["currentSessionId updated&lt;br/&gt;reset sequence numbers/dedup sets"]
+  strategy2 --> retryLimit{"Rebuilt > 3 times?"}
+  retryLimit -->|yes| failed["State → failed&lt;br/&gt;trigger onFatalError"]
+  retryLimit -->|no| continue["Continue polling"]
 </pre>
 
 <ul>
-  <li>System sleep detection: if the interval between two polling errors is far greater than the maximum backoff (default 240s), the machine is judged to have slept, and the error budget is reset; otherwise it would be abandoned immediately on wake due to "already exceeded 10min".</li>
-  <li>Heartbeat to keep lease: work items have a 300s lease TTL; even while the channel is backing off and reconnecting, <code>heartbeatActiveWorkItems</code> continues to send heartbeats to prevent the server from reclaiming the lease.</li>
-  <li>JWT expiry → heartbeat receives 401/403 → bridge does not treat this as fatal but calls <code>reconnectSession</code> to have the server re-enqueue this work; the next poll gets the same work with a new JWT, and <code>onWorkReceived</code> reconnects the channel with the new token (existingHandle path).</li>
-  <li>Environment reconstruction has a 3-time limit to prevent infinite loops; the counter resets on success, so a failure hours later is not wrongly killed by historical accumulation.</li>
-  <li>Perpetual mode (daemon) teardown is "local exit, server stays"—no archiving, no stopping work, relying on the server's 300s lease to naturally return to pending; the next startup reads the pointer from <code>reconnectSession</code> to resume.</li>
+  <li>System sleep detection: if the interval between two polling errors is far greater than the max backoff (default 240s), the machine is considered to have slept, and the error budget is reset; otherwise it would immediately be abandoned as "already over 10 min" upon waking.</li>
+  <li>Heartbeat keeps the lease: work items have a 300s lease TTL; even while the channel is backing off and reconnecting, <code>heartbeatActiveWorkItems</code> keeps sending heartbeats to prevent the lease from expiring and being reclaimed by the server.</li>
+  <li>JWT expiration → heartbeats receive 401/403 → bridge does not treat this as fatal, but calls <code>reconnectSession</code> to requeue the work on the server side; the next poll gets the same work with a new JWT, and <code>onWorkReceived</code> reconnects the channel with the new token (existingHandle path).</li>
+  <li>Environment reconstruction has a 3-attempt cap to prevent infinite loops; after success the counter resets, so a failure hours later is not mistakenly killed by historical accumulation.</li>
+  <li>Perpetual mode (daemon) teardown is "local exit, server keeps"—no result, no stopWork; it relies on the server's 300s lease to naturally return to pending, and the next startup uses <code>reconnectSession</code> to resume from the pointer.</li>
 </ul>
 
-<h2>5. Session Lifecycle: From Dispatch to Teardown</h2>
+<h2>5. Session Lifecycle: From Dispatch to Cleanup</h2>
 
-<p>From the moment a session is dispatched to when it ends, bridge manages its directory, timeout, title, worktree cleanup, and reporting stop to the server. This is the Lifecycle perspective supplement.</p>
+<p>From the moment a session is dispatched until it ends, bridge manages its directory, timeout, title, worktree cleanup, and server-side stop notification. This is a lifecycle-oriented supplement.</p>
 
 <pre class="mermaid">
 graph TD
-  workReceived["work item arrives&lt;br/&gt;type=session"] --> existing{"Is this sessionId&lt;br/&gt;already running?"}
-  existing -->|Yes| updateToken["Update ingress token&lt;br/&gt;reschedule refresh timer&lt;br/&gt;push new token to child stdin"]
-  existing -->|No| atCap{"Capacity limit reached?"}
-  atCap -->|Yes| skipSpawn["Do not spawn&lt;br/&gt;wait for capacity"]
-  atCap -->|No| spawn["safeSpawn child CLI&lt;br/&gt;--print --sdk-url ..."]
-  spawn --> spawnFail{"Spawn threw?"}
-  spawnFail -->|Yes| stopWorkFail["stopWork report stop&lt;br/&gt;clean worktree"]
-  spawnFail -->|No| register["Record in activeSessions&lt;br/&gt;set start time/timeout/refresh timer"]
+  workReceived["work item arrives&lt;br/&gt;type=session"] --> existing{"This sessionId&lt;br/&gt;already running?"}
+  existing -->|yes| updateToken["Update ingress token&lt;br/&gt;reschedule refresh timer&lt;br/&gt;push new token to child stdin"]
+  existing -->|no| atCap{"At capacity limit?"}
+  atCap -->|yes| skipSpawn["Do not spawn&lt;br/&gt;wait for capacity"]
+  atCap -->|no| spawn["safeSpawn child CLI&lt;br/&gt;--print --sdk-url ..."]
+  spawn --> spawnFail{"Spawn throws?"}
+  spawnFail -->|yes| stopWorkFail["stopWork notify failure&lt;br/&gt;clean worktree"]
+  spawnFail -->|no| register["Record in activeSessions&lt;br/&gt;set start time/timeout/refresh timer"]
   register --> timeout["Set 24h timeout watchdog"]
   register --> title["Fetch session title async&lt;br/&gt;derive title on first user message"]
-  register --> status["Start real-time status line refresh&lt;br/&gt;(tool trace / elapsed time)"]
+  register --> status["Start live status line refresh&lt;br/&gt;(tool trace/elapsed time)"]
   status --> running["Session running"]
-  running -->|"Child process close"| done["onSessionDone"]
+  running -->|"child process close"| done["onSessionDone"]
   done --> status2{"Exit status"}
-  status2 -->|completed| logComplete["Print complete"]
-  status2 -->|failed| logFail["Print failed&lt;br/&gt;(not shutdown-induced)"]
-  status2 -->|interrupted| skipLog["Skip stop report&lt;br/&gt;(server-initiated or shutdown)"]
-  logComplete --> stopWork["stopWorkWithRetry report stop"]
+  status2 -->|completed| logComplete["Print completed"]
+  status2 -->|failed| logFail["Print failed&lt;br/&gt;(not caused by shutdown)"]
+  status2 -->|interrupted| skipLog["Skip stop notification&lt;br/&gt;(server-initiated or shutdown)"]
+  logComplete --> stopWork["stopWorkWithRetry notify stop"]
   logFail --> stopWork
   stopWork --> worktree["Clean worktree&lt;br/&gt;(worktree mode)"]
   worktree --> mode{"Spawn mode?"}
@@ -222,49 +215,49 @@ graph TD
 </pre>
 
 <ul>
-  <li>Spawn mode is one of three: <code>single-session</code> (exit after one session), <code>same-dir</code> (multiple sessions share cwd), or <code>worktree</code> (each session has its own git worktree, no file collisions). Pressing <code>w</code> while running toggles between same-dir and worktree.</li>
-  <li>Title strategy: a server-set name (--name/Web rename) takes priority; otherwise wait for the first real user message, deriveSessionTitle truncates to 80 characters, and PATCHes it back to the server so the IDE list can display it.</li>
-  <li>24h timeout watchdog: when triggered, SIGKILL the child process, mark timedOut, and onSessionDone reclassifies interrupted as failed, still reporting stop and cleaning up.</li>
-  <li>Graceful shutdown sequence: SIGTERM → wait 30s grace → SIGKILL if still alive → stop all work → clean worktrees → archive sessions → unregister environment → clear crash pointer. For single-session non-fatal exits, the session and environment are intentionally left alive, printing <code>claude remote-control --continue</code> so the user can resume.</li>
-  <li>Crash recovery pointer (bridgePointer): written to <code>.claude/bridge_pointer</code> immediately after spawn, mtime refreshed hourly; cleared on normal teardown, left behind on crash, and read on next <code>--continue</code> to resume.</li>
+  <li>Spawn mode is one of three: <code>single-session</code> (exit after one session), <code>same-dir</code> (multiple sessions share cwd), <code>worktree</code> (each session has its own git worktree, no file collisions). Pressing <code>w</code> while running toggles between same-dir and worktree.</li>
+  <li>Title strategy: server-set name (--name/Web rename) takes priority; otherwise wait for the first real user message, deriveSessionTitle truncates to 80 characters, and PATCHes back to the server so the IDE list can display it.</li>
+  <li>24h timeout watchdog: when triggered, SIGKILL the child process, mark timedOut, and onSessionDone reclassifies interrupted as failed, then stops and cleans up normally.</li>
+  <li>Graceful shutdown order: SIGTERM → wait 30s grace → SIGKILL if still alive → stop all work → clean worktree → archive session → unregister environment → clear crash pointer. For single-session non-fatal exits, the session and environment are deliberately left alive and <code>claude remote-control --continue</code> is printed so the user can resume.</li>
+  <li>Crash recovery pointer (bridgePointer): immediately after spawn, write to <code>.claude/bridge_pointer</code> and refresh mtime hourly; normal teardown removes it, a crash leaves it, and next <code>--continue</code> reads it to recover.</li>
 </ul>
 
-<h2>6. REPL Bridge: Another Connection Style Inside an Interactive Session</h2>
+<h2>6. REPL Bridge: Another Way to Connect Inside an Interactive Session</h2>
 
-<p>The above describes the standalone <code>claude remote-control</code> process mode. There is another form: the user is already running a normal interactive <code>claude</code> REPL and wants to also control the same session from Web/mobile—this goes through <code>initReplBridge</code> / <code>initBridgeCore</code>. It shares bridgeApi, workSecret, bridgeMessaging, and jwtUtils with standalone mode, but differs in that: the transport lives in this process (HybridTransport/SSETransport), no child process is spawned; environment/session lifecycle is bound to the REPL process; and there is extra reconnect-in-place logic for environment loss.</p>
+<p>The above covers the standalone <code>claude remote-control</code> process mode. There is another form: the user is already running a normal interactive <code>claude</code> REPL and wants to also control the same session from Web/mobile—this goes through <code>initReplBridge</code> / <code>initBridgeCore</code>. It shares bridgeApi, workSecret, bridgeMessaging, and jwtUtils with standalone mode, but differs in that: the transport is in-process (HybridTransport/SSETransport) and no child process is spawned; environment/session lifecycle is bound to the REPL process; and there is additional in-place reconstruction logic after environment loss.</p>
 
 <pre class="mermaid">
 graph TD
-  replStart["REPL start / /remote-control"] --> initRepl["initReplBridge"]
+  replStart["REPL startup / /remote-control"] --> initRepl["initReplBridge"]
   initRepl --> gateCheck{"BRIDGE_MODE + OAuth +&lt;br/&gt;org policy allowed?"}
-  gateCheck -->|No| skip["Silently skip"]
-  gateCheck -->|Yes| registerEnv["Register environment"]
-  registerEnv --> createSess["Create/resume session&lt;br/&gt;write crash pointer"]
+  gateCheck -->|no| skip["Silently skip"]
+  gateCheck -->|yes| registerEnv["Register environment"]
+  registerEnv --> createSess["Create/restore session&lt;br/&gt;write crash pointer"]
   createSess --> startPoll["Start startWorkPollLoop"]
   startPoll --> pollWait["Poll waiting for work"]
   pollWait --> workArrived["Work arrives"]
   workArrived --> sameSess{"workSessionId&lt;br/&gt;matches current session?"}
-  sameSess -->|No| rejectForeign["Reject foreign session"]
-  sameSess -->|Yes| closeOld["Close old transport&lt;br/&gt;carry over SSE sequence number"]
+  sameSess -->|no| rejectForeign["Reject foreign session"]
+  sameSess -->|yes| closeOld["Close old transport&lt;br/&gt;carry over SSE sequence number"]
   closeOld --> pickV{"v1 or v2?"}
-  pickV -->|v1| hybrid["HybridTransport&lt;br/&gt;WS read + POST write&lt;br/&gt;use OAuth"]
-  pickV -->|v2| sse["createV2ReplTransport&lt;br/&gt;SSE read + CCRClient write&lt;br/&gt;use JWT, registerWorker"]
+  pickV -->|v1| hybrid["HybridTransport&lt;br/&gt;WS read + POST write&lt;br/&gt;uses OAuth"]
+  pickV -->|v2| sse["createV2ReplTransport&lt;br/&gt;SSE read + CCRClient write&lt;br/&gt;uses JWT, registerWorker"]
   hybrid --> wire["wireTransport&lt;br/&gt;attach onConnect/onData/onClose"]
   sse --> wire
-  wire --> flush["onConnect: first history flush&lt;br/&gt;cap 200 messages"]
+  wire --> flush["onConnect: first flush of history&lt;br/&gt;cap 200 messages"]
   flush --> ready["onStateChange connected&lt;br/&gt;channel ready"]
-  ready --> twoWay["Bidirectional message flow&lt;br/&gt;(same as section 3)"]
+  ready --> twoWay["Bidirectional message flow&lt;br/&gt;(same as diagram 3)"]
   twoWay --> envLost2{"poll 404?"}
-  envLost2 -->|Yes| reconnect["doReconnect&lt;br/&gt;strategy 1 in-place / strategy 2 new"]
+  envLost2 -->|yes| reconnect["doReconnect&lt;br/&gt;strategy 1 in-place / strategy 2 new"]
   reconnect --> startPoll
   twoWay --> teardown2["teardown: send result → stopWork → archive → unregister"]
 </pre>
 
 <ul>
-  <li>Carrying over the SSE sequence number (<code>lastTransportSequenceNum</code>) is a key detail: when switching transports, the old high-water mark is carried over, and the new SSE first connection sends <code>from_sequence_num</code>; otherwise the server would replay the entire session history from 0—treating every historical prompt as a new message.</li>
-  <li>The initial history flush uses a flushGate: new messages are queued during the flush to avoid arriving out of order with historical POSTs on the server.</li>
-  <li>Perpetual mode (daemon) teardown does not send result, stop work, or close transport—local exit, server stays, relying on the 300s lease to return to pending; next <code>--continue</code> reads the pointer from <code>reconnectSession</code> to resume.</li>
-  <li>Outbound-only mode: only POST upstream, does not receive downstream control_request, and returns errors for mutable requests (interrupt/set_model)—used for "you may only watch my local results, not control me from outside" scenarios.</li>
+  <li>SSE sequence number carry-over (<code>lastTransportSequenceNum</code>) is a critical detail: when swapping transports, bring the old high-water mark so the new SSE first connection can send <code>from_sequence_num</code>; otherwise the server replays the entire session history from 0, treating each historical prompt as a new message.</li>
+  <li>Initial history flush has a flushGate: while history is being flushed, new messages are queued to avoid interleaving with historical POSTs and causing out-of-order arrival at the server.</li>
+  <li>Perpetual mode (daemon) teardown does not send result, stop work, or close transport—local exit, server keeps, relying on the 300s lease to return to pending; next <code>--continue</code> uses <code>reconnectSession</code> to resume from the pointer.</li>
+  <li>Outbound-only mode: only POST uplink, does not receive downlink control_request, and returns errors for mutable requests (interrupt/set_model)—used for "you may only watch my local results, not control me from outside" scenarios.</li>
 </ul>
 
 <script>
@@ -414,5 +407,4 @@ window.__sourceMap = {
 <aside id="source-panel"><div id="source-header"></div><div id="monaco-container"></div></aside>
 <script src="../assets/codeindex-runtime.js"></script>
 <script src="../assets/codeindex.js"></script>
-</body>
-</html>
+</body></html>

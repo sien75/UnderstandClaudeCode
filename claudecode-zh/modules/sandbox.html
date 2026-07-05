@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html lang="zh"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>沙箱机制（OS 级执行隔离）</title><link rel="stylesheet" href="../assets/codeindex.css"></head><body>
+<nav class="topnav"><a href="../index.html">← 返回总览</a></nav>
+<h1>沙箱机制（OS 级执行隔离）</h1>
+
+<p>当 Claude 准备跑一条 bash 命令、读写文件、或发起网络请求时，系统要决定一件事：这条命令要不要被关进操作系统级沙箱里跑。沙箱是一道硬安全边界——它由 <code>@anthropic-ai/sandbox-runtime</code> 在 OS 层实现（macOS 用 sandbox-exec，Linux/WSL2 用 bubblewrap+socat），限制进程能写哪些文件、能连哪些主机。违规不会让 Claude 飙到不该去的地方，而是被拦下来、记一笔、必要时弹窗问用户。</p>
+
+<p>这个模块的入口不是某个 UI 按钮，而是 agent 自主执行工具的那一瞬间：BashTool 在真正 spawn 子进程前，会问 <code>shouldUseSandbox(input)</code>，得到 yes 就把原命令交给 <code>SandboxManager.wrapWithSandbox</code> 包一层沙箱启动器再 spawn。命令跑完后，<code>cleanupAfterCommand</code> 清掉临时目录、扫掉被攻击者植入的 bare-git 文件。整个生命周期由 <code>SandboxManager</code>（adapter）统一对外暴露，内部转发给外部包的 <code>BaseSandboxManager</code>。</p>
+
+<dl>
+  <dt>输入</dt>
+  <dd>用户/agent 触发的一条 bash 命令（含 <code>dangerouslyDisableSandbox</code> 标志）+ 当前合并好的 settings（permissions allow/deny 规则、sandbox.* 配置）+ 平台/依赖检测结果</dd>
+  <dt>输出</dt>
+  <dd>一条要么原样、要么被沙箱启动器包裹的命令字符串；执行结果里被标注过的 stderr；可能的违规事件、权限弹窗、以及（用户同意后）持久化到本地 settings 的 WebFetch(domain) 规则</dd>
+</dl>
+
+<ul>
+  <li>沙箱不是"可选美化"：当 <code>autoAllowBashIfSandboxed</code> 打开时，沙箱命中 = 自动放行 bash（绕过 ask 规则）。所以"要不要关沙箱"直接决定了"要不要弹权限"，二者是同一个决策点。</li>
+  <li>外部包 <code>@anthropic-ai/sandbox-runtime</code> 是真正的 OS 级实现，本模块只做"CLI settings → runtime config"的翻译和事件回流，不读它的源码。</li>
+  <li>有三道独立闸门：平台/依赖是否支持、settings 是否 enabled、单条命令是否被排除/<code>dangerouslyDisableSandbox</code> 豁免。任一不满足都不进沙箱。</li>
+  <li>违规和权限是两条回流路径：网络违规走 ask callback 弹窗；FS/网络违规走 violation store 沉淀到 UI 展开。</li>
+</ul>
+
+<h2>图一：一条 bash 命令的沙箱决策与执行流</h2>
+
+<p>从用户视角看：Claude 决定跑 <code>npm install</code>。BashTool 在 spawn 之前会先问"这条要不要进沙箱"，问的顺序是"全局开关 → 显式豁免 → 命令是否在排除名单 → 默认进沙箱"。一旦决定进沙箱，命令字符串会被 sandbox-runtime 包成 <code>bwrap ... -- sh -c '原命令'</code>（macOS 类似），spawn 后由 OS 层强制限制读写和网络。命令结束后清场，并把 stderr 里被 sandbox-runtime 标记的违规行回填到给 Claude 看的输出里。</p>
+
+<pre class="mermaid">
+graph TD
+  bash-call["BashTool.call 收到要执行的命令"] --> exec-opts["构造 exec 选项，传 shouldUseSandbox(input)"]
+  exec-opts --> sus["shouldUseSandbox: 总闸门"]
+  sus --> sus-enabled{"沙箱全局启用?&lt;br/&gt;(平台+依赖+enabled)"}
+  sus-enabled -->|否| no-sandbox["不进沙箱，原样 spawn"]
+  sus-enabled -->|是| sus-disable{"dangerouslyDisableSandbox&lt;br/&gt;且允许未沙箱命令?"}
+  sus-disable -->|是| no-sandbox
+  sus-disable -->|否| sus-cmd{"有 command?"}
+  sus-cmd -->|否| no-sandbox
+  sus-cmd -->|是| excl{"命中 excludedCommands?&lt;br/&gt;(用户名单 / ant 动态名单)"}
+  excl -->|是| no-sandbox
+  excl -->|否| yes-sandbox["返回 true：进沙箱"]
+  yes-sandbox --> shell-wrap["Shell.ts: 调 wrapWithSandbox"]
+  shell-wrap --> init-wait{"已 initialize?"}
+  init-wait -->|否| init-err["抛 Sandbox 未初始化错误"]
+  init-wait -->|是| runtime-wrap["BaseSandboxManager.wrapWithSandbox&lt;br/&gt;生成 bwrap/sandbox-exec 启动串"]
+  runtime-wrap --> mkdir-tmp["创建 0700 沙箱临时目录"]
+  mkdir-tmp --> spawn["spawn 包裹后的命令"]
+  spawn --> run["子进程在 OS 沙箱内执行"]
+  run --> violate{"有 FS/网络违规?"}
+  violate -->|是| record["违规写入 SandboxViolationStore"]
+  violate -->|否| done["正常结束"]
+  record --> done
+  done --> annotate["BashTool: annotateStderrWithSandboxFailures&lt;br/&gt;把违规标注到 stdout"]
+  annotate --> cleanup["Shell.ts finally: cleanupAfterCommand"]
+  cleanup --> scrub["scrubBareGitRepoFiles: 删掉被植入的 bare-git 文件"]
+  no-sandbox --> spawn-plain["直接 spawn 原命令，无 OS 限制"]
+</pre>
+
+<h2>图二：沙箱限制配置怎么从 settings 装配出来</h2>
+
+<p>这一步发生在 <code>initialize()</code> 和每次 settings 变更时。<code>convertToSandboxRuntimeConfig</code> 把分散在多个 settings 源（user/project/local/policy/flag）里的 permissions 规则和 <code>sandbox.*</code> 字段，翻译成 sandbox-runtime 能吃的 <code>SandboxRuntimeConfig</code>（network + filesystem + ignoreViolations + ripgrep）。关键点是路径语义有两套——permission 规则里 <code>/foo</code> 是"相对 settings 文件目录"，而 <code>sandbox.filesystem.*</code> 里 <code>/foo</code> 是绝对路径，不能混。另外有一批"无条件硬编码"的拒写路径：所有 settings.json、<code>.claude/skills</code>、bare-git 文件，这些是防逃逸的护城河。</p>
+
+<pre class="mermaid">
+graph TD
+  init["initialize() 启动"] --> wt["detectWorktreeMainRepoPath&lt;br/&gt;解析 .git 是否指向主仓"]
+  wt --> conv["convertToSandboxRuntimeConfig(settings)"]
+  conv --> net-branch["装网络域"]
+  conv --> fs-branch["装文件系统路径"]
+  conv --> rg-branch["装 ripgrep 配置"]
+  net-branch --> net-managed{"allowManagedDomainsOnly?"}
+  net-managed -->|是| net-policy["只取 policy 的 allowedDomains + WebFetch(domain) allow"]
+  net-managed -->|否| net-all["合并所有源的 sandbox.network.allowedDomains + WebFetch(domain) allow"]
+  net-all --> net-deny["扫所有源的 WebFetch(domain) deny → deniedDomains"]
+  net-policy --> net-deny
+  fs-branch --> fs-always["硬编码：allowWrite=['.', claudeTempDir]&lt;br/&gt;denyWrite=所有 settings.json + managedDropInDir"]
+  fs-always --> fs-skills["denyWrite 追加 .claude/skills (原始+当前 cwd)"]
+  fs-skills --> fs-baregit["扫 cwd 的 HEAD/objects/refs/hooks/config&lt;br/&gt;存在→denyWrite；不存在→加入 scrubPaths"]
+  fs-baregit --> fs-wt{"worktree 主仓?"}
+  fs-wt -->|是| fs-wt-allow["allowWrite 追加主仓路径"]
+  fs-wt -->|否| fs-add-dir["allowWrite 追加 --add-dir 目录"]
+  fs-wt-allow --> fs-add-dir
+  fs-add-dir --> fs-loop["遍历每个 settings 源"]
+  fs-loop --> fs-perm["从 Edit/Read allow/deny 规则抽路径&lt;br/&gt;(resolvePathPatternForSandbox: // → 绝对, / → settings 相对)"]
+  fs-perm --> fs-sandbox["从 sandbox.filesystem.* 抽路径&lt;br/&gt;(resolveSandboxFilesystemPath: / = 绝对, ~ 展开)"]
+  fs-sandbox --> fs-managed-read{"allowManagedReadPathsOnly?"}
+  fs-managed-read -->|是| fs-read-policy["allowRead 只取 policy 源"]
+  fs-managed-read -->|否| fs-read-all["allowRead 取所有源"]
+  fs-read-policy --> fs-assemble["组装 filesystem: {denyRead,allowRead,allowWrite,denyWrite}"]
+  fs-read-all --> fs-assemble
+  net-deny --> net-assemble["组装 network: {allowedDomains,deniedDomains,unixSockets,proxy...}"]
+  rg-branch --> rg-pick["优先用 settings.sandbox.ripgrep；否则用内置 ripgrepCommand()"]
+  net-assemble --> out["返回 SandboxRuntimeConfig"]
+  fs-assemble --> out
+  rg-pick --> out
+  out --> subscribe["订阅 settingsChangeDetector&lt;br/&gt;变更时 updateConfig 动态刷新"]
+</pre>
+
+<h2>图三：违规事件处理与权限回流</h2>
+
+<p>沙箱在 OS 层拦截后，回流有两条独立的路。<strong>网络路</strong>：sandbox-runtime 跑命令时遇到一个没在 allowedDomains 里的主机，会回调 <code>SandboxAskCallback</code>——这个 callback 在 REPL 里被装成"排队一个 SandboxPermissionRequest 弹窗"，用户选 Yes/不再问/No。选"不再问"会把 <code>WebFetch(domain:host)</code> 作为 allow 规则持久化到 localSettings，并立即 <code>refreshConfig</code> 让在途请求也享受到新规则。<strong>FS/通用路</strong>：违规被写进 <code>SandboxViolationStore</code>，<code>annotateStderrWithSandboxFailures</code> 把它缝进命令输出告诉 Claude，UI 端两个组件订阅 store 展示计数和最近 10 条。另外还有一条启动硬门：若 <code>failIfUnavailable=true</code> 且沙箱起不来，REPL 直接退出不肯跑——这是给企业部署的硬安全闸。</p>
+
+<pre class="mermaid">
+graph TD
+  start["沙箱内命令触发越界行为"] --> kind{"违规类型?"}
+  kind -->|网络主机未授权| ask["sandbox-runtime 调 SandboxAskCallback(hostPattern)"]
+  kind -->|FS 写越界 / 其他| store["写入 SandboxViolationStore"]
+  ask --> managed{"allowManagedDomainsOnly?"}
+  managed -->|是| block["直接返回 false，拦截"]
+  managed -->|否| queue["REPL: 排入 sandboxPermissionRequestQueue"]
+  queue --> swarm{"swarm worker?"}
+  swarm -->|是| mailbox["通过 mailbox 转给 leader 审批"]
+  swarm -->|否| bridge{"Remote Control bridge 连着?"}
+  bridge -->|是| remote["同时发 can_use_tool 给远端用户"]
+  bridge -->|否| local["本地弹 SandboxPermissionRequest"]
+  mailbox --> wait-worker["worker 等待 leader 回复"]
+  wait-worker --> local
+  remote --> local
+  local --> choice{"用户选择?"}
+  choice -->|Yes| allow-once["allow=true, 不持久化"]
+  choice -->|Yes 不再问| allow-persist["allow=true, persistToSettings=true"]
+  choice -->|No / Esc| deny["allow=false"]
+  allow-persist --> write-rule["把 WebFetch(domain:host) 写入 localSettings.allow"]
+  write-rule --> refresh["SandboxManager.refreshConfig() 立即刷新内存配置"]
+  refresh --> resolve["resolve 所有同 host 的 pending 请求"]
+  allow-once --> resolve
+  deny --> resolve
+  store --> annotate["BashTool: annotateStderrWithSandboxFailures&lt;br/&gt;把违规行缝进 stdout 给 Claude 看"]
+  store --> expanded["SandboxViolationExpandedView 订阅 store&lt;br/&gt;展示总数+最近10条 (macOS only)"]
+  store --> footer["SandboxPromptFooterHint 订阅 store&lt;br/&gt;提示行底部显示最近违规计数"]
+  block --> done["网络请求被拒绝，命令继续在沙箱内"]
+  resolve --> done2["命令按用户决定继续/中止"]
+  annotate --> done2
+</pre>
+
+<ul>
+  <li><code>autoAllowBashIfSandboxed</code> 把"沙箱命中"和"权限自动放行"焊在一起：在 <code>hasPermissionsToUseToolInner</code> 里，只要 shouldUseSandbox 返回 true 且 auto-allow 开着，就跳过 Bash 的 ask 规则直接 allow，但显式 deny/ask 规则仍优先（含子命令级检查，防 <code>echo ok && rm -rf /</code> 逃逸）。</li>
+  <li><code>excludedCommands</code> 是便利特性不是安全边界——代码注释明确写了真正的安全控制是会弹窗的权限系统。它按 prefix/exact/wildcard 匹配，且对复合命令按 <code>&&</code> 拆分逐个查，避免首段命中就整条逃逸。</li>
+  <li>路径解析两套语义是高频坑：<code>Edit(/foo)</code> 的 <code>/foo</code> 是"相对 settings 文件目录"，而 <code>sandbox.filesystem.allowWrite: ["/foo"]</code> 的 <code>/foo</code> 是绝对路径。后者是 #30067 的修复——用户写在 sandbox 配置里时合理期待绝对路径。 <code>//foo</code> 是历史逃逸写法，两套都把它当绝对路径。</li>
+  <li>启动时若 <code>failIfUnavailable=true</code> 且沙箱起不来（缺依赖/不支持平台/不在 enabledPlatforms），REPL 直接 <code>gracefulShutdownSync(1)</code> 退出，拒绝在无沙箱状态下运行——给 NVIDIA 这类企业部署的硬闸。否则只发一条 <code>sandbox disabled</code> 通知指向 <code>/sandbox</code>。</li>
+  <li>裸 git 仓逃逸（#29316）：攻击者在 cwd 植入 <code>HEAD/objects/refs</code> 让 Claude 后续的未沙箱 git 把 cwd 当 bare 仓 + 触发 <code>core.fsmonitor</code>。adapter 在装配置时 stat 这些文件，存在的 denyWrite（沙箱内 ro-bind），不存在的加入 <code>bareGitRepoScrubPaths</code>，在 <code>cleanupAfterCommand</code> 里删掉，让未沙箱的 git 看不到。</li>
+  <li>settings 变更通过 <code>settingsChangeDetector</code> 订阅动态刷新，权限弹窗"不再问"还会额外手动 <code>refreshConfig</code> 一次防竞态（在 settings 文件落盘事件回来前，pending 请求可能滑过去用旧配置）。</li>
+  <li>swarm 场景下 worker 的网络权限请求通过 mailbox 转给 leader 审批；leader 端 <code>useInboxPoller</code> 收到 <code>SandboxPermissionRequestMessage</code> 后弹同一个 <code>SandboxPermissionRequest</code> 组件。</li>
+</ul>
+
+<script>
+window.__sourceMap = {
+  "bash-call": { "file": "src/tools/BashTool/BashTool.tsx", "startLine": 880, "endLine": 898 },
+  "exec-opts": { "file": "src/tools/BashTool/BashTool.tsx", "startLine": 880, "endLine": 898 },
+  "sus": { "file": "src/tools/BashTool/shouldUseSandbox.ts", "startLine": 130, "endLine": 153 },
+  "sus-enabled": { "file": "src/tools/BashTool/shouldUseSandbox.ts", "startLine": 131, "endLine": 133 },
+  "sus-disable": { "file": "src/tools/BashTool/shouldUseSandbox.ts", "startLine": 136, "endLine": 141 },
+  "sus-cmd": { "file": "src/tools/BashTool/shouldUseSandbox.ts", "startLine": 143, "endLine": 145 },
+  "excl": { "file": "src/tools/BashTool/shouldUseSandbox.ts", "startLine": 148, "endLine": 150 },
+  "contains-excluded": { "file": "src/tools/BashTool/shouldUseSandbox.ts", "startLine": 21, "endLine": 128 },
+  "no-sandbox": { "file": "src/tools/BashTool/shouldUseSandbox.ts", "startLine": 152, "endLine": 152 },
+  "yes-sandbox": { "file": "src/tools/BashTool/shouldUseSandbox.ts", "startLine": 152, "endLine": 152 },
+  "shell-wrap": { "file": "src/utils/Shell.ts", "startLine": 256, "endLine": 273 },
+  "init-wait": { "file": "src/utils/sandbox/sandbox-adapter.ts", "startLine": 711, "endLine": 717 },
+  "init-err": { "file": "src/utils/sandbox/sandbox-adapter.ts", "startLine": 715, "endLine": 716 },
+  "runtime-wrap": { "file": "src/utils/sandbox/sandbox-adapter.ts", "startLine": 719, "endLine": 725 },
+  "mkdir-tmp": { "file": "src/utils/Shell.ts", "startLine": 267, "endLine": 272 },
+  "spawn": { "file": "src/utils/Shell.ts", "startLine": 315, "endLine": 330 },
+  "run": { "file": "src/utils/Shell.ts", "startLine": 315, "endLine": 390 },
+  "violate": { "file": "src/utils/sandbox/sandbox-adapter.ts", "startLine": 960, "endLine": 961 },
+  "record": { "file": "src/utils/sandbox/sandbox-adapter.ts", "startLine": 960, "endLine": 961 },
+  "done": { "file": "src/utils/Shell.ts", "startLine": 391, "endLine": 392 },
+  "annotate": { "file": "src/tools/BashTool/BashTool.tsx", "startLine": 710, "endLine": 710 },
+  "cleanup": { "file": "src/utils/Shell.ts", "startLine": 391, "endLine": 392 },
+  "scrub": { "file": "src/utils/sandbox/sandbox-adapter.ts", "startLine": 404, "endLine": 414 },
+  "spawn-plain": { "file": "src/utils/Shell.ts", "startLine": 315, "endLine": 330 },
+
+  "init": { "file": "src/utils/sandbox/sandbox-adapter.ts", "startLine": 730, "endLine": 792 },
+  "wt": { "file": "src/utils/sandbox/sandbox-adapter.ts", "startLine": 422, "endLine": 445 },
+  "conv": { "file": "src/utils/sandbox/sandbox-adapter.ts", "startLine": 172, "endLine": 381 },
+  "net-branch": { "file": "src/utils/sandbox/sandbox-adapter.ts", "startLine": 178, "endLine": 220 },
+  "fs-branch": { "file": "src/utils/sandbox/sandbox-adapter.ts", "startLine": 222, "endLine": 349 },
+  "rg-branch": { "file": "src/utils/sandbox/sandbox-adapter.ts", "startLine": 350, "endLine": 357 },
+  "net-managed": { "file": "src/utils/sandbox/sandbox-adapter.ts", "startLine": 182, "endLine": 196 },
+  "net-policy": { "file": "src/utils/sandbox/sandbox-adapter.ts", "startLine": 183, "endLine": 196 },
+  "net-all": { "file": "src/utils/sandbox/sandbox-adapter.ts", "startLine": 197, "endLine": 210 },
+  "net-deny": { "file": "src/utils/sandbox/sandbox-adapter.ts", "startLine": 212, "endLine": 220 },
+  "net-assemble": { "file": "src/utils/sandbox/sandbox-adapter.ts", "startLine": 360, "endLine": 368 },
+  "fs-always": { "file": "src/utils/sandbox/sandbox-adapter.ts", "startLine": 225, "endLine": 236 },
+  "fs-skills": { "file": "src/utils/sandbox/sandbox-adapter.ts", "startLine": 247, "endLine": 255 },
+  "fs-baregit": { "file": "src/utils/sandbox/sandbox-adapter.ts", "startLine": 267, "endLine": 280 },
+  "fs-wt": { "file": "src/utils/sandbox/sandbox-adapter.ts", "startLine": 286, "endLine": 288 },
+  "fs-wt-allow": { "file": "src/utils/sandbox/sandbox-adapter.ts", "startLine": 286, "endLine": 288 },
+  "fs-add-dir": { "file": "src/utils/sandbox/sandbox-adapter.ts", "startLine": 295, "endLine": 299 },
+  "fs-loop": { "file": "src/utils/sandbox/sandbox-adapter.ts", "startLine": 304, "endLine": 349 },
+  "fs-perm": { "file": "src/utils/sandbox/sandbox-adapter.ts", "startLine": 308, "endLine": 327 },
+  "fs-sandbox": { "file": "src/utils/sandbox/sandbox-adapter.ts", "startLine": 332, "endLine": 348 },
+  "fs-managed-read": { "file": "src/utils/sandbox/sandbox-adapter.ts", "startLine": 343, "endLine": 347 },
+  "fs-read-policy": { "file": "src/utils/sandbox/sandbox-adapter.ts", "startLine": 343, "endLine": 347 },
+  "fs-read-all": { "file": "src/utils/sandbox/sandbox-adapter.ts", "startLine": 344, "endLine": 346 },
+  "fs-assemble": { "file": "src/utils/sandbox/sandbox-adapter.ts", "startLine": 369, "endLine": 374 },
+  "rg-pick": { "file": "src/utils/sandbox/sandbox-adapter.ts", "startLine": 352, "endLine": 357 },
+  "out": { "file": "src/utils/sandbox/sandbox-adapter.ts", "startLine": 359, "endLine": 381 },
+  "subscribe": { "file": "src/utils/sandbox/sandbox-adapter.ts", "startLine": 776, "endLine": 781 },
+  "resolve-path-pattern": { "file": "src/utils/sandbox/sandbox-adapter.ts", "startLine": 99, "endLine": 119 },
+  "resolve-fs-path": { "file": "src/utils/sandbox/sandbox-adapter.ts", "startLine": 138, "endLine": 146 },
+
+  "start": { "file": "src/utils/sandbox/sandbox-adapter.ts", "startLine": 719, "endLine": 725 },
+  "kind": { "file": "src/utils/sandbox/sandbox-adapter.ts", "startLine": 960, "endLine": 962 },
+  "ask": { "file": "src/utils/sandbox/sandbox-adapter.ts", "startLine": 745, "endLine": 755 },
+  "store": { "file": "src/utils/sandbox/sandbox-adapter.ts", "startLine": 960, "endLine": 961 },
+  "managed": { "file": "src/utils/sandbox/sandbox-adapter.ts", "startLine": 747, "endLine": 752 },
+  "block": { "file": "src/utils/sandbox/sandbox-adapter.ts", "startLine": 748, "endLine": 751 },
+  "queue": { "file": "src/screens/REPL.tsx", "startLine": 2262, "endLine": 2265 },
+  "swarm": { "file": "src/screens/REPL.tsx", "startLine": 2218, "endLine": 2249 },
+  "mailbox": { "file": "src/screens/REPL.tsx", "startLine": 2222, "endLine": 2238 },
+  "wait-worker": { "file": "src/screens/REPL.tsx", "startLine": 2234, "endLine": 2247 },
+  "bridge": { "file": "src/screens/REPL.tsx", "startLine": 2270, "endLine": 2308 },
+  "remote": { "file": "src/screens/REPL.tsx", "startLine": 2273, "endLine": 2306 },
+  "local": { "file": "src/screens/REPL.tsx", "startLine": 4609, "endLine": 4657 },
+  "sandbox-permission-request": { "file": "src/components/permissions/SandboxPermissionRequest.tsx", "startLine": 15, "endLine": 162 },
+  "choice": { "file": "src/components/permissions/SandboxPermissionRequest.tsx", "startLine": 27, "endLine": 52 },
+  "allow-once": { "file": "src/components/permissions/SandboxPermissionRequest.tsx", "startLine": 28, "endLine": 34 },
+  "allow-persist": { "file": "src/components/permissions/SandboxPermissionRequest.tsx", "startLine": 36, "endLine": 42 },
+  "deny": { "file": "src/components/permissions/SandboxPermissionRequest.tsx", "startLine": 44, "endLine": 50 },
+  "write-rule": { "file": "src/screens/REPL.tsx", "startLine": 4620, "endLine": 4634 },
+  "refresh": { "file": "src/screens/REPL.tsx", "startLine": 4638, "endLine": 4638 },
+  "resolve": { "file": "src/screens/REPL.tsx", "startLine": 4643, "endLine": 4646 },
+  "expanded": { "file": "src/components/SandboxViolationExpandedView.tsx", "startLine": 20, "endLine": 95 },
+  "footer": { "file": "src/components/PromptInput/SandboxPromptFooterHint.tsx", "startLine": 1, "endLine": 64 },
+  "done2": { "file": "src/utils/Shell.ts", "startLine": 391, "endLine": 392 },
+  "startup-gate": { "file": "src/screens/REPL.tsx", "startLine": 2317, "endLine": 2344 },
+  "fail-if-unavailable": { "file": "src/utils/sandbox/sandbox-adapter.ts", "startLine": 479, "endLine": 485 },
+  "unavailable-reason": { "file": "src/utils/sandbox/sandbox-adapter.ts", "startLine": 562, "endLine": 592 }
+};
+</script>
+
+<aside id="source-panel"><div id="source-header"></div><div id="monaco-container"></div></aside>
+<script src="../assets/codeindex-runtime.js"></script>
+<script src="../assets/codeindex.js"></script>
+</body></html>
