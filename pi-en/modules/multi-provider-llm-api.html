@@ -1,0 +1,290 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Multi-Provider LLM API</title>
+<link rel="stylesheet" href="../assets/codeindex.css">
+</head>
+<body>
+<a href="index.html" class="back-link">← Back to overview</a>
+<h1>Multi-Provider LLM API</h1>
+<p>This is the <code>@earendil-works/pi-ai</code> package — a single library that lets an application talk to many different LLM providers (Anthropic, OpenAI, Google, AWS Bedrock, and roughly 25 others) through one uniform streaming interface. The business value is: a coding agent or CLI tool can swap the model behind a request without rewriting call sites, and auth, retry, prompt-caching, and "thinking" controls are handled once for every provider. This report walks the system the way a request actually travels — from the caller choosing a model, through auth resolution and provider routing, down to the HTTP call and the streaming events handed back. Two side doors exist: a CLI for OAuth login, and a legacy <code>compat</code> entrypoint that preserves the old global API for apps that haven't migrated yet.</p>
+
+<h2>What the caller can do here</h2>
+<dl>
+<dt>Stream a chat completion</dt>
+<dd>The primary action. The caller (an agent runtime, or a higher-level app) picks a <code>Model</code> from a <code>Models</code> collection, hands over a <code>Context</code> (system prompt + conversation messages + optional tool definitions), and receives an <code>AssistantMessageEventStream</code> — an async iterable that emits partial text, thinking, and tool-call deltas, then terminates with a final <code>AssistantMessage</code>. Triggered by <code>models.stream(model, context, options)</code> or <code>models.complete(...)</code> (which just awaits the stream's result).</dd>
+<dt>Stream with a "reasoning level"</dt>
+<dd><code>streamSimple</code> / <code>completeSimple</code> take a human-friendly <code>reasoning: "low" | "medium" | "high" | ...</code> instead of provider-specific thinking knobs. The provider maps it to whatever the upstream API expects.</dd>
+<dt>Log in to an OAuth provider</dt>
+<dd>From the CLI (<code>npx @earendil-works/pi-ai login &lt;provider&gt;</code>) a user runs the Anthropic / GitHub Copilot / OpenAI Codex OAuth flow and saves credentials to a local <code>auth.json</code>. This is the only interactive, human-facing entry point.</dd>
+<dt>Generate images</dt>
+<dd>A parallel image-generation pipeline (<code>ImagesModels</code>) with the same shape — currently only OpenRouter images is wired up.</dd>
+</dl>
+
+<p>Everything below is from the <strong>data-flow perspective</strong>: where a prompt enters, how it is authenticated, routed, transformed into a provider payload, sent over the wire, and how the streaming response is normalized back into pi's event protocol. State-machine details (OAuth token refresh) and structural details (the provider-adapter hierarchy) are flagged where they naturally appear.</p>
+
+<h2>The request lifecycle, end to end</h2>
+<p>The diagram below is the master flow for <code>models.stream(model, context, options)</code>. It is split into two sub-diagrams because the chain is long: the first covers setup (auth resolution and routing into the right provider/API implementation), the second covers the actual provider HTTP call and response decoding. Node IDs in kebab-case map to source locations in the <code>window.__sourceMap</code> table at the end.</p>
+
+<pre class="mermaid">
+graph TD
+    caller["Caller invokes models.stream(model, context, options)"]
+    lazyStream["lazyStream returns a stream synchronously, runs async setup behind it"]
+    requireProvider["requireProvider: look up Provider by model.provider"]
+    applyAuth["applyAuth: resolve credentials for this model"]
+    resolveAuth["resolveProviderAuth: stored credential or ambient env"]
+    decideCred{"Credential type?"}
+    oauthStored["Stored OAuth credential"]
+    oauthExpiry{"Token expired?"}
+    oauthRefresh["Locked refresh under credential store lock"]
+    oauthToAuth["oauth.toAuth: derive bearer apiKey"]
+    apiKeyStored["Stored API key credential"]
+    apiKeyResolve["apiKey.resolve: stored key or env var"]
+    ambientOnly["Ambient only (AWS profile, ADC file, env)"]
+    noAuth["No auth resolved - request proceeds unauthenticated"]
+    mergeAuth["Merge auth into request options (apiKey/headers/env override model.baseUrl)"]
+    providerStream["provider.stream(requestModel, context, requestOptions)"]
+    dispatchApi["createProvider dispatch: pick API impl by model.api"]
+    apiImpl["API implementation module (e.g. anthropic-messages.stream)"]
+    setupError["Setup failure -> stream emits error event, ends"]
+    noProvider["Unknown provider -> throws ModelsError"]
+
+    caller --> lazyStream
+    lazyStream --> requireProvider
+    requireProvider --> noProvider
+    requireProvider --> applyAuth
+    applyAuth --> resolveAuth
+    resolveAuth --> decideCred
+    decideCred -- OAuth --> oauthStored
+    oauthStored --> oauthExpiry
+    oauthExpiry -- yes --> oauthRefresh
+    oauthExpiry -- no --> oauthToAuth
+    oauthRefresh --> oauthToAuth
+    decideCred -- API key --> apiKeyStored
+    apiKeyStored --> apiKeyResolve
+    decideCred -- nothing stored --> ambientOnly
+    ambientOnly --> apiKeyResolve
+    resolveAuth -- undefined --> noAuth
+    oauthToAuth --> mergeAuth
+    apiKeyResolve --> mergeAuth
+    noAuth --> mergeAuth
+    mergeAuth --> providerStream
+    providerStream --> dispatchApi
+    dispatchApi --> apiImpl
+    lazyStream -. setup rejects .-> setupError
+</pre>
+
+<p>Notes on this section:</p>
+<ul>
+<li><strong>Synchronous stream, asynchronous setup.</strong> <code>Models.stream()</code> must return an <code>AssistantMessageEventStream</code> synchronously (callers shouldn't <code>await</code> before they can start consuming). Auth resolution and lazy module loading are async, so <code>lazyStream</code> hands back an empty stream immediately and pushes events into it once setup completes. If setup throws (unknown provider, OAuth refresh failure), the stream is terminated with an <code>error</code> event carrying an empty <code>AssistantMessage</code> — never a thrown exception to the caller.</li>
+<li><strong>Auth is resolved per-request, not per-provider.</strong> <code>resolveProviderAuth</code> prefers an explicit <code>options.apiKey</code> override, then a stored credential, then ambient sources (env vars, AWS profiles, ADC files). A stored credential "owns" the provider: ambient env is consulted only when nothing is stored. This prevents silent env fallback after a failed refresh.</li>
+<li><strong>OAuth refresh is double-checked-locked.</strong> The optimistic expiry check runs unlocked; if expired, the refresh runs inside <code>CredentialStore.modify()</code>, which serializes writes per provider (in-memory via a promise chain; a persistent store would use a file lock). Under the lock it re-checks expiry so concurrent requests don't double-refresh. Refresh failure throws <code>ModelsError("oauth")</code> and preserves the stored credential for retry / re-login.</li>
+<li><strong>Provider routing is a two-level dispatch.</strong> <code>Models</code> finds the <code>Provider</code> by <code>model.provider</code>; the provider (built by <code>createProvider</code>) then dispatches on <code>model.api</code> to the right <code>ProviderStreams</code> implementation. A provider with a single API passes one <code>api</code>; a mixed-API provider passes a map keyed by <code>model.api</code>. If no implementation matches the API, the stream errors with <code>ModelsError("stream")</code>.</li>
+</ul>
+
+<h2>Inside the provider HTTP call (Anthropic as the reference impl)</h2>
+<p>Every API implementation module under <code>src/api/</code> exports a <code>stream</code> and <code>streamSimple</code> function with the same shape. They differ in payload construction and event decoding. The Anthropic messages implementation (<code>api/anthropic-messages.ts</code>) is the most thoroughly observed here; OpenAI-completions, OpenAI-responses, Google, Bedrock, and the rest follow the same skeleton with provider-specific transformations.</p>
+
+<pre class="mermaid">
+graph TD
+    enter["stream(model, context, options) called"]
+    createStream["Create AssistantMessageEventStream + empty output AssistantMessage"]
+    hasClient{"options.client provided?"}
+    buildClient["createClient: pick API-key / OAuth-bearer / Copilot-bearer auth + beta headers"]
+    assertAuth["assertRequestAuth: fail fast if no apiKey and no auth header"]
+    copilotHeaders["If github-copilot: buildCopilotDynamicHeaders (vision awareness)"]
+    buildParams["buildParams: convert Context messages/tools to Anthropic MessageCreateParams"]
+    onPayloadCb["options.onPayload callback may rewrite payload"]
+    httpCall["client.messages.create({stream:true}) -> HTTP POST to api.anthropic.com"]
+    onResponseCb["options.onResponse callback with status + headers"]
+    pushStart["Stream emits start event"]
+    decodeSse["iterateAnthropicEvents: decode SSE lines, parse JSON with repair"]
+    blockEvents{"SSE event type"}
+    msgStart["message_start: capture responseId + input usage + cost"]
+    blockStart["content_block_start: open text/thinking/redacted_thinking/tool_use block"]
+    blockDelta["content_block_delta: append text/thinking/input_json/signature"]
+    blockStop["content_block_stop: finalize block, emit text_end/thinking_end/toolcall_end"]
+    msgDelta["message_delta: final stop_reason + output usage + reasoning tokens"]
+    success["Emit done event with final AssistantMessage, end stream"]
+    failure["Catch: set stopReason error/aborted, emit error event, end stream"]
+
+    enter --> createStream
+    createStream --> hasClient
+    hasClient -- no --> assertAuth
+    assertAuth --> copilotHeaders
+    copilotHeaders --> buildClient
+    hasClient -- yes --> buildParams
+    buildClient --> buildParams
+    buildParams --> onPayloadCb
+    onPayloadCb --> httpCall
+    httpCall --> onResponseCb
+    onResponseCb --> pushStart
+    pushStart --> decodeSse
+    decodeSse --> blockEvents
+    blockEvents -- message_start --> msgStart
+    blockEvents -- content_block_start --> blockStart
+    blockEvents -- content_block_delta --> blockDelta
+    blockEvents -- content_block_stop --> blockStop
+    blockEvents -- message_delta --> msgDelta
+    msgStart --> decodeSse
+    blockStart --> decodeSse
+    blockDelta --> decodeSse
+    blockStop --> decodeSse
+    msgDelta --> success
+    decodeSse -. abort/network/parse error .-> failure
+</pre>
+
+<p>Notes on the provider call:</p>
+<ul>
+<li><strong>External boundary.</strong> <code>client.messages.create()</code> is the call that leaves the process — an authenticated HTTP POST to <code>https://api.anthropic.com/v1/messages</code> with an SSE response body. Everything before it is local transformation; everything after it is decoding a remote stream. Same boundary exists for the other providers (OpenAI responses endpoint, Google generateContent, Bedrock Converse, etc.).</li>
+<li><strong>Three auth flavors, one client constructor.</strong> <code>createClient</code> branches on (a) GitHub Copilot — bearer token + Copilot dynamic headers; (b) OAuth token — bearer auth plus Claude Code identity headers (<code>claude-code-20250219</code>, <code>oauth-2025-04-20</code> beta flags, <code>user-agent: claude-cli/...</code>); (c) plain API key — <code>x-api-key</code> header. The OAuth "stealth" path exists so a Claude Pro/Max subscription token works against the same API as a paid API key.</li>
+<li><strong>onPayload / onResponse hooks.</strong> Callers can inspect or replace the final provider payload right before it ships, and observe raw HTTP response status/headers right after they arrive. This is how higher layers do request logging, redaction, and A/B routing without touching provider internals.</li>
+<li><strong>Streaming JSON repair.</strong> Tool-call argument deltas arrive as partial JSON fragments. <code>parseStreamingJson</code> incrementally parses them so the partial <code>arguments</code> object is always readable; <code>parseJsonWithRepair</code> fixes malformed SSE data. These live in <code>utils/json-parse.ts</code>.</li>
+<li><strong>Usage and cost are computed inline.</strong> Token counts arrive split across <code>message_start</code> (input/cache) and <code>message_delta</code> (output, reasoning). <code>calculateCost(model, usage)</code> multiplies by the model's per-million prices on every update; the final <code>AssistantMessage</code> carries a fully costed <code>Usage</code>. Anthropic's 1h cache writes are charged at 2x base input, handled specially in <code>calculateCost</code>.</li>
+<li><strong>Abort and error semantics.</strong> An <code>AbortSignal</code> is checked inside the SSE loop; on abort or any thrown error, the partial <code>AssistantMessage</code> is finalized with <code>stopReason: "aborted" | "error"</code> and an <code>errorMessage</code>, then emitted as an <code>error</code> event. The stream never throws to the caller — failures are values.</li>
+</ul>
+
+<h2>OAuth login flow (state machine)</h2>
+<p>This is the other entry point — the CLI's <code>login</code> command, and the <code>OAuthAuth.login</code> interface that backs it. The Anthropic flow (authorization code + PKCE) is the reference; Copilot and OpenAI Codex follow the same shape with their own endpoints.</p>
+
+<pre class="mermaid">
+graph TD
+    cliLogin["CLI: npx pi-ai login anthropic"]
+    pickProvider["getOAuthProvider(id) from registry"]
+    startServer["startCallbackServer: local node:http on port 53692"]
+    pkce["generatePKCE: verifier + challenge"]
+    buildAuthUrl["Build authorize URL with client_id, challenge, state, scopes"]
+    notifyUrl["callbacks.notify auth_url -> CLI prints URL"]
+    userBrowser["User authorizes in browser (external)"]
+    waitForCode["server.waitForCode races callback vs manual code paste"]
+    codeArrived{"Code received?"}
+    exchangeCode["exchangeAuthorizationCode: POST to token endpoint"]
+    tokenResp["Receive access + refresh + expires_in"]
+    saveCreds["CLI saves {type:oauth,...credentials} to auth.json"]
+    done["Login complete"]
+
+    cliLogin --> pickProvider
+    pickProvider --> startServer
+    startServer --> pkce
+    pkce --> buildAuthUrl
+    buildAuthUrl --> notifyUrl
+    notifyUrl --> userBrowser
+    userBrowser --> waitForCode
+    waitForCode --> codeArrived
+    codeArrived -- yes --> exchangeCode
+    codeArrived -- no/error --> done
+    exchangeCode --> tokenResp
+    tokenResp --> saveCreds
+    saveCreds --> done
+</pre>
+
+<p>The matching refresh state machine (run lazily on first authenticated request after expiry, under the credential-store lock) is the <code>oauthExpiry → oauthRefresh</code> branch in the master diagram. <code>refreshAnthropicToken</code> POSTs <code>grant_type=refresh_token</code> to the same token endpoint and returns a new <code>OAuthCredentials</code>; the 5-minute skew on <code>expires</code> (<code>expires_in * 1000 - 5 * 60 * 1000</code>) makes the next request refresh proactively rather than racing the boundary.</p>
+
+<h2>The provider-adapter hierarchy (structure view)</h2>
+<p>Structurally, every built-in provider is built by <code>createProvider()</code> from the same parts: an <code>id</code>, a <code>baseUrl</code>, an <code>auth</code> block (one or both of <code>ApiKeyAuth</code> / <code>OAuthAuth</code>), a static model list (or a <code>refreshModels</code> fetcher for dynamic providers), and an <code>api</code> implementation. The built-in catalog is assembled in <code>providers/all.ts</code>, which wires ~30 provider factories into a fresh <code>Models</code> via <code>builtinModels()</code>. Most providers are thin: e.g. <code>anthropicProvider()</code> just declares env vars <code>ANTHROPIC_OAUTH_TOKEN</code>/<code>ANTHROPIC_API_KEY</code>, a lazy OAuth loader, the Anthropic model catalog, and the lazy <code>anthropicMessagesApi()</code> streams. The interesting structural variations:</p>
+<ul>
+<li><strong>Amazon Bedrock</strong> (<code>providers/amazon-bedrock.ts</code>) is the ambient-credential case: its <code>ApiKeyAuth.resolve</code> returns an empty <code>auth</code> object (no apiKey) for AWS profile / IAM / ECS / IRSA sources — the AWS SDK's default credential chain does the actual SigV4 signing inside the API implementation. A stored bearer token is the only non-ambient path.</li>
+<li><strong>Mixed-API providers</strong> (OpenAI, Google, Google Vertex) pass an <code>api</code> map keyed by <code>model.api</code> so a single provider can serve both <code>openai-completions</code> and <code>openai-responses</code>, or <code>google-generative-ai</code> vs <code>google-vertex</code>, dispatching per model.</li>
+<li><strong>Lazy wrappers everywhere.</strong> <code>api/*.lazy.ts</code> files wrap each API implementation module in <code>lazyApi(() => import("./real.ts"))</code> so the heavy provider SDKs (Anthropic SDK, AWS Bedrock SDK, Google SDK) are only loaded when a request for that API actually starts. <code>auth/helpers.ts → lazyOAuth</code> does the same for OAuth flow modules, keeping Node-only <code>http.createServer</code> code out of browser bundles.</li>
+</ul>
+
+<h2>The legacy compat entrypoint</h2>
+<p><code>compat.ts</code> preserves the older global API (<code>stream()</code>, <code>complete()</code>, <code>getModel()</code>) that existed before the <code>Models</code>/<code>Provider</code> redesign. It maintains a separate in-process <code>apiProviderRegistry</code> keyed by API id, auto-registers the nine built-in API implementations on import, and routes a call by either delegating to a <code>builtinModels()</code> instance (when the model matches the built-in catalog) or by dispatching through the registry with env API-key injection (<code>withEnvApiKey</code>). It is explicitly marked for deletion once the coding-agent finishes migrating to <code>createModels()</code>. New code should not use it; it's documented here only because existing apps still import <code>@earendil-works/pi-ai/compat</code>.</p>
+
+<h2>Environment-key resolution</h2>
+<p><code>env-api-keys.ts</code> answers "is this provider configured via environment?" without touching credentials. <code>findEnvKeys</code> maps provider ids to their conventional env vars (<code>OPENAI_API_KEY</code>, <code>ANTHROPIC_API_KEY</code>, etc.); <code>getEnvApiKey</code> goes further for ambient-credential providers: for <code>google-vertex</code> it checks ADC file existence plus <code>GOOGLE_CLOUD_PROJECT</code>/<code>GOOGLE_CLOUD_LOCATION</code>; for <code>amazon-bedrock</code> it recognizes the full AWS credential chain (profile, access keys, bearer token, ECS URIs, web identity). It returns the sentinel <code>"&lt;authenticated&gt;"</code> for ambient-configured providers so callers can show "configured" in status UIs without seeing a real secret. This module is the fallback path inside <code>ApiKeyAuth.resolve</code> implementations and the <code>compat</code> env-injection layer; the <code>Models</code> path uses the provider's own <code>auth.apiKey.resolve</code> instead.</p>
+
+<h2>Image generation (parallel pipeline)</h2>
+<p><code>images-models.ts</code> mirrors the chat side: <code>ImagesProvider</code> / <code>ImagesModels</code> / <code>createImagesProvider</code> with the same auth-resolution and option-merging logic, but the contract is a single <code>Promise&lt;AssistantImages&gt;</code> rather than a stream (image generation isn't streamed). Failures are returned as an <code>AssistantImages</code> with <code>stopReason: "error"</code> — again, failures-as-values, no throws to the caller. Only <code>openrouter-images</code> is wired as a built-in image provider.</p>
+
+<h2>Module summary</h2>
+<dl>
+<dt>packages/ai/src/index.ts</dt>
+<dd>Barrel re-export of the core, side-effect-free public API. Provider factories and API implementations live under subpath exports; this file intentionally pulls in no generated catalogs or OAuth implementations so browser bundles stay lean.</dd>
+<dt>packages/ai/src/cli.ts</dt>
+<dd>The <code>npx @earendil-works/pi-ai</code> binary. Supports <code>login &lt;provider&gt;</code> and <code>list</code>; loads/saves OAuth credentials to <code>auth.json</code> in the cwd. No chat commands — it's purely an auth helper.</dd>
+<dt>packages/ai/src/models.ts</dt>
+<dd>The runtime heart. Defines <code>Provider</code>, <code>Models</code>, <code>createModels</code>, <code>createProvider</code>, and the auth-application + per-request dispatch logic. A prompt + context turns into an <code>AssistantMessageEventStream</code> here.</dd>
+<dt>packages/ai/src/auth/resolve.ts</dt>
+<dd>Auth decision tree: explicit override → stored credential (OAuth with locked refresh, or API key) → ambient. Wraps failures in <code>ModelsError</code> with codes <code>auth</code>/<code>oauth</code>.</dd>
+<dt>packages/ai/src/auth/types.ts</dt>
+<dd>The auth contracts: <code>CredentialStore</code> (serialized read-modify-write), <code>ApiKeyAuth</code> / <code>OAuthAuth</code> (with the <code>refresh</code>/<code>toAuth</code> split that lets <code>Models</code> own the locked refresh pattern).</dd>
+<dt>packages/ai/src/api/anthropic-messages.ts</dt>
+<dd>Reference API implementation. Converts a <code>Context</code> to Anthropic <code>MessageCreateParams</code>, builds the SDK client with the right auth flavor, decodes SSE, and emits pi's unified event protocol. The other <code>api/*.ts</code> files follow this skeleton.</dd>
+<dt>packages/ai/src/api/lazy.ts</dt>
+<dd><code>lazyStream</code> + <code>lazyApi</code> — the synchronous-stream/async-setup bridge that every <code>Models.stream</code> and lazy API wrapper goes through. Setup failures become stream error events.</dd>
+<dt>packages/ai/src/env-api-keys.ts</dt>
+<dd>Provider → env-var mapping for status/availability checks; recognizes ambient AWS and Google ADC configurations. Used by compat and by status UIs, not by the <code>Models</code> request path.</dd>
+<dt>packages/ai/src/compat.ts</dt>
+<dd>Deprecated global API surface with an API-provider registry and env-key injection. Routes to <code>builtinModels()</code> when possible, else dispatches through the registry. Slated for deletion.</dd>
+<dt>packages/ai/src/utils/oauth/anthropic.ts</dt>
+<dd>Anthropic OAuth (Claude Pro/Max): PKCE + local callback server + manual-code-paste race, token exchange, and the <code>anthropicOAuth</code> <code>OAuthAuth</code> adapter (<code>login</code>/<code>refresh</code>/<code>toAuth</code>).</dd>
+<dt>packages/ai/src/providers/all.ts</dt>
+<dd>Assembles all built-in provider factories into a <code>Models</code> / <code>ImagesModels</code> collection and exposes typed static-catalog reads (<code>getBuiltinModel</code>).</dd>
+</dl>
+
+<script>
+window.__sourceMap = {
+  "caller": { "file": "packages/ai/src/models.ts", "startLine": 258, "endLine": 268 },
+  "lazyStream": { "file": "packages/ai/src/api/lazy.ts", "startLine": 39, "endLine": 56 },
+  "requireProvider": { "file": "packages/ai/src/models.ts", "startLine": 222, "endLine": 228 },
+  "applyAuth": { "file": "packages/ai/src/models.ts", "startLine": 230, "endLine": 256 },
+  "resolveAuth": { "file": "packages/ai/src/auth/resolve.ts", "startLine": 40, "endLine": 71 },
+  "decideCred": { "file": "packages/ai/src/auth/resolve.ts", "startLine": 57, "endLine": 67 },
+  "oauthStored": { "file": "packages/ai/src/auth/resolve.ts", "startLine": 59, "endLine": 61 },
+  "oauthExpiry": { "file": "packages/ai/src/auth/resolve.ts", "startLine": 94, "endLine": 94 },
+  "oauthRefresh": { "file": "packages/ai/src/auth/resolve.ts", "startLine": 86, "endLine": 113 },
+  "oauthToAuth": { "file": "packages/ai/src/auth/resolve.ts", "startLine": 115, "endLine": 119 },
+  "apiKeyStored": { "file": "packages/ai/src/auth/resolve.ts", "startLine": 62, "endLine": 64 },
+  "apiKeyResolve": { "file": "packages/ai/src/auth/resolve.ts", "startLine": 122, "endLine": 133 },
+  "ambientOnly": { "file": "packages/ai/src/auth/resolve.ts", "startLine": 69, "endLine": 70 },
+  "noAuth": { "file": "packages/ai/src/models.ts", "startLine": 244, "endLine": 245 },
+  "mergeAuth": { "file": "packages/ai/src/models.ts", "startLine": 246, "endLine": 255 },
+  "providerStream": { "file": "packages/ai/src/models.ts", "startLine": 265, "endLine": 267 },
+  "dispatchApi": { "file": "packages/ai/src/models.ts", "startLine": 331, "endLine": 345 },
+  "apiImpl": { "file": "packages/ai/src/api/anthropic-messages.ts", "startLine": 468, "endLine": 741 },
+  "setupError": { "file": "packages/ai/src/api/lazy.ts", "startLine": 49, "endLine": 53 },
+  "noProvider": { "file": "packages/ai/src/models.ts", "startLine": 224, "endLine": 226 },
+  "enter": { "file": "packages/ai/src/api/anthropic-messages.ts", "startLine": 468, "endLine": 472 },
+  "createStream": { "file": "packages/ai/src/api/anthropic-messages.ts", "startLine": 473, "endLine": 492 },
+  "hasClient": { "file": "packages/ai/src/api/anthropic-messages.ts", "startLine": 498, "endLine": 501 },
+  "buildClient": { "file": "packages/ai/src/api/anthropic-messages.ts", "startLine": 813, "endLine": 899 },
+  "assertAuth": { "file": "packages/ai/src/api/anthropic-messages.ts", "startLine": 264, "endLine": 274 },
+  "copilotHeaders": { "file": "packages/ai/src/api/anthropic-messages.ts", "startLine": 505, "endLine": 512 },
+  "buildParams": { "file": "packages/ai/src/api/anthropic-messages.ts", "startLine": 901, "endLine": 901 },
+  "onPayloadCb": { "file": "packages/ai/src/api/anthropic-messages.ts", "startLine": 530, "endLine": 533 },
+  "httpCall": { "file": "packages/ai/src/api/anthropic-messages.ts", "startLine": 539, "endLine": 540 },
+  "onResponseCb": { "file": "packages/ai/src/api/anthropic-messages.ts", "startLine": 540, "endLine": 540 },
+  "pushStart": { "file": "packages/ai/src/api/anthropic-messages.ts", "startLine": 541, "endLine": 541 },
+  "decodeSse": { "file": "packages/ai/src/api/anthropic-messages.ts", "startLine": 427, "endLine": 466 },
+  "blockEvents": { "file": "packages/ai/src/api/anthropic-messages.ts", "startLine": 546, "endLine": 546 },
+  "msgStart": { "file": "packages/ai/src/api/anthropic-messages.ts", "startLine": 547, "endLine": 559 },
+  "blockStart": { "file": "packages/ai/src/api/anthropic-messages.ts", "startLine": 560, "endLine": 601 },
+  "blockDelta": { "file": "packages/ai/src/api/anthropic-messages.ts", "startLine": 602, "endLine": 647 },
+  "blockStop": { "file": "packages/ai/src/api/anthropic-messages.ts", "startLine": 648, "endLine": 679 },
+  "msgDelta": { "file": "packages/ai/src/api/anthropic-messages.ts", "startLine": 680, "endLine": 714 },
+  "success": { "file": "packages/ai/src/api/anthropic-messages.ts", "startLine": 725, "endLine": 726 },
+  "failure": { "file": "packages/ai/src/api/anthropic-messages.ts", "startLine": 727, "endLine": 737 },
+  "cliLogin": { "file": "packages/ai/src/cli.ts", "startLine": 106, "endLine": 137 },
+  "pickProvider": { "file": "packages/ai/src/cli.ts", "startLine": 29, "endLine": 33 },
+  "startServer": { "file": "packages/ai/src/utils/oauth/anthropic.ts", "startLine": 100, "endLine": 169 },
+  "pkce": { "file": "packages/ai/src/utils/oauth/anthropic.ts", "startLine": 238, "endLine": 239 },
+  "buildAuthUrl": { "file": "packages/ai/src/utils/oauth/anthropic.ts", "startLine": 246, "endLine": 256 },
+  "notifyUrl": { "file": "packages/ai/src/utils/oauth/anthropic.ts", "startLine": 257, "endLine": 261 },
+  "userBrowser": { "file": "packages/ai/src/utils/oauth/anthropic.ts", "startLine": 31, "endLine": 32 },
+  "waitForCode": { "file": "packages/ai/src/utils/oauth/anthropic.ts", "startLine": 277, "endLine": 294 },
+  "codeArrived": { "file": "packages/ai/src/utils/oauth/anthropic.ts", "startLine": 283, "endLine": 283 },
+  "exchangeCode": { "file": "packages/ai/src/utils/oauth/anthropic.ts", "startLine": 191, "endLine": 227 },
+  "tokenResp": { "file": "packages/ai/src/utils/oauth/anthropic.ts", "startLine": 222, "endLine": 226 },
+  "saveCreds": { "file": "packages/ai/src/cli.ts", "startLine": 65, "endLine": 68 },
+  "done": { "file": "packages/ai/src/cli.ts", "startLine": 69, "endLine": 69 }
+};
+</script>
+
+<aside id="source-panel"><div id="source-header"></div><div id="monaco-container"></div></aside>
+<script src="../assets/codeindex-runtime.js"></script>
+<script src="../assets/codeindex.js"></script>
+</body>
+</html>

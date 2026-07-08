@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pi Agent Harness — 代码索引</title>
+<link rel="stylesheet" href="assets/codeindex.css">
+</head>
+<body>
+<h1>Pi Agent Harness</h1>
+
+<p>这是 <strong>pi</strong> —— 一个开源、可自扩展的编码智能体框架，以 TypeScript 单体仓库形式发布。在终端中运行 <code>pi</code> 命令，它会把自然语言请求转化为多轮编码会话：与 LLM 对话、调用可读写文件和运行 shell 命令的工具，并将整个过程流式回显到终端 UI。底层由五个包组成一条流水线：统一的多提供商 LLM API、负责“问模型 / 跑工具”循环的智能体运行时、在运行时之上衔接工具 + 系统提示词 + 模式的编码智能体 CLI、负责渲染的终端 UI 库，以及用于以受监管子进程方式运行多个智能体的编排器。</p>
+
+<h2>用户能做什么</h2>
+<ul>
+  <li>在终端中启动交互式编码聊天（<code>pi</code>）→ <a href="modules/interactive-coding-agent-cli.html">交互式编码智能体 CLI</a> + <a href="modules/terminal-ui-library.html">终端 UI 库</a></li>
+  <li>不进入 TUI 直接运行一次性提示（<code>pi -p "fix this test"</code>）→ <a href="modules/interactive-coding-agent-cli.html">交互式编码智能体 CLI</a></li>
+  <li>在会话中调用技能或斜杠命令（例如 <code>/cl</code>、自定义 skills）→ <a href="modules/interactive-coding-agent-cli.html">交互式编码智能体 CLI</a></li>
+  <li>恢复、派生或导入之前的会话 → <a href="modules/interactive-coding-agent-cli.html">交互式编码智能体 CLI</a></li>
+  <li>在回合中中途干预（在运行时排队一条重定向消息）→ <a href="modules/agent-runtime-loop.html">智能体运行时循环</a></li>
+  <li>接入自己的 LLM 提供商 —— 通过 API key 或 OAuth 支持 OpenAI、Anthropic、Google、Bedrock、Mistral 等 → <a href="modules/multi-provider-llm-api.html">多提供商 LLM API</a></li>
+  <li>以无头 JSON-RPC 服务器方式运行 <code>pi</code>（供编排器和 IDE 集成使用）→ <a href="modules/interactive-coding-agent-cli.html">交互式编码智能体 CLI</a></li>
+  <li>同时运行多个智能体：启动监管守护进程、创建/列出/停止工作智能体、流式查看它们的会话 → <a href="modules/multi-agent-orchestrator.html">多智能体编排器</a></li>
+</ul>
+
+<h2>各模块如何协作</h2>
+<p>数据流自上而下：用户在 <a href="modules/terminal-ui-library.html">TUI</a> 中输入；<a href="modules/interactive-coding-agent-cli.html">编码智能体</a> 构建系统提示词和工具集，再交给 <a href="modules/agent-runtime-loop.html">智能体运行时</a>；运行时通过 <a href="modules/multi-provider-llm-api.html">LLM API</a> 调用 LLM；返回的工具调用针对文件系统和 shell 执行；执行结果再流回循环，直到智能体完成。<a href="modules/multi-agent-orchestrator.html">编排器</a> 独立于这一主流程，负责派生多个 <code>pi</code> RPC 工作进程并为其路由任务。</p>
+
+<a class="module-card" href="modules/multi-provider-llm-api.html">
+  <section>
+    <h2>多提供商 LLM API</h2>
+    <p>把调用方的提示词 + 提供商凭证转化为流式 LLM 响应 —— 一套统一 API 覆盖 OpenAI、Anthropic、Google、Bedrock 等。</p>
+  </section>
+</a>
+
+<a class="module-card" href="modules/agent-runtime-loop.html">
+  <section>
+    <h2>智能体运行时循环</h2>
+    <p>把提示词和一组工具转化为多轮 LLM 对话 —— 问模型、跑它要求的工具、把结果喂回去，重复直到完成。</p>
+  </section>
+</a>
+
+<a class="module-card" href="modules/interactive-coding-agent-cli.html">
+  <section>
+    <h2>交互式编码智能体 CLI</h2>
+    <p>把 <code>pi</code> 命令变成一个可用的编码会话 —— 衔接系统提示词、read/bash/edit/write 工具，以及交互/一次性/RPC 模式。</p>
+  </section>
+</a>
+
+<a class="module-card" href="modules/terminal-ui-library.html">
+  <section>
+    <h2>终端 UI 库</h2>
+    <p>把原始 stdin 字节和组件树渲染成终端屏幕 —— 解码按键、diff 帧、只重绘变化的部分。</p>
+  </section>
+</a>
+
+<a class="module-card" href="modules/multi-agent-orchestrator.html">
+  <section>
+    <h2>多智能体编排器</h2>
+    <p>把单个 <code>orchestrator serve</code> 命令变成受监管的智能体工作集群 —— 派生、路由 RPC、流式会话、崩溃恢复。</p>
+  </section>
+</a>
+
+<pre class="coverage">=== 覆盖状态 ===
+总行数:     264006
+深度:       19406 (7.4%)
+已映射:     87753
+已忽略:     154015
+未覆盖:     2832
+覆盖率:     98.9%
+
+未覆盖文件 (3):
+  - packages/coding-agent/docs/packages.md
+  - packages/coding-agent/test/fixtures/empty-agent/.gitkeep
+  - packages/coding-agent/test/fixtures/empty-cwd/.gitkeep
+</pre>
+<script src="assets/codeindex-runtime.js"></script>
+<script src="assets/codeindex.js"></script>
+</body>
+</html>

@@ -1,0 +1,369 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Terminal UI Library (@earendil-works/pi-tui)</title>
+<link rel="stylesheet" href="../assets/codeindex.css">
+</head>
+<body>
+<a href="index.html" class="back-link">← Back to overview</a>
+<h1>Terminal UI Library (@earendil-works/pi-tui)</h1>
+
+<p>A terminal UI library with differential rendering: it turns raw stdin bytes into structured key events, lets components consume those events to update their own state, then diffs the new render tree against the previous frame and writes only the changed rows to stdout. The coding-agent's interactive mode mounts a component tree (editor + markdown output + autocomplete), feeds stdin into it, and reads back submitted lines.</p>
+
+<dl>
+<dt>Module</dt><dd>Raw terminal bytes in → decoded key events → component state mutations → diffed render buffer out to stdout.</dd>
+<dt>Input</dt><dd>Raw bytes from process.stdin in raw mode: key presses, paste (bracketed-paste wrapped), mouse sequences, Kitty keyboard CSI-u sequences, resize events, and terminal query responses (OSC 11 background color, DSR color-scheme, cell-size replies).</dd>
+<dt>Output</dt><dd>An ANSI escape-sequence buffer written to process.stdout that repositions the cursor, clears only the changed lines, re-renders them, and optionally places a hardware cursor for IME — all inside a synchronized-output wrapper (ESC[?2026h…l) to prevent tearing.</dd>
+<dt>Notes</dt><dd>The library is transport-agnostic at the edges: ProcessTerminal talks to real stdin/stdout, but the Terminal interface could back a test or in-memory terminal. The core TUI class is a Container of components; each component implements render(width) returning string[] and optionally handleInput(data). Differential rendering is the central optimization: unchanged lines are never rewritten.</dd>
+</dl>
+
+<h2>What a caller can do with this library</h2>
+<p>The coding-agent interactive mode (the primary external caller) uses the library to:</p>
+<ul>
+<li>Mount a component tree — add an Editor (line input), Markdown (streamed agent output), Loader (spinner), SelectList, or overlays (autocomplete menu, settings) to a TUI instance.</li>
+<li>Feed stdin — call tui.start(); the library takes over process.stdin in raw mode, decodes keys, and routes each event to the focused component's handleInput.</li>
+<li>Render frames — any component calls tui.requestRender(); the TUI batches renders to at most one per 16ms tick, diffs against the previous frame, and writes only changed lines.</li>
+<li>Read line input — the Editor component exposes onSubmit/onChange callbacks; when the user presses Enter (matched via keybindings), the submitted text flows out to the caller.</li>
+<li>Drive an editor — the Editor supports multi-line editing, history (up/down), undo/redo, kill-ring (Emacs yank), word navigation, and autocomplete (slash commands + file paths).</li>
+<li>Query the terminal — queryTerminalBackgroundColor, queryTerminalColorScheme, and cell-size queries return promises; responses are intercepted from stdin and resolved.</li>
+<li>Show overlays — showOverlay positions a modal component (autocomplete, settings) on top of base content with anchor/percentage sizing and focus management.</li>
+</ul>
+<p>The action that triggers the whole chain is <strong>tui.start()</strong>: it flips stdin into raw mode, enables bracketed paste, queries the Kitty keyboard protocol, and wires the data callback to TUI.handleInput.</p>
+
+<h2>Data Flow: Input Decode (stdin bytes → key event → focused component)</h2>
+<p>This is the path a single key press travels. Bytes arrive on process.stdin, get split into complete escape sequences by StdinBuffer, are inspected for Kitty-protocol negotiation or terminal query responses by ProcessTerminal, then forwarded to TUI.handleInput which routes them to the focused component (after global interceptors: OSC 11 replies, color-scheme reports, cell-size replies, debug key, overlay focus restore).</p>
+
+<pre class="mermaid">
+graph TD
+    raw-stdin[Raw stdin data event] --> process-data[StdinBuffer.process accumulates bytes]
+    process-data --> check-paste{Starts with paste marker ESC 200~?}
+    check-paste -->|yes| paste-mode[Enter paste mode, accumulate until ESC 201~]
+    paste-mode --> emit-paste[Emit paste event with full content]
+    check-paste -->|no| extract[extractCompleteSequences splits buffer]
+    extract --> complete-check{Each slice: isCompleteSequence?}
+    complete-check -->|incomplete| wait-timeout[Hold remainder, 10ms timeout]
+    wait-timeout --> flush[flush remainder as-is]
+    complete-check -->|complete| emit-seq[Emit data event with one sequence]
+    emit-seq --> negotiation{Kitty protocol negotiation prefix?}
+    negotiation -->|pending| nego-buf[Buffer, wait 150ms for rest of split response]
+    negotiation -->|kitty-flags| handle-kitty[Enable/disable Kitty or modifyOtherKeys]
+    negotiation -->|device-attributes| handle-da[Enable modifyOtherKeys fallback]
+    negotiation -->|neither| forward[forwardInputSequence to TUI]
+    handle-kitty --> forward
+    handle-da --> forward
+    nego-buf --> forward
+    emit-paste --> forward
+    flush --> emit-seq
+    forward --> apple-check{Apple Terminal shift-enter?}
+    apple-check -->|yes| apple-norm[normalizeAppleTerminalInput rewrap as ESC 13;2u]
+    apple-check -->|no| tui-input[TUI.handleInput]
+    apple-norm --> tui-input
+    tui-input --> osc11{OSC 11 background reply pending?}
+    osc11 -->|yes| consume-osc11[consumeOsc11BackgroundResponse, resolve promise]
+    osc11 -->|no| scheme{Terminal color-scheme report?}
+    scheme -->|yes| consume-scheme[consumeTerminalColorSchemeReport, notify listeners]
+    scheme -->|no| listeners{Global inputListeners registered?}
+    listeners -->|yes, consume| listener-stop[Listener consumed, return]
+    listeners -->|yes, transform| listener-data[Listener transformed data, continue]
+    listeners -->|no| cell{Cell-size response CSI 6;H;W t?}
+    listener-data --> cell
+    cell -->|yes| consume-cell[consumeCellSizeResponse, setCellDimensions, invalidate]
+    cell -->|no| debug{Shift+Ctrl+D and onDebug set?}
+    debug -->|yes| debug-call[Call onDebug, return]
+    debug -->|no| overlay-visible{Focused overlay still visible?}
+    overlay-visible -->|no| restore-focus[Redirect focus to topmost visible overlay or preFocus]
+    overlay-visible -->|yes| restore-check{Overlay focus restore pending?}
+    restore-focus --> restore-check
+    restore-check -->|eligible| set-focus-ov[setFocus to pending overlay]
+    restore-check -->|blocked| resolve-block[Resolve blocked resume]
+    restore-check -->|inactive| key-release{Key release event?}
+    set-focus-ov --> key-release
+    resolve-block --> key-release
+    key-release -->|yes, not opted in| drop[Drop event, return]
+    key-release -->|no| focused[Focused component handleInput data]
+    focused --> render-req[requestRender]
+</pre>
+
+<h2>Data Flow: Render / Diff (component tree → changed stdout bytes)</h2>
+<p>This is the path a render frame travels. A component calls requestRender; the TUI coalesces into a nextTick + 16ms-throttled timer; doRender renders all children + composites overlays, extracts the IME cursor marker, normalizes lines, then either does a full redraw (first render, width/height change, clear-on-shrink, viewport misalignment) or a differential update that writes only the firstChanged..lastChanged range inside synchronized output.</p>
+
+<pre class="mermaid">
+graph TD
+    req[requestRender called by component] --> force{Force flag?}
+    force -->|yes| force-reset[Reset previousLines/width/height, nextTick doRender]
+    force -->|no| already{renderRequested already true?}
+    already -->|yes| req-stop[Return, coalesce]
+    already -->|no| sched-next[renderRequested true, nextTick scheduleRender]
+    sched-next --> timer{renderTimer active?}
+    timer -->|yes| sched-stop[Return]
+    timer -->|no| delay[Compute 16ms minus elapsed]
+    delay --> fire[setTimeout fires, doRender]
+    force-reset --> fire
+</pre>
+
+<p>The scheduling phase above coalesces repeated requestRender calls into a single doRender invocation throttled to one frame per 16ms tick. Once fire (the doRender entry point) is reached, execution continues into the render and diff phase below, which renders the component tree, composites overlays, and writes only the changed line range to stdout.</p>
+
+<pre class="mermaid">
+graph TD
+    fire[setTimeout fires, doRender] --> stopped{stopped?}
+    stopped -->|yes| render-abort[Abort]
+    stopped -->|no| dims[Read terminal columns/rows]
+    dims --> render-tree[Container.render width = all children render]
+    render-tree --> overlays{Overlay stack non-empty?}
+    overlays -->|yes| composite[compositeOverlays: position + splice overlay lines onto base]
+    overlays -->|no| cursor-extract
+    composite --> cursor-extract[extractCursorPosition: find CURSOR_MARKER, strip it]
+    cursor-extract --> resets[applyLineResets: normalize ANSI + append reset]
+    resets --> first{previousLines empty and no resize?}
+    first -->|yes| full-noclear[fullRender clear=false: write all lines synchronized]
+    first -->|no| wch{Width changed?}
+    wch -->|yes| full-clear[fullRender clear=true: clear screen + scrollback, rewrite all]
+    wch -->|no| hch{Height changed and not Termux?}
+    hch -->|yes| full-clear
+    hch -->|no| shrink{clearOnShrink and content shrank below maxLines?}
+    shrink -->|yes| full-clear
+    shrink -->|no| diff[Scan old vs new lines for firstChanged/lastChanged]
+    diff --> none{firstChanged is -1?}
+    none -->|yes| cursor-only[positionHardwareCursor only, return]
+    none -->|no| expand[Expand range for Kitty image multi-row lines]
+    expand --> deleted{firstChanged beyond new content?}
+    deleted -->|yes| clear-deleted[Write delete buffer: move cursor, clear extra lines]
+    deleted -->|no| viewport{firstChanged above previous viewport?}
+    viewport -->|yes| full-clear
+    viewport -->|no| append{Appending at end?}
+    append -->|yes| scroll-down[Move to bottom, scroll with CRLF, adjust viewport]
+    append -->|no| move[Move cursor to firstChanged line]
+    scroll-down --> write-range
+    move --> write-range[Write firstChanged..lastChanged with line clears, synchronized]
+    write-range --> trailing{Previous had more lines?}
+    trailing -->|yes| clear-trailing[Clear trailing extra lines, move back]
+    trailing -->|no| sync-end[End synchronized output, terminal.write buffer]
+    clear-trailing --> sync-end
+    full-noclear --> store[Store previousLines, kittyIds, width, height, viewport]
+    full-clear --> store
+    clear-deleted --> store
+    sync-end --> store
+    store --> hw-cursor[positionHardwareCursor for IME, show/hide]
+    hw-cursor --> done[Frame complete]
+    cursor-only --> done
+    render-abort --> done
+</pre>
+
+<h2>Data Flow: Editor (key event → text state → render lines)</h2>
+<p>The Editor is the primary input-consuming component. handleInput consults the global KeybindingsManager to dispatch each key to an action; actions mutate state.lines/cursorLine/cursorCol (with undo snapshots, kill-ring accumulation); render wraps text to width, applies scroll offset, renders the cursor as a highlighted grapheme, and appends the autocomplete list if active. Flag state machines: jumpMode (forward/backward awaiting next char), paste buffering, autocomplete navigation, undo stack, kill-ring yank-pop cycling.</p>
+
+<pre class="mermaid">
+graph TD
+    ed-input[Editor.handleInput data] --> jump{jumpMode active?}
+    jump -->|yes| jump-cancel{Jump hotkey again or control char?}
+    jump-cancel -->|cancel| jump-off[jumpMode null, fall through]
+    jump-cancel -->|perform| jump-do[jumpToChar, return]
+    jump -->|no| paste{Bracketed paste marker?}
+    paste -->|yes| paste-buf[Accumulate pasteBuffer until ESC 201~]
+    paste-buf -->|complete| paste-handle[handlePaste content, return]
+    paste -->|no| kb-copy{Keybinding tui.input.copy Ctrl+C?}
+    kb-copy -->|yes| copy-return[Return, let parent handle]
+    kb-copy -->|no| kb-undo{Undo key?}
+    kb-undo -->|yes| undo[undo, return]
+    kb-undo -->|no| ac-active{Autocomplete open?}
+    ac-active -->|yes| ac-cancel{Cancel key?}
+    ac-cancel -->|yes| ac-off[cancelAutocomplete, return]
+    ac-active -->|Up or Down| ac-up-down{Up or Down}
+    ac-up-down -->|yes| ac-list[autocompleteList.handleInput, return]
+    ac-active -->|Tab| ac-tab{Tab}
+    ac-tab -->|yes| ac-apply[applyCompletion, update state, cancel, return]
+    ac-active -->|Confirm| ac-confirm{Confirm}
+    ac-confirm -->|slash| slash{Prefix starts with slash}
+    slash -->|yes| ac-submit[apply + fall through to submit]
+    slash -->|no| ac-done[cancelAutocomplete + onChange, return]
+    ac-off --> tab-trigger{Tab and no autocomplete?}
+    ac-done --> tab-trigger
+    ac-apply --> tab-trigger
+    jump-off --> tab-trigger
+    undo --> tab-trigger
+    copy-return --> ed-end[No match, drop]
+    paste-handle --> ed-end
+    jump-do --> ed-end
+</pre>
+
+<p>The dispatch phase above resolves jump mode, paste, copy, undo, and autocomplete interactions; most non-terminal paths converge on the tab-trigger decision node, which is the entry point to the key-action dispatch phase below. The ac-submit node (slash-command confirm) also falls through to the submit node in the lower diagram.</p>
+
+<pre class="mermaid">
+graph TD
+    tab-trigger{Tab and no autocomplete?}
+    tab-trigger -->|yes| handle-tab[handleTabCompletion, return]
+    tab-trigger -->|no| deletes{Deletion keybinding?}
+    deletes -->|yes| delete-action[deleteToEndOfLine/WordBack/Forward/Char, return]
+    deletes -->|no| kill{Yank or yankPop?}
+    kill -->|yes| kill-action[yank/yankPop from kill-ring, return]
+    kill -->|no| move{Cursor movement key?}
+    move -->|yes| move-action[moveToLineStart/End/word/up/down/left/right/page, return]
+    move -->|no| newline{Newline key or shift-enter?}
+    newline -->|yes| bs-check{Backslash before cursor?}
+    bs-check -->|yes| bs-submit[handleBackspace + submitValue, return]
+    bs-check -->|no| add-line[addNewLine, return]
+    newline -->|no| submit{Submit enter?}
+    submit -->|yes| bs-check2{Backslash before cursor?}
+    bs-check2 -->|yes| bs-newline[handleBackspace + addNewLine, return]
+    bs-check2 -->|no| submit-val[submitValue, return]
+    submit -->|no| printable{decodePrintableKey or char code &gt;= 32?}
+    printable -->|yes| insert-char[insertCharacter, return]
+    printable -->|no| ed-end[No match, drop]
+    handle-tab --> ed-end
+    delete-action --> ed-end
+    kill-action --> ed-end
+    move-action --> ed-end
+    bs-submit --> ed-end
+    add-line --> ed-end
+    bs-newline --> ed-end
+    submit-val --> ed-end
+    insert-char --> ed-end
+    ac-submit[apply + fall through to submit] --> submit
+</pre>
+
+<h2>State machines flagged</h2>
+<ul>
+<li><strong>Editor jumpMode</strong> (editor.ts:595-613): null | "forward" | "backward". A jump hotkey sets the mode; the next printable char performs jumpToChar and clears it; a control char or repeat hotkey cancels.</li>
+<li><strong>Editor paste buffering</strong> (editor.ts:616-639, input.ts:48-84): isInPaste toggles on ESC[200~, accumulates until ESC[201~, then handlePaste + recurse on remainder.</li>
+<li><strong>Editor autocomplete navigation</strong> (editor.ts:653-711): when autocompleteState is set, up/down/cancel/tab/confirm are intercepted by the SelectList child; confirm on a slash command falls through to submit.</li>
+<li><strong>Undo stack</strong> (undo-stack.ts, editor.ts pushUndoSnapshot/undo): clone-on-push snapshots; pop returns the detached clone. Cleared on submit.</li>
+<li><strong>Kill ring</strong> (kill-ring.ts, editor.ts yank/yankPop): ring buffer; consecutive kills accumulate (prepend/append); yank peeks the last; yankPop rotates to cycle older entries.</li>
+<li><strong>Overlay focus restore</strong> (tui.ts:241-258, 370-470): inactive | eligible | blocked{overlay, blockedBy, resume}. Blocked transitions track when a non-overlay steals focus from a focused overlay; resume resolves to restore-overlay or focus-target.</li>
+<li><strong>Kitty keyboard protocol negotiation</strong> (terminal.ts:220-301): query → buffer fragments → parse kitty-flags vs device-attributes → enable Kitty (flags != 0) or modifyOtherKeys fallback; 150ms fragment timeout flushes as input.</li>
+<li><strong>StdinBuffer sequence completeness</strong> (stdin-buffer.ts:29-78): per-slice state machine complete | incomplete | not-escape for CSI/OSC/DCS/APC/SS3/meta; 10ms timeout flushes stuck incomplete remnants.</li>
+</ul>
+
+<h2>Source map</h2>
+<script>
+window.__sourceMap = {
+  "raw-stdin": { "file": "packages/tui/src/terminal.ts", "startLine": 202, "endLine": 205 },
+  "process-data": { "file": "packages/tui/src/stdin-buffer.ts", "startLine": 287, "endLine": 313 },
+  "check-paste": { "file": "packages/tui/src/stdin-buffer.ts", "startLine": 337, "endLine": 338 },
+  "paste-mode": { "file": "packages/tui/src/stdin-buffer.ts", "startLine": 315, "endLine": 334 },
+  "emit-paste": { "file": "packages/tui/src/stdin-buffer.ts", "startLine": 328, "endLine": 328 },
+  "extract": { "file": "packages/tui/src/stdin-buffer.ts", "startLine": 371, "endLine": 372 },
+  "complete-check": { "file": "packages/tui/src/stdin-buffer.ts", "startLine": 192, "endLine": 255 },
+  "wait-timeout": { "file": "packages/tui/src/stdin-buffer.ts", "startLine": 378, "endLine": 387 },
+  "flush": { "file": "packages/tui/src/stdin-buffer.ts", "startLine": 400, "endLine": 414 },
+  "emit-seq": { "file": "packages/tui/src/stdin-buffer.ts", "startLine": 389, "endLine": 398 },
+  "negotiation": { "file": "packages/tui/src/terminal.ts", "startLine": 181, "endLine": 192 },
+  "nego-buf": { "file": "packages/tui/src/terminal.ts", "startLine": 295, "endLine": 301 },
+  "handle-kitty": { "file": "packages/tui/src/terminal.ts", "startLine": 228, "endLine": 250 },
+  "handle-da": { "file": "packages/tui/src/terminal.ts", "startLine": 246, "endLine": 249 },
+  "forward": { "file": "packages/tui/src/terminal.ts", "startLine": 309, "endLine": 318 },
+  "apple-check": { "file": "packages/tui/src/terminal.ts", "startLine": 311, "endLine": 317 },
+  "apple-norm": { "file": "packages/tui/src/terminal.ts", "startLine": 44, "endLine": 47 },
+  "tui-input": { "file": "packages/tui/src/tui.ts", "startLine": 761, "endLine": 768 },
+  "osc11": { "file": "packages/tui/src/tui.ts", "startLine": 762, "endLine": 763 },
+  "consume-osc11": { "file": "packages/tui/src/tui.ts", "startLine": 837, "endLine": 859 },
+  "scheme": { "file": "packages/tui/src/tui.ts", "startLine": 765, "endLine": 766 },
+  "consume-scheme": { "file": "packages/tui/src/tui.ts", "startLine": 861, "endLine": 871 },
+  "listeners": { "file": "packages/tui/src/tui.ts", "startLine": 769, "endLine": 784 },
+  "listener-stop": { "file": "packages/tui/src/tui.ts", "startLine": 773, "endLine": 774 },
+  "listener-data": { "file": "packages/tui/src/tui.ts", "startLine": 776, "endLine": 783 },
+  "cell": { "file": "packages/tui/src/tui.ts", "startLine": 787, "endLine": 789 },
+  "consume-cell": { "file": "packages/tui/src/tui.ts", "startLine": 873, "endLine": 891 },
+  "debug": { "file": "packages/tui/src/tui.ts", "startLine": 792, "endLine": 795 },
+  "debug-call": { "file": "packages/tui/src/tui.ts", "startLine": 793, "endLine": 794 },
+  "overlay-visible": { "file": "packages/tui/src/tui.ts", "startLine": 799, "endLine": 808 },
+  "restore-focus": { "file": "packages/tui/src/tui.ts", "startLine": 802, "endLine": 807 },
+  "restore-check": { "file": "packages/tui/src/tui.ts", "startLine": 810, "endLine": 823 },
+  "set-focus-ov": { "file": "packages/tui/src/tui.ts", "startLine": 813, "endLine": 814 },
+  "resolve-block": { "file": "packages/tui/src/tui.ts", "startLine": 815, "endLine": 822 },
+  "key-release": { "file": "packages/tui/src/tui.ts", "startLine": 828, "endLine": 831 },
+  "drop": { "file": "packages/tui/src/tui.ts", "startLine": 829, "endLine": 830 },
+  "focused": { "file": "packages/tui/src/tui.ts", "startLine": 832, "endLine": 833 },
+  "render-req": { "file": "packages/tui/src/tui.ts", "startLine": 833, "endLine": 833 },
+  "req": { "file": "packages/tui/src/tui.ts", "startLine": 712, "endLine": 712 },
+  "force": { "file": "packages/tui/src/tui.ts", "startLine": 713, "endLine": 713 },
+  "force-reset": { "file": "packages/tui/src/tui.ts", "startLine": 714, "endLine": 734 },
+  "already": { "file": "packages/tui/src/tui.ts", "startLine": 736, "endLine": 736 },
+  "req-stop": { "file": "packages/tui/src/tui.ts", "startLine": 736, "endLine": 736 },
+  "sched-next": { "file": "packages/tui/src/tui.ts", "startLine": 737, "endLine": 738 },
+  "timer": { "file": "packages/tui/src/tui.ts", "startLine": 742, "endLine": 742 },
+  "sched-stop": { "file": "packages/tui/src/tui.ts", "startLine": 742, "endLine": 744 },
+  "delay": { "file": "packages/tui/src/tui.ts", "startLine": 745, "endLine": 746 },
+  "fire": { "file": "packages/tui/src/tui.ts", "startLine": 747, "endLine": 754 },
+  "stopped": { "file": "packages/tui/src/tui.ts", "startLine": 1255, "endLine": 1255 },
+  "render-abort": { "file": "packages/tui/src/tui.ts", "startLine": 1255, "endLine": 1255 },
+  "dims": { "file": "packages/tui/src/tui.ts", "startLine": 1256, "endLine": 1262 },
+  "render-tree": { "file": "packages/tui/src/tui.ts", "startLine": 1271, "endLine": 1271 },
+  "overlays": { "file": "packages/tui/src/tui.ts", "startLine": 1274, "endLine": 1276 },
+  "composite": { "file": "packages/tui/src/tui.ts", "startLine": 1032, "endLine": 1091 },
+  "cursor-extract": { "file": "packages/tui/src/tui.ts", "startLine": 1279, "endLine": 1279 },
+  "resets": { "file": "packages/tui/src/tui.ts", "startLine": 1281, "endLine": 1281 },
+  "first": { "file": "packages/tui/src/tui.ts", "startLine": 1336, "endLine": 1336 },
+  "full-noclear": { "file": "packages/tui/src/tui.ts", "startLine": 1337, "endLine": 1339 },
+  "wch": { "file": "packages/tui/src/tui.ts", "startLine": 1343, "endLine": 1343 },
+  "full-clear": { "file": "packages/tui/src/tui.ts", "startLine": 1344, "endLine": 1346 },
+  "hch": { "file": "packages/tui/src/tui.ts", "startLine": 1352, "endLine": 1352 },
+  "shrink": { "file": "packages/tui/src/tui.ts", "startLine": 1361, "endLine": 1361 },
+  "diff": { "file": "packages/tui/src/tui.ts", "startLine": 1368, "endLine": 1393 },
+  "none": { "file": "packages/tui/src/tui.ts", "startLine": 1397, "endLine": 1397 },
+  "cursor-only": { "file": "packages/tui/src/tui.ts", "startLine": 1398, "endLine": 1402 },
+  "expand": { "file": "packages/tui/src/tui.ts", "startLine": 1390, "endLine": 1393 },
+  "deleted": { "file": "packages/tui/src/tui.ts", "startLine": 1405, "endLine": 1405 },
+  "clear-deleted": { "file": "packages/tui/src/tui.ts", "startLine": 1406, "endLine": 1450 },
+  "viewport": { "file": "packages/tui/src/tui.ts", "startLine": 1455, "endLine": 1455 },
+  "append": { "file": "packages/tui/src/tui.ts", "startLine": 1394, "endLine": 1394 },
+  "scroll-down": { "file": "packages/tui/src/tui.ts", "startLine": 1466, "endLine": 1478 },
+  "move": { "file": "packages/tui/src/tui.ts", "startLine": 1481, "endLine": 1486 },
+  "write-range": { "file": "packages/tui/src/tui.ts", "startLine": 1492, "endLine": 1549 },
+  "trailing": { "file": "packages/tui/src/tui.ts", "startLine": 1555, "endLine": 1555 },
+  "clear-trailing": { "file": "packages/tui/src/tui.ts", "startLine": 1556, "endLine": 1568 },
+  "sync-end": { "file": "packages/tui/src/tui.ts", "startLine": 1570, "endLine": 1602 },
+  "store": { "file": "packages/tui/src/tui.ts", "startLine": 1607, "endLine": 1619 },
+  "hw-cursor": { "file": "packages/tui/src/tui.ts", "startLine": 1614, "endLine": 1614 },
+  "done": { "file": "packages/tui/src/tui.ts", "startLine": 1620, "endLine": 1620 },
+  "ed-input": { "file": "packages/tui/src/components/editor.ts", "startLine": 591, "endLine": 591 },
+  "jump": { "file": "packages/tui/src/components/editor.ts", "startLine": 595, "endLine": 595 },
+  "jump-cancel": { "file": "packages/tui/src/components/editor.ts", "startLine": 597, "endLine": 612 },
+  "jump-off": { "file": "packages/tui/src/components/editor.ts", "startLine": 612, "endLine": 613 },
+  "jump-do": { "file": "packages/tui/src/components/editor.ts", "startLine": 606, "endLine": 608 },
+  "paste": { "file": "packages/tui/src/components/editor.ts", "startLine": 616, "endLine": 616 },
+  "paste-buf": { "file": "packages/tui/src/components/editor.ts", "startLine": 622, "endLine": 623 },
+  "paste-handle": { "file": "packages/tui/src/components/editor.ts", "startLine": 627, "endLine": 629 },
+  "kb-copy": { "file": "packages/tui/src/components/editor.ts", "startLine": 642, "endLine": 642 },
+  "copy-return": { "file": "packages/tui/src/components/editor.ts", "startLine": 643, "endLine": 644 },
+  "kb-undo": { "file": "packages/tui/src/components/editor.ts", "startLine": 647, "endLine": 647 },
+  "undo": { "file": "packages/tui/src/components/editor.ts", "startLine": 648, "endLine": 649 },
+  "ac-active": { "file": "packages/tui/src/components/editor.ts", "startLine": 653, "endLine": 653 },
+  "ac-cancel": { "file": "packages/tui/src/components/editor.ts", "startLine": 654, "endLine": 654 },
+  "ac-off": { "file": "packages/tui/src/components/editor.ts", "startLine": 655, "endLine": 656 },
+  "ac-up-down": { "file": "packages/tui/src/components/editor.ts", "startLine": 659, "endLine": 660 },
+  "ac-list": { "file": "packages/tui/src/components/editor.ts", "startLine": 660, "endLine": 661 },
+  "ac-tab": { "file": "packages/tui/src/components/editor.ts", "startLine": 664, "endLine": 664 },
+  "ac-apply": { "file": "packages/tui/src/components/editor.ts", "startLine": 667, "endLine": 681 },
+  "ac-confirm": { "file": "packages/tui/src/components/editor.ts", "startLine": 685, "endLine": 685 },
+  "slash": { "file": "packages/tui/src/components/editor.ts", "startLine": 701, "endLine": 701 },
+  "ac-submit": { "file": "packages/tui/src/components/editor.ts", "startLine": 702, "endLine": 703 },
+  "ac-done": { "file": "packages/tui/src/components/editor.ts", "startLine": 705, "endLine": 707 },
+  "tab-trigger": { "file": "packages/tui/src/components/editor.ts", "startLine": 714, "endLine": 714 },
+  "handle-tab": { "file": "packages/tui/src/components/editor.ts", "startLine": 715, "endLine": 716 },
+  "deletes": { "file": "packages/tui/src/components/editor.ts", "startLine": 720, "endLine": 720 },
+  "delete-action": { "file": "packages/tui/src/components/editor.ts", "startLine": 721, "endLine": 743 },
+  "kill": { "file": "packages/tui/src/components/editor.ts", "startLine": 746, "endLine": 746 },
+  "kill-action": { "file": "packages/tui/src/components/editor.ts", "startLine": 747, "endLine": 753 },
+  "move": { "file": "packages/tui/src/components/editor.ts", "startLine": 756, "endLine": 756 },
+  "move-action": { "file": "packages/tui/src/components/editor.ts", "startLine": 757, "endLine": 851 },
+  "newline": { "file": "packages/tui/src/components/editor.ts", "startLine": 774, "endLine": 781 },
+  "bs-check": { "file": "packages/tui/src/components/editor.ts", "startLine": 782, "endLine": 782 },
+  "bs-submit": { "file": "packages/tui/src/components/editor.ts", "startLine": 783, "endLine": 785 },
+  "add-line": { "file": "packages/tui/src/components/editor.ts", "startLine": 787, "endLine": 788 },
+  "submit": { "file": "packages/tui/src/components/editor.ts", "startLine": 792, "endLine": 792 },
+  "bs-check2": { "file": "packages/tui/src/components/editor.ts", "startLine": 798, "endLine": 798 },
+  "bs-newline": { "file": "packages/tui/src/components/editor.ts", "startLine": 799, "endLine": 801 },
+  "submit-val": { "file": "packages/tui/src/components/editor.ts", "startLine": 804, "endLine": 805 },
+  "printable": { "file": "packages/tui/src/components/editor.ts", "startLine": 869, "endLine": 876 },
+  "insert-char": { "file": "packages/tui/src/components/editor.ts", "startLine": 871, "endLine": 872 },
+  "ed-end": { "file": "packages/tui/src/components/editor.ts", "startLine": 879, "endLine": 879 }
+};
+</script>
+
+<aside id="source-panel"><div id="source-header"></div><div id="monaco-container"></div></aside>
+<script src="../assets/codeindex-runtime.js"></script>
+<script src="../assets/codeindex.js"></script>
+</body>
+</html>

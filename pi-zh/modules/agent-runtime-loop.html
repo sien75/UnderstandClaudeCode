@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>智能体运行时循环</title>
+<link rel="stylesheet" href="../assets/codeindex.css">
+</head>
+<body>
+<a href="index.html" class="back-link">← 返回总览</a>
+<h1>智能体运行时循环</h1>
+
+<p>本模块是 <code>@earendil-works/pi-agent-core</code> 的核心：它把调用方的提示词和一组工具转换成与 LLM 的多轮对话，执行 LLM 请求的 tool call，并将结果反馈回去，直到智能体无事可做。可以把它看作一个小型运行时：你交给它一个目标和一些能力，它会循环执行“询问模型、运行模型要求的内容、重复”，直到模型停止调用工具且没有更多排队消息。</p>
+
+<p>它分为两层。底层（<code>agent-loop.ts</code>）是一个纯函数——给定上下文、配置和事件接收器，它运行循环并返回新消息。上层（<code>agent.ts</code>）是一个有状态的 <code>Agent</code> 类，拥有对话记录、管理运行生命周期，并为“steering”（中途干预）和“follow-up”（在智能体将要停止后再次运行）提供排队机制。更丰富的 <code>AgentHarness</code>（位于 <code>harness/</code>）在其之上叠加了会话持久化、hook、skill 和 prompt template。</p>
+
+<h2>调用方可以做什么</h2>
+<dl>
+<dt>启动提示词</dt>
+<dd><code>Agent.prompt(text|messages)</code> 或 <code>AgentHarness.prompt(text)</code> 启动一次新运行。这是循环的主要触发器。</dd>
+<dt>从已有对话记录继续</dt>
+<dd><code>Agent.continue()</code> 从最后一条消息恢复循环，而不添加新的用户提示词（用于重试后，或最后一条消息已经是 user/tool-result 的情况）。</dd>
+<dt>运行中干预</dt>
+<dd><code>steer(message)</code> 在下一轮 assistant 回复前注入一条排队消息——让用户在智能体工作时重新定向它。</dd>
+<dt>跟进</dt>
+<dd><code>followUp(message)</code> 仅在智能体本来会停止后才处理排队消息——一种“再补充一点”的机制。</dd>
+<dt>调用 skill 或 prompt template</dt>
+<dd><code>AgentHarness.skill(name)</code> / <code>promptFromTemplate(name, args)</code> 将 skill 或 template 格式化成提示词并运行一轮。</dd>
+<dt>中止</dt>
+<dd><code>abort()</code> 取消当前运行；循环以 <code>aborted</code> 的 stop reason 结束。</dd>
+<dt>压缩或导航会话树</dt>
+<dd><code>AgentHarness.compact()</code> 总结旧上下文； <code>navigateTree(targetId)</code> 将会话叶子移动到另一分支。这些是针对已存储历史的循环外操作。</dd>
+</dl>
+
+<h2>单次运行的数据流</h2>
+
+<p>对话以 <code>AgentMessage[]</code> 形式保存——它是普通 LLM 消息（user/assistant/toolResult）与应用特定的自定义消息（bash 输出、压缩摘要、分支摘要、任意“custom”消息）的并集。循环仅在调用模型的最后一刻才将此对话记录转换为 LLM 原生的 <code>Message[]</code> 形态。这种分离让应用可以在对话记录中携带仅用于 UI 或结构化的数据，而这些数据永远不会发给模型提供商。</p>
+
+<p>状态存在于三处：<code>Agent</code> 的 <code>_state</code>（对话记录、模型、工具、流式标志）、每次运行的 <code>AgentContext</code> 快照（system prompt + 消息 + 激活的工具），以及——在 <code>AgentHarness</code> 下——<code>Session</code> 树，它是持久化的真相来源，每一轮的上下文都从这里重建。</p>
+
+<pre class="mermaid">
+graph TD
+  caller-prompt["调用方调用 prompt / skill / promptFromTemplate"]
+  active-run-check{"是否正在运行？"}
+  reject-busy["抛出：agent 正忙"]
+  lifecycle-start["设置 abort controller，标记 isStreaming，清除错误"]
+  emit-agent-start["发出 agent_start + turn_start"]
+  emit-prompt-msgs["将 prompt 消息作为 message_start/end 发出"]
+  steering-poll["在运行开始时轮询 steering 队列"]
+  inner-loop{"还有更多 tool call 或待处理消息？"}
+  inject-pending["将 pending / steering 消息注入上下文"]
+  stream-response["从 LLM 流式接收 assistant 响应"]
+  transform-context["应用 transformContext（AgentMessage[] 到 AgentMessage[]）"]
+  convert-llm["convertToLlm：AgentMessage[] 转为 LLM Message[]"]
+  resolve-apikey["按提供商解析 API key"]
+  llm-call["外部：调用 streamFn（LLM 提供商边界）"]
+  stream-events["迭代流事件，构建部分 assistant 消息"]
+  final-message["完成 assistant 消息，发出 message_end"]
+  stop-error-aborted{"stopReason 为 error 或 aborted？"}
+  execute-toolcalls["批量执行 tool call，将结果推入上下文"]
+  turn-end["发出 turn_end"]
+  prepare-next-turn["prepareNextTurn 可更换 context / model / thinking"]
+  should-stop{"shouldStopAfterTurn？"}
+  poll-steering-again["再次轮询 steering 队列"]
+  follow-up-check{"是否有排队的 follow-up 消息？"}
+  agent-end["发出 agent_end，返回新消息"]
+  failure-handler["合成失败消息，发出 message/turn/agent_end"]
+  finish-run["清除流式状态，resolve idle promise"]
+
+  caller-prompt --> active-run-check
+  active-run-check -->|"否"| lifecycle-start
+  active-run-check -->|"是"| reject-busy
+  lifecycle-start --> emit-agent-start
+  emit-agent-start --> emit-prompt-msgs
+  emit-prompt-msgs --> steering-poll
+  steering-poll --> inner-loop
+  inner-loop -->|"是"| inject-pending
+  inject-pending --> stream-response
+  stream-response --> transform-context
+  transform-context --> convert-llm
+  convert-llm --> resolve-apikey
+  resolve-apikey --> llm-call
+  llm-call --> stream-events
+  stream-events --> final-message
+  final-message --> stop-error-aborted
+  stop-error-aborted -->|"是"| agent-end
+  stop-error-aborted -->|"否"| execute-toolcalls
+  execute-toolcalls --> turn-end
+  turn-end --> prepare-next-turn
+  prepare-next-turn --> should-stop
+  should-stop -->|"是"| agent-end
+  should-stop -->|"否"| poll-steering-again
+  poll-steering-again --> inner-loop
+  inner-loop -->|"否"| follow-up-check
+  follow-up-check -->|"是（设为 pending）"| inject-pending
+  follow-up-check -->|"否"| agent-end
+  agent-end --> finish-run
+  lifecycle-start -.->|"抛出错误"| failure-handler
+  failure-handler --> finish-run
+</pre>
+
+<h2>工具执行数据流</h2>
+
+<p>当 assistant 消息包含 tool call 时，循环会批量执行它们。每个 tool call 都经历三个阶段：<em>prepare</em>（查找工具、验证参数、运行可阻止它的 <code>beforeToolCall</code> hook）、<em>execute</em>（调用 <code>tool.execute</code>，流式返回部分更新）和 <em>finalize</em>（运行可覆盖结果的 <code>afterToolCall</code>）。工具默认顺序执行，也可以并行执行——但即使在并行模式下，prepare 仍然是顺序的，只有 execute 是并发的。只有当每个 finalized 结果都设置了 <code>terminate: true</code> 时，批次才会提前终止。</p>
+
+<pre class="mermaid">
+graph TD
+  tc-entry["从 assistant 消息中过滤出 toolCall 块"]
+  tc-mode-check{"顺序执行，或存在顺序执行工具？"}
+  tc-seq["逐个运行 tool call"]
+  tc-par["并行运行 tool call（准备顺序、执行并发）"]
+  tc-emit-start["发出 tool_execution_start"]
+  tc-prepare["prepareToolCall：查找工具、准备参数、验证"]
+  tc-tool-notfound{"是否找到工具？"}
+  tc-immediate["直接返回错误结果（跳过执行）"]
+  tc-prepare-args["prepareToolCallArguments + validateToolArguments"]
+  tc-before-hook["config.beforeToolCall hook"]
+  tc-aborted{"信号是否已 abort？"}
+  tc-blocked{"Hook 是否阻止？"}
+  tc-prepared["返回已准备的 {tool, args}"]
+  tc-execute["executePreparedToolCall：调用 tool.execute"]
+  tc-updates["通过 onUpdate 回调流式返回部分结果"]
+  tc-exec-error{"工具是否抛出异常？"}
+  tc-finalize["finalizeExecutedToolCall：afterToolCall hook"]
+  tc-after-override["afterResult 覆盖 content/details/isError/terminate"]
+  tc-after-error{"afterToolCall 是否抛出异常？"}
+  tc-emit-end["发出 tool_execution_end"]
+  tc-create-result-msg["构建 toolResult 消息"]
+  tc-emit-result-msg["为 tool result 发出 message_start/end"]
+  tc-par-preflight["并行：preflight 所有调用，收集执行 thunk"]
+  tc-par-run["Promise.all：并发运行 thunk"]
+  tc-terminate-check{"每个结果都设置 terminate？"}
+  tc-batch-result["返回 batch {messages, terminate}"]
+
+  tc-entry --> tc-mode-check
+  tc-mode-check -->|"顺序"| tc-seq
+  tc-mode-check -->|"并行"| tc-par
+  tc-seq --> tc-emit-start
+  tc-par --> tc-par-preflight
+  tc-par-preflight --> tc-emit-start
+  tc-emit-start --> tc-prepare
+  tc-prepare --> tc-tool-notfound
+  tc-tool-notfound -->|"否"| tc-immediate
+  tc-tool-notfound -->|"是"| tc-prepare-args
+  tc-prepare-args --> tc-before-hook
+  tc-before-hook --> tc-aborted
+  tc-aborted -->|"是"| tc-immediate
+  tc-aborted -->|"否"| tc-blocked
+  tc-blocked -->|"是"| tc-immediate
+  tc-blocked -->|"否"| tc-prepared
+  tc-prepared --> tc-execute
+  tc-execute --> tc-updates
+  tc-updates --> tc-exec-error
+  tc-exec-error -->|"是"| tc-finalize
+  tc-exec-error -->|"否"| tc-finalize
+  tc-immediate --> tc-emit-end
+  tc-finalize --> tc-after-override
+  tc-after-override --> tc-after-error
+  tc-after-error -->|"是"| tc-emit-end
+  tc-after-error -->|"否"| tc-emit-end
+  tc-emit-end --> tc-create-result-msg
+  tc-create-result-msg --> tc-emit-result-msg
+  tc-emit-result-msg --> tc-par-run
+  tc-par-run --> tc-terminate-check
+  tc-terminate-check -->|"是"| tc-batch-result
+  tc-terminate-check -->|"否"| tc-batch-result
+</pre>
+
+<h2>状态机说明</h2>
+
+<p>循环本身就是一个自然的状态机。每次运行中，<code>AgentHarness</code> 显式跟踪一个 <code>phase</code>，取值为 <code>idle</code>、<code>turn</code>、<code>compaction</code>、<code>branch_summary</code> 或 <code>retry</code>（定义在 <code>harness/types.ts</code> 中）。在一轮之内，隐式状态为：<em>流式 assistant 响应</em> → <em>执行 tool batch</em> → <em>一轮结束</em> → 要么 <em>下一轮</em>（如果存在 tool call、steering 或 follow-up），要么 <em>agent 结束</em>。流式 assistant 消息本身也会经历作为事件发出的子状态：<code>message_start</code> → <code>message_update</code>（text/thinking/tool-call 增量）→ <code>message_end</code>。Tool call 的状态循环为 <code>tool_execution_start</code> → <code>tool_execution_update</code> → <code>tool_execution_end</code>。</p>
+
+<h2>外部边界</h2>
+<ul>
+<li><strong>LLM 提供商调用</strong> —— <code>streamFn</code>（默认来自 <code>@earendil-works/pi-ai</code> 的 <code>streamSimple</code>）是 transcript 离开进程的唯一外部边界。其契约是：绝不抛出；将失败编码为最终 assistant 消息，并带有 <code>stopReason: "error" | "aborted"</code>。<code>streamProxy</code> 变体将此调用路由到一台持有认证并代理到提供商的服务器，客户端从带宽优化的事件中重建部分消息。</li>
+<li><strong>工具执行</strong> —— 每个 <code>tool.execute</code> 都是外部边界（工具可能运行 shell 命令、调用 API、触碰文件系统）。工具通过抛出异常来报告失败；循环捕获异常并转换为错误 tool result。</li>
+<li><strong>会话存储</strong> —— 在 <code>AgentHarness</code> 下，每个 <code>message_end</code> 和轮次边界都通过 <code>Session</code> 持久化（JSONL 或内存 repo），因此一次运行可以被恢复或分叉。</li>
+</ul>
+
+<h2>关键扩展点</h2>
+<dl>
+<dt><code>convertToLlm</code></dt>
+<dd>控制哪些对话记录消息以及以何种形态进入模型。自定义消息类型（bash 输出、摘要、自定义通知）会在这里映射为 user 消息；带有 <code>excludeFromContext</code> 的 bash 消息会被完全过滤掉。</dd>
+<dt><code>transformContext</code></dt>
+<dd>在 <code>convertToLlm</code> 之前于 <code>AgentMessage[]</code> 层级运行——是上下文窗口管理（剪枝、压缩）和注入外部上下文的钩子。在 harness 下，<code>context</code> hook 可以在这里重写消息。</dd>
+<dt><code>beforeToolCall</code> / <code>afterToolCall</code></dt>
+<dd>针对每个 tool call 的拦截。<code>before</code> 可以阻止调用；<code>after</code> 可以重写结果（content、details、error 标志、terminate 提示）。Harness 将它们作为 <code>tool_call</code> / <code>tool_result</code> 事件暴露出来。</dd>
+<dt><code>prepareNextTurn</code></dt>
+<dd>在轮次之间，可以替换 context、model 或 thinking 级别。Harness 利用它刷出 pending 的会话写入，并从会话重建一个干净的新轮次状态。</dd>
+<dt><code>shouldStopAfterTurn</code></dt>
+<dd>请求在当前轮次后优雅停止——例如在上下文窗口填满前——但不会中止正在执行的 tool。</dd>
+</dl>
+
+<script>
+window.__sourceMap = {
+  "caller-prompt": { "file": "packages/agent/src/agent.ts", "startLine": 335, "endLine": 345 },
+  "active-run-check": { "file": "packages/agent/src/agent.ts", "startLine": 338, "endLine": 342 },
+  "reject-busy": { "file": "packages/agent/src/agent.ts", "startLine": 339, "endLine": 341 },
+  "lifecycle-start": { "file": "packages/agent/src/agent.ts", "startLine": 469, "endLine": 492 },
+  "emit-agent-start": { "file": "packages/agent/src/agent-loop.ts", "startLine": 109, "endLine": 110 },
+  "emit-prompt-msgs": { "file": "packages/agent/src/agent-loop.ts", "startLine": 111, "endLine": 114 },
+  "steering-poll": { "file": "packages/agent/src/agent-loop.ts", "startLine": 167, "endLine": 167 },
+  "inner-loop": { "file": "packages/agent/src/agent-loop.ts", "startLine": 174, "endLine": 174 },
+  "inject-pending": { "file": "packages/agent/src/agent-loop.ts", "startLine": 182, "endLine": 190 },
+  "stream-response": { "file": "packages/agent/src/agent-loop.ts", "startLine": 275, "endLine": 368 },
+  "transform-context": { "file": "packages/agent/src/agent-loop.ts", "startLine": 283, "endLine": 286 },
+  "convert-llm": { "file": "packages/agent/src/agent-loop.ts", "startLine": 288, "endLine": 289 },
+  "resolve-apikey": { "file": "packages/agent/src/agent-loop.ts", "startLine": 300, "endLine": 302 },
+  "llm-call": { "file": "packages/agent/src/agent-loop.ts", "startLine": 304, "endLine": 308 },
+  "stream-events": { "file": "packages/agent/src/agent-loop.ts", "startLine": 313, "endLine": 357 },
+  "final-message": { "file": "packages/agent/src/agent-loop.ts", "startLine": 359, "endLine": 367 },
+  "stop-error-aborted": { "file": "packages/agent/src/agent-loop.ts", "startLine": 196, "endLine": 200 },
+  "execute-toolcalls": { "file": "packages/agent/src/agent-loop.ts", "startLine": 208, "endLine": 216 },
+  "turn-end": { "file": "packages/agent/src/agent-loop.ts", "startLine": 218, "endLine": 218 },
+  "prepare-next-turn": { "file": "packages/agent/src/agent-loop.ts", "startLine": 220, "endLine": 239 },
+  "should-stop": { "file": "packages/agent/src/agent-loop.ts", "startLine": 241, "endLine": 251 },
+  "poll-steering-again": { "file": "packages/agent/src/agent-loop.ts", "startLine": 253, "endLine": 253 },
+  "follow-up-check": { "file": "packages/agent/src/agent-loop.ts", "startLine": 257, "endLine": 262 },
+  "agent-end": { "file": "packages/agent/src/agent-loop.ts", "startLine": 268, "endLine": 268 },
+  "failure-handler": { "file": "packages/agent/src/agent.ts", "startLine": 494, "endLine": 510 },
+  "finish-run": { "file": "packages/agent/src/agent.ts", "startLine": 512, "endLine": 518 },
+  "tc-entry": { "file": "packages/agent/src/agent-loop.ts", "startLine": 373, "endLine": 380 },
+  "tc-mode-check": { "file": "packages/agent/src/agent-loop.ts", "startLine": 381, "endLine": 388 },
+  "tc-seq": { "file": "packages/agent/src/agent-loop.ts", "startLine": 395, "endLine": 449 },
+  "tc-par": { "file": "packages/agent/src/agent-loop.ts", "startLine": 451, "endLine": 516 },
+  "tc-emit-start": { "file": "packages/agent/src/agent-loop.ts", "startLine": 407, "endLine": 412 },
+  "tc-prepare": { "file": "packages/agent/src/agent-loop.ts", "startLine": 562, "endLine": 626 },
+  "tc-tool-notfound": { "file": "packages/agent/src/agent-loop.ts", "startLine": 570, "endLine": 576 },
+  "tc-prepare-args": { "file": "packages/agent/src/agent-loop.ts", "startLine": 548, "endLine": 560 },
+  "tc-before-hook": { "file": "packages/agent/src/agent-loop.ts", "startLine": 581, "endLine": 605 },
+  "tc-aborted": { "file": "packages/agent/src/agent-loop.ts", "startLine": 591, "endLine": 612 },
+  "tc-blocked": { "file": "packages/agent/src/agent-loop.ts", "startLine": 598, "endLine": 604 },
+  "tc-prepared": { "file": "packages/agent/src/agent-loop.ts", "startLine": 613, "endLine": 618 },
+  "tc-immediate": { "file": "packages/agent/src/agent-loop.ts", "startLine": 416, "endLine": 421 },
+  "tc-execute": { "file": "packages/agent/src/agent-loop.ts", "startLine": 628, "endLine": 669 },
+  "tc-updates": { "file": "packages/agent/src/agent-loop.ts", "startLine": 641, "endLine": 655 },
+  "tc-exec-error": { "file": "packages/agent/src/agent-loop.ts", "startLine": 659, "endLine": 665 },
+  "tc-finalize": { "file": "packages/agent/src/agent-loop.ts", "startLine": 671, "endLine": 714 },
+  "tc-after-override": { "file": "packages/agent/src/agent-loop.ts", "startLine": 695, "endLine": 702 },
+  "tc-after-error": { "file": "packages/agent/src/agent-loop.ts", "startLine": 703, "endLine": 706 },
+  "tc-emit-end": { "file": "packages/agent/src/agent-loop.ts", "startLine": 723, "endLine": 731 },
+  "tc-create-result-msg": { "file": "packages/agent/src/agent-loop.ts", "startLine": 733, "endLine": 745 },
+  "tc-emit-result-msg": { "file": "packages/agent/src/agent-loop.ts", "startLine": 747, "endLine": 750 },
+  "tc-par-preflight": { "file": "packages/agent/src/agent-loop.ts", "startLine": 461, "endLine": 500 },
+  "tc-par-run": { "file": "packages/agent/src/agent-loop.ts", "startLine": 502, "endLine": 504 },
+  "tc-terminate-check": { "file": "packages/agent/src/agent-loop.ts", "startLine": 544, "endLine": 546 },
+  "tc-batch-result": { "file": "packages/agent/src/agent-loop.ts", "startLine": 445, "endLine": 448 }
+};
+</script>
+
+<aside id="source-panel"><div id="source-header"></div><div id="monaco-container"></div></aside>
+<script src="../assets/codeindex-runtime.js"></script>
+<script src="../assets/codeindex.js"></script>
+</body>
+</html>

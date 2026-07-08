@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agent Runtime Loop</title>
+<link rel="stylesheet" href="../assets/codeindex.css">
+</head>
+<body>
+<a href="index.html" class="back-link">← Back to overview</a>
+<h1>Agent Runtime Loop</h1>
+
+<p>This module is the heart of <code>@earendil-works/pi-agent-core</code>: it turns a caller's prompt plus a set of tools into a multi-turn conversation with an LLM, executing tool calls the LLM requests and feeding the results back until the agent has nothing left to do. Think of it as a small runtime: you hand it a goal and some capabilities, it loops "ask the model, run what the model asked, repeat" until the model stops calling tools and there are no more queued messages.</p>
+
+<p>There are two layers. The lower layer (<code>agent-loop.ts</code>) is a pure function — given a context, a config, and an event sink, it runs the loop and returns the new messages. The upper layer (<code>agent.ts</code>) is a stateful <code>Agent</code> class that owns the transcript, manages run lifecycle, and exposes queueing for "steering" (interrupt mid-turn) and "follow-up" (run again after the agent would otherwise stop). A richer <code>AgentHarness</code> (in <code>harness/</code>) layers session persistence, hooks, skills, and prompt templates on top.</p>
+
+<h2>What the caller can do</h2>
+<dl>
+<dt>Start a prompt</dt>
+<dd><code>Agent.prompt(text|messages)</code> or <code>AgentHarness.prompt(text)</code> kicks off a fresh run. This is the main trigger for the loop.</dd>
+<dt>Continue from the existing transcript</dt>
+<dd><code>Agent.continue()</code> resumes the loop from the last message without adding a new user prompt (used after retries or when the last message is already a user/tool-result).</dd>
+<dt>Steer mid-run</dt>
+<dd><code>steer(message)</code> queues a message injected before the next assistant response — lets the user redirect the agent while it is working.</dd>
+<dt>Follow up</dt>
+<dd><code>followUp(message)</code> queues a message processed only after the agent would otherwise stop — a "one more thing" mechanism.</dd>
+<dt>Invoke a skill or prompt template</dt>
+<dd><code>AgentHarness.skill(name)</code> / <code>promptFromTemplate(name, args)</code> format a skill or template into a prompt and run a turn.</dd>
+<dt>Abort</dt>
+<dd><code>abort()</code> cancels the active run; the loop surfaces an <code>aborted</code> stop reason.</dd>
+<dt>Compact or navigate the session tree</dt>
+<dd><code>AgentHarness.compact()</code> summarizes old context; <code>navigateTree(targetId)</code> moves the session leaf to another branch. These are out-of-loop operations on stored history.</dd>
+</dl>
+
+<h2>How data flows through one run</h2>
+
+<p>The conversation is held as <code>AgentMessage[]</code> — a union of normal LLM messages (user/assistant/toolResult) plus app-specific custom messages (bash output, compaction summaries, branch summaries, arbitrary "custom" messages). The loop only converts this transcript to the LLM's native <code>Message[]</code> shape at the very edge, right before calling the model. This separation lets apps carry UI-only or structured data in the transcript that never reaches the provider.</p>
+
+<p>State lives in three places: the <code>Agent</code>'s <code>_state</code> (transcript, model, tools, streaming flags), the per-run <code>AgentContext</code> snapshot (system prompt + messages + active tools), and — under <code>AgentHarness</code> — the <code>Session</code> tree, which is the durable source of truth that each turn's context is rebuilt from.</p>
+
+<pre class="mermaid">
+graph TD
+  caller-prompt["Caller invokes prompt / skill / promptFromTemplate"]
+  active-run-check{"Already running?"}
+  reject-busy["Throw: agent is busy"]
+  lifecycle-start["Set up abort controller, mark isStreaming, clear error"]
+  emit-agent-start["Emit agent_start + turn_start"]
+  emit-prompt-msgs["Emit prompt messages as message_start/end"]
+  steering-poll["Poll steering queue at run start"]
+  inner-loop{"More tool calls or pending messages?"}
+  inject-pending["Inject pending / steering messages into context"]
+  stream-response["Stream assistant response from LLM"]
+  transform-context["Apply transformContext (AgentMessage[] to AgentMessage[])"]
+  convert-llm["convertToLlm: AgentMessage[] to LLM Message[]"]
+  resolve-apikey["Resolve API key per provider"]
+  llm-call["External: call streamFn (LLM provider boundary)"]
+  stream-events["Iterate stream events, build partial assistant message"]
+  final-message["Finalize assistant message, emit message_end"]
+  stop-error-aborted{"stopReason error or aborted?"}
+  execute-toolcalls["Execute tool calls in batch, push results to context"]
+  turn-end["Emit turn_end"]
+  prepare-next-turn["prepareNextTurn may swap context / model / thinking"]
+  should-stop{"shouldStopAfterTurn?"}
+  poll-steering-again["Poll steering queue again"]
+  follow-up-check{"Follow-up messages queued?"}
+  agent-end["Emit agent_end, return new messages"]
+  failure-handler["Synthesize failure message, emit message/turn/agent_end"]
+  finish-run["Clear streaming state, resolve idle promise"]
+
+  caller-prompt --> active-run-check
+  active-run-check -->|"no"| lifecycle-start
+  active-run-check -->|"yes"| reject-busy
+  lifecycle-start --> emit-agent-start
+  emit-agent-start --> emit-prompt-msgs
+  emit-prompt-msgs --> steering-poll
+  steering-poll --> inner-loop
+  inner-loop -->|"yes"| inject-pending
+  inject-pending --> stream-response
+  stream-response --> transform-context
+  transform-context --> convert-llm
+  convert-llm --> resolve-apikey
+  resolve-apikey --> llm-call
+  llm-call --> stream-events
+  stream-events --> final-message
+  final-message --> stop-error-aborted
+  stop-error-aborted -->|"yes"| agent-end
+  stop-error-aborted -->|"no"| execute-toolcalls
+  execute-toolcalls --> turn-end
+  turn-end --> prepare-next-turn
+  prepare-next-turn --> should-stop
+  should-stop -->|"yes"| agent-end
+  should-stop -->|"no"| poll-steering-again
+  poll-steering-again --> inner-loop
+  inner-loop -->|"no"| follow-up-check
+  follow-up-check -->|"yes (set as pending)"| inject-pending
+  follow-up-check -->|"no"| agent-end
+  agent-end --> finish-run
+  lifecycle-start -.->|"thrown error"| failure-handler
+  failure-handler --> finish-run
+</pre>
+
+<h2>Tool execution data flow</h2>
+
+<p>When the assistant message contains tool calls, the loop executes them as a batch. Each tool call goes through three phases: <em>prepare</em> (find the tool, validate arguments, run the <code>beforeToolCall</code> hook which can block it), <em>execute</em> (call <code>tool.execute</code>, streaming partial updates), and <em>finalize</em> (run <code>afterToolCall</code> which can override the result). Tools run sequentially by default or in parallel — but even in parallel mode, preparation is sequential and only execution is concurrent. A batch terminates early only when every finalized result sets <code>terminate: true</code>.</p>
+
+<pre class="mermaid">
+graph TD
+  tc-entry["Filter toolCall blocks from assistant message"]
+  tc-mode-check{"Sequential or any sequential-tool?"}
+  tc-seq["Run tool calls one at a time"]
+  tc-par["Run tool calls in parallel (prepare sequential, execute concurrent)"]
+  tc-emit-start["Emit tool_execution_start"]
+  tc-prepare["prepareToolCall: find tool, prepare args, validate"]
+  tc-tool-notfound{"Tool found?"}
+  tc-immediate["Immediate error result (skip execution)"]
+  tc-prepare-args["prepareToolCallArguments + validateToolArguments"]
+  tc-before-hook["config.beforeToolCall hook"]
+  tc-aborted{"Signal aborted?"}
+  tc-blocked{"Hook blocked?"}
+  tc-prepared["Return prepared {tool, args}"]
+  tc-execute["executePreparedToolCall: call tool.execute"]
+  tc-updates["Stream partial results via onUpdate callback"]
+  tc-exec-error{"Tool threw?"}
+  tc-finalize["finalizeExecutedToolCall: afterToolCall hook"]
+  tc-after-override["afterResult overrides content/details/isError/terminate"]
+  tc-after-error{"afterToolCall threw?"}
+  tc-emit-end["Emit tool_execution_end"]
+  tc-create-result-msg["Build toolResult message"]
+  tc-emit-result-msg["Emit message_start/end for tool result"]
+  tc-par-preflight["Parallel: preflight all calls, collect execution thunks"]
+  tc-par-run["Promise.all: run thunks concurrently"]
+  tc-terminate-check{"Every result sets terminate?"}
+  tc-batch-result["Return batch {messages, terminate}"]
+
+  tc-entry --> tc-mode-check
+  tc-mode-check -->|"sequential"| tc-seq
+  tc-mode-check -->|"parallel"| tc-par
+  tc-seq --> tc-emit-start
+  tc-par --> tc-par-preflight
+  tc-par-preflight --> tc-emit-start
+  tc-emit-start --> tc-prepare
+  tc-prepare --> tc-tool-notfound
+  tc-tool-notfound -->|"no"| tc-immediate
+  tc-tool-notfound -->|"yes"| tc-prepare-args
+  tc-prepare-args --> tc-before-hook
+  tc-before-hook --> tc-aborted
+  tc-aborted -->|"yes"| tc-immediate
+  tc-aborted -->|"no"| tc-blocked
+  tc-blocked -->|"yes"| tc-immediate
+  tc-blocked -->|"no"| tc-prepared
+  tc-prepared --> tc-execute
+  tc-execute --> tc-updates
+  tc-updates --> tc-exec-error
+  tc-exec-error -->|"yes"| tc-finalize
+  tc-exec-error -->|"no"| tc-finalize
+  tc-immediate --> tc-emit-end
+  tc-finalize --> tc-after-override
+  tc-after-override --> tc-after-error
+  tc-after-error -->|"yes"| tc-emit-end
+  tc-after-error -->|"no"| tc-emit-end
+  tc-emit-end --> tc-create-result-msg
+  tc-create-result-msg --> tc-emit-result-msg
+  tc-emit-result-msg --> tc-par-run
+  tc-par-run --> tc-terminate-check
+  tc-terminate-check -->|"yes"| tc-batch-result
+  tc-terminate-check -->|"no"| tc-batch-result
+</pre>
+
+<h2>State machine note</h2>
+
+<p>The loop is itself a natural state machine. Per run, the <code>AgentHarness</code> tracks an explicit <code>phase</code> of <code>idle</code>, <code>turn</code>, <code>compaction</code>, <code>branch_summary</code>, or <code>retry</code> (defined in <code>harness/types.ts</code>). Within a turn, the implicit states are: <em>streaming assistant response</em> → <em>executing tool batch</em> → <em>turn settled</em> → either <em>next turn</em> (if tool calls, steering, or follow-ups exist) or <em>agent ended</em>. The streamed assistant message itself also cycles through sub-states emitted as events: <code>message_start</code> → <code>message_update</code> (text/thinking/tool-call deltas) → <code>message_end</code>. Tool calls cycle <code>tool_execution_start</code> → <code>tool_execution_update</code> → <code>tool_execution_end</code>.</p>
+
+<h2>External boundaries</h2>
+<ul>
+<li><strong>LLM provider call</strong> — the <code>streamFn</code> (default <code>streamSimple</code> from <code>@earendil-works/pi-ai</code>) is the single external boundary where the transcript leaves the process. Its contract: never throw; encode failures as a final assistant message with <code>stopReason: "error" | "aborted"</code>. The <code>streamProxy</code> variant routes this call through a server that holds auth and proxies to providers, reconstructing the partial message client-side from bandwidth-optimized events.</li>
+<li><strong>Tool execution</strong> — each <code>tool.execute</code> is an external boundary (tools may run shell commands, hit APIs, touch the filesystem). Tools signal failure by throwing; the loop catches and converts to an error tool result.</li>
+<li><strong>Session storage</strong> — under <code>AgentHarness</code>, every <code>message_end</code> and turn boundary is persisted through the <code>Session</code> (JSONL or in-memory repo), so a run can be resumed or forked.</li>
+</ul>
+
+<h2>Key extension points</h2>
+<dl>
+<dt><code>convertToLlm</code></dt>
+<dd>Controls which transcript messages reach the model and in what shape. Custom message types (bash output, summaries, custom notifications) are mapped to user messages here; <code>excludeFromContext</code> bash messages are filtered out entirely.</dd>
+<dt><code>transformContext</code></dt>
+<dd>Runs just before <code>convertToLlm</code> on the <code>AgentMessage[]</code> level — the hook for context-window management (pruning, compaction) and injecting external context. Under the harness, the <code>context</code> hook can rewrite messages here.</dd>
+<dt><code>beforeToolCall</code> / <code>afterToolCall</code></dt>
+<dd>Per-tool-call interception. <code>before</code> can block a call; <code>after</code> can rewrite the result (content, details, error flag, terminate hint). The harness surfaces these as <code>tool_call</code> / <code>tool_result</code> events.</dd>
+<dt><code>prepareNextTurn</code></dt>
+<dd>Between turns, can replace the context, model, or thinking level. The harness uses this to flush pending session writes and rebuild a fresh turn state from the session.</dd>
+<dt><code>shouldStopAfterTurn</code></dt>
+<dd>Requests a graceful stop after the current turn — e.g. before the context window fills up — without aborting in-flight tool execution.</dd>
+</dl>
+
+<script>
+window.__sourceMap = {
+  "caller-prompt": { "file": "packages/agent/src/agent.ts", "startLine": 335, "endLine": 345 },
+  "active-run-check": { "file": "packages/agent/src/agent.ts", "startLine": 338, "endLine": 342 },
+  "reject-busy": { "file": "packages/agent/src/agent.ts", "startLine": 339, "endLine": 341 },
+  "lifecycle-start": { "file": "packages/agent/src/agent.ts", "startLine": 469, "endLine": 492 },
+  "emit-agent-start": { "file": "packages/agent/src/agent-loop.ts", "startLine": 109, "endLine": 110 },
+  "emit-prompt-msgs": { "file": "packages/agent/src/agent-loop.ts", "startLine": 111, "endLine": 114 },
+  "steering-poll": { "file": "packages/agent/src/agent-loop.ts", "startLine": 167, "endLine": 167 },
+  "inner-loop": { "file": "packages/agent/src/agent-loop.ts", "startLine": 174, "endLine": 174 },
+  "inject-pending": { "file": "packages/agent/src/agent-loop.ts", "startLine": 182, "endLine": 190 },
+  "stream-response": { "file": "packages/agent/src/agent-loop.ts", "startLine": 275, "endLine": 368 },
+  "transform-context": { "file": "packages/agent/src/agent-loop.ts", "startLine": 283, "endLine": 286 },
+  "convert-llm": { "file": "packages/agent/src/agent-loop.ts", "startLine": 288, "endLine": 289 },
+  "resolve-apikey": { "file": "packages/agent/src/agent-loop.ts", "startLine": 300, "endLine": 302 },
+  "llm-call": { "file": "packages/agent/src/agent-loop.ts", "startLine": 304, "endLine": 308 },
+  "stream-events": { "file": "packages/agent/src/agent-loop.ts", "startLine": 313, "endLine": 357 },
+  "final-message": { "file": "packages/agent/src/agent-loop.ts", "startLine": 359, "endLine": 367 },
+  "stop-error-aborted": { "file": "packages/agent/src/agent-loop.ts", "startLine": 196, "endLine": 200 },
+  "execute-toolcalls": { "file": "packages/agent/src/agent-loop.ts", "startLine": 208, "endLine": 216 },
+  "turn-end": { "file": "packages/agent/src/agent-loop.ts", "startLine": 218, "endLine": 218 },
+  "prepare-next-turn": { "file": "packages/agent/src/agent-loop.ts", "startLine": 220, "endLine": 239 },
+  "should-stop": { "file": "packages/agent/src/agent-loop.ts", "startLine": 241, "endLine": 251 },
+  "poll-steering-again": { "file": "packages/agent/src/agent-loop.ts", "startLine": 253, "endLine": 253 },
+  "follow-up-check": { "file": "packages/agent/src/agent-loop.ts", "startLine": 257, "endLine": 262 },
+  "agent-end": { "file": "packages/agent/src/agent-loop.ts", "startLine": 268, "endLine": 268 },
+  "failure-handler": { "file": "packages/agent/src/agent.ts", "startLine": 494, "endLine": 510 },
+  "finish-run": { "file": "packages/agent/src/agent.ts", "startLine": 512, "endLine": 518 },
+  "tc-entry": { "file": "packages/agent/src/agent-loop.ts", "startLine": 373, "endLine": 380 },
+  "tc-mode-check": { "file": "packages/agent/src/agent-loop.ts", "startLine": 381, "endLine": 388 },
+  "tc-seq": { "file": "packages/agent/src/agent-loop.ts", "startLine": 395, "endLine": 449 },
+  "tc-par": { "file": "packages/agent/src/agent-loop.ts", "startLine": 451, "endLine": 516 },
+  "tc-emit-start": { "file": "packages/agent/src/agent-loop.ts", "startLine": 407, "endLine": 412 },
+  "tc-prepare": { "file": "packages/agent/src/agent-loop.ts", "startLine": 562, "endLine": 626 },
+  "tc-tool-notfound": { "file": "packages/agent/src/agent-loop.ts", "startLine": 570, "endLine": 576 },
+  "tc-prepare-args": { "file": "packages/agent/src/agent-loop.ts", "startLine": 548, "endLine": 560 },
+  "tc-before-hook": { "file": "packages/agent/src/agent-loop.ts", "startLine": 581, "endLine": 605 },
+  "tc-aborted": { "file": "packages/agent/src/agent-loop.ts", "startLine": 591, "endLine": 612 },
+  "tc-blocked": { "file": "packages/agent/src/agent-loop.ts", "startLine": 598, "endLine": 604 },
+  "tc-prepared": { "file": "packages/agent/src/agent-loop.ts", "startLine": 613, "endLine": 618 },
+  "tc-immediate": { "file": "packages/agent/src/agent-loop.ts", "startLine": 416, "endLine": 421 },
+  "tc-execute": { "file": "packages/agent/src/agent-loop.ts", "startLine": 628, "endLine": 669 },
+  "tc-updates": { "file": "packages/agent/src/agent-loop.ts", "startLine": 641, "endLine": 655 },
+  "tc-exec-error": { "file": "packages/agent/src/agent-loop.ts", "startLine": 659, "endLine": 665 },
+  "tc-finalize": { "file": "packages/agent/src/agent-loop.ts", "startLine": 671, "endLine": 714 },
+  "tc-after-override": { "file": "packages/agent/src/agent-loop.ts", "startLine": 695, "endLine": 702 },
+  "tc-after-error": { "file": "packages/agent/src/agent-loop.ts", "startLine": 703, "endLine": 706 },
+  "tc-emit-end": { "file": "packages/agent/src/agent-loop.ts", "startLine": 723, "endLine": 731 },
+  "tc-create-result-msg": { "file": "packages/agent/src/agent-loop.ts", "startLine": 733, "endLine": 745 },
+  "tc-emit-result-msg": { "file": "packages/agent/src/agent-loop.ts", "startLine": 747, "endLine": 750 },
+  "tc-par-preflight": { "file": "packages/agent/src/agent-loop.ts", "startLine": 461, "endLine": 500 },
+  "tc-par-run": { "file": "packages/agent/src/agent-loop.ts", "startLine": 502, "endLine": 504 },
+  "tc-terminate-check": { "file": "packages/agent/src/agent-loop.ts", "startLine": 544, "endLine": 546 },
+  "tc-batch-result": { "file": "packages/agent/src/agent-loop.ts", "startLine": 445, "endLine": 448 }
+};
+</script>
+
+<aside id="source-panel"><div id="source-header"></div><div id="monaco-container"></div></aside>
+<script src="../assets/codeindex-runtime.js"></script>
+<script src="../assets/codeindex.js"></script>
+</body>
+</html>

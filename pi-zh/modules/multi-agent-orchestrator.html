@@ -1,0 +1,339 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>多智能体编排器</title>
+<link rel="stylesheet" href="../assets/codeindex.css">
+</head>
+<body>
+<a href="index.html" class="back-link">← 返回总览</a>
+<h1>多智能体编排器</h1>
+<p><code>@earendil-works/pi-orchestrator</code> 包是一个监管进程，负责生成并管理多个编码智能体子进程，在调用方（CLI 或外部客户端）与这些工作进程之间路由任务和 RPC 流量，并协调它们的生命周期。从用户角度看，只需运行一次 <code>orchestrator serve</code> 即可启动长期运行的监管守护进程；随后所有其他命令——<code>list</code>、<code>spawn</code>、<code>status</code>、<code>stop</code>、<code>rpc</code>、<code>rpc-stream</code>——都是轻量客户端，通过 Unix 套接字连接到该守护进程，发送 JSON-Lines 请求并打印 JSON 响应。监管进程本身将每个智能体作为子进程生成，并通过其 stdin/stdout 使用 <code>@earendil-works/pi-coding-agent</code> 定义的同一 JSON-Lines RPC 协议与之通信。此外，监管进程还可以选择将自己和每个 Pi 工作进程注册到远程 "Radius" 在线服务，以便其他机器发现并访问该编排器。</p>
+
+<dl>
+<dt>cli.ts — 命令分发器</dt>
+<dd>解析 <code>process.argv</code>，并路由到 <code>serve()</code>（启动守护进程）或调用 <code>sendIpcRequest</code> 的某个客户端命令。对于 <code>rpc-stream</code>，它会打开原始双向套接字，并将 stdin 的 JSON-Lines 管道输入其中。<strong>输入：</strong>argv 标志。<strong>输出：</strong>打印的 JSON 响应或一个运行中的守护进程。</dd>
+<dt>serve.ts — 守护进程入口</dt>
+<dd>启动 IPC 套接字服务器，在重启后恢复持久化的实例状态，可选择启动 Radius 在线服务，然后永久阻塞，直到信号或致命错误触发优雅关闭：关闭服务器、停止所有工作进程并删除套接字文件。<strong>输入：</strong>无（副作用：一个运行中的套接字）。<strong>输出：</strong>一个长期运行的进程。</dd>
+<dt>ipc/server.ts — 套接字服务器</dt>
+<dd>接受 Unix 套接字连接，读取以换行符分隔的 JSON，将每一行解析为 <code>OrchestratorRequest</code>，分派给处理器，并写回 JSON 响应。对于 <code>rpc_stream</code> 请求，它会将连接升级为长期存在的双向桥接：将智能体会话事件和 UI 请求扇出给客户端，并按串行方式排队入站 RPC 命令。<strong>输入：</strong>套接字上的 JSON-Lines 请求。<strong>输出：</strong>JSON-Lines 响应和流式事件。</dd>
+<dt>ipc/client.ts — 套接字客户端</dt>
+<dd>每个非 <code>serve</code> 的 CLI 子命令使用的一次性辅助函数：打开到编排器套接字的连接，写入一个请求，读取一个响应并返回。<strong>输入：</strong>一个 <code>OrchestratorRequest</code>。<strong>输出：</strong>一个 <code>OrchestratorResponse</code>。</dd>
+<dt>ipc/protocol.ts — 有线格式</dt>
+<dd>定义请求/响应的可辨识联合类型，以及 <code>encodeMessage</code>/<code>parseRequestLine</code>/<code>parseResponseLine</code> 辅助函数。套接字上的每个字节都是 <code>JSON.stringify(msg) + "\n"</code>。</dd>
+<dt>handler.ts — 请求路由器</dt>
+<dd>根据 <code>request.type</code> 进行分支，并委托给对应的 <code>supervisor</code> 方法，将 <code>InstanceRecord</code> 映射为便于传输的 <code>InstanceSummary</code>。同时暴露 <code>openRpcStream</code>，将 supervisor 的流句柄适配为面向套接字的回调形态。</dd>
+<dt>supervisor.ts — 生命周期与路由核心</dt>
+<dd>持有内存中的 <code>liveInstances</code> 映射（每个工作进程对应一个 <code>LiveInstance</code>，将持久化的 <code>InstanceRecord</code> 绑定到活动的 <code>RpcProcessInstance</code>、订阅者集合以及 UI 请求处理器）。负责生成、停止、RPC 路由、流订阅、崩溃恢复和关闭。将实例元数据持久化到 <code>instances.json</code>，并在改变会话状态的 RPC 调用后刷新。将自己配置为 Radius 协调器。</dd>
+<dt>rpc-process.ts — 子进程包装器</dt>
+<dd>为每个工作进程生成一个 <code>pi --mode rpc</code>（或 <code>pi-coding-agent/rpc-entry</code>）子进程，通过 stdin/stdout 成帧 JSON-Lines，按 <code>id</code> 将响应与待处理请求关联，向监听者扇出会话事件和 <code>extension_ui_request</code> 消息，并检测子进程退出/错误。<strong>输入：</strong><code>RpcCommand</code>。<strong>输出：</strong><code>RpcResponse</code> + 异步 <code>AgentSessionEvent</code> 流。<strong>外部边界：</strong>一个 Node 子进程。</dd>
+<dt>storage.ts — 持久化</dt>
+<dd>在编排器目录下读写 <code>instances.json</code> 和 <code>machine.json</code>。纯 JSON 文件 IO，无缓存。</dd>
+<dt>config.ts — 路径与环境</dt>
+<dd>解析编排器目录（<code>PI_ORCHESTRATOR_DIR</code> 或 <code>~/.pi/orchestrator</code>）、套接字路径、instances/machine/auth 路径、包版本，以及决定子进程生成命令的 <code>isBunBinary</code> 标志。</dd>
+<dt>radius.ts — 远程在线服务</dt>
+<dd>与 Radius 服务的可选集成：注册本机和每个 Pi（工作进程），以指数退避 + 抖动方式运行心跳，并在多次 404 后重新注册。<strong>外部边界：</strong>Radius HTTP API。</dd>
+<dt>types.ts — 共享类型</dt>
+<dd><code>InstanceStatus</code>（<code>"starting" | "online" | "stopping" | "stopped" | "error"</code>）、<code>InstanceRecord</code>、<code>MachineRecord</code>、<code>RadiusRegistration</code>。</dd>
+</dl>
+
+<h2>数据流 — serve 启动</h2>
+<pre class="mermaid">
+graph TD
+    serve-cli-invoke["serve CLI 调用"] --> serve-fn["serve 函数"]
+    serve-fn --> mkdir-socket-dir["创建 socket 目录"]
+    serve-fn --> start-ipc-server["启动 IPC 服务器"]
+    start-ipc-server --> stale-socket-check["检查过期 socket"]
+    stale-socket-check --> socket-exists-decision["socket 存在判断"]
+    socket-exists-decision -->|存在| is-live-decision["是否活跃判断"]
+    is-live-decision -->|活跃| throw-already-running["抛出已在运行错误"]
+    is-live-decision -->|过期| unlink-stale["删除过期 socket"]
+    socket-exists-decision -->|不存在| listen-server["监听服务器"]
+    unlink-stale --> listen-server
+    listen-server --> recover-after-restart["重启后恢复"]
+    recover-after-restart --> radius-enabled-decision["Radius 启用判断"]
+    radius-enabled-decision -->|已启用| radius-presence-start["启动 Radius 在线服务"]
+    radius-presence-start --> register-machine["注册机器"]
+    register-machine --> start-machine-heartbeat["启动机器心跳"]
+    start-machine-heartbeat --> listen-forever["永久监听"]
+    radius-enabled-decision -->|已禁用| radius-disabled-log["Radius 禁用日志"]
+    radius-disabled-log --> listen-forever
+    start-ipc-server --> startup-error-decision["启动错误判断"]
+    startup-error-decision -->|错误| server-close-cleanup["关闭服务器并清理"]
+    listen-forever --> signal-handler["信号处理器"]
+    signal-handler --> shutdown["关闭"]
+    shutdown --> supervisor-shutdown["supervisor 关闭"]
+    shutdown --> radius-stop["Radius 停止"]
+</pre>
+
+<h2>数据流 — 客户端命令请求/响应（list/spawn/status/stop/rpc）</h2>
+<pre class="mermaid">
+graph TD
+    user-client-cmd["用户客户端命令"] --> send-ipc-request["发送 IPC 请求"]
+    send-ipc-request --> connect-socket["连接套接字"]
+    connect-socket --> socket-data-receive["接收套接字数据"]
+    socket-data-receive --> parse-request-line["解析请求行"]
+    parse-request-line --> is-rpc-stream-decision["是否 rpc-stream 判断"]
+    is-rpc-stream-decision -->|单次| handle-ipc-request["处理 IPC 请求"]
+    handle-ipc-request --> request-type-decision["请求类型判断"]
+    request-type-decision -->|spawn| spawn-case["spawn 分支"]
+    request-type-decision -->|list| list-case["list 分支"]
+    request-type-decision -->|status| status-case["status 分支"]
+    request-type-decision -->|stop| stop-case["stop 分支"]
+    request-type-decision -->|rpc| rpc-case["rpc 分支"]
+    spawn-case --> supervisor-method["supervisor 方法"]
+    list-case --> supervisor-method
+    status-case --> supervisor-method
+    stop-case --> supervisor-method
+    rpc-case --> supervisor-method
+    supervisor-method --> build-response["构建响应"]
+    build-response --> write-response-socket["向套接字写入响应"]
+    write-response-socket --> client-receive-data["客户端接收数据"]
+    client-receive-data --> parse-response["解析响应"]
+    parse-response --> print-response["打印响应"]
+    handle-ipc-request --> unknown-instance-error["未知实例错误"]
+    unknown-instance-error --> write-response-socket
+    socket-data-receive --> parse-error-decision["解析错误判断"]
+    parse-error-decision -->|解析失败| write-error-response["写入错误响应"]
+    write-error-response --> client-receive-data
+</pre>
+
+<h2>数据流 — 生成工作进程（进入子进程）</h2>
+<pre class="mermaid">
+graph TD
+    spawn-request-arrives["spawn 请求到达"] --> spawn-instance["生成实例"]
+    spawn-instance --> create-live-instance["创建活动实例"]
+    create-live-instance --> upsert-instance-storage["更新/插入实例存储"]
+    spawn-instance --> create-rpc-process["创建 RPC 进程"]
+    create-rpc-process --> get-spawn-command["获取生成命令"]
+    get-spawn-command --> spawn-child-process["生成子进程"]
+    spawn-child-process --> attach-listeners["附加监听器"]
+    create-rpc-process --> bind-rpc-process["绑定 RPC 进程"]
+    bind-rpc-process --> sync-instance-record["同步实例记录"]
+    sync-instance-record --> get-state-rpc["获取状态 RPC"]
+    get-state-rpc --> radius-register-pi["注册 Radius Pi"]
+    radius-register-pi --> start-pi-heartbeat["启动 Pi 心跳"]
+    start-pi-heartbeat --> set-status-online["设置状态为 online"]
+    set-status-online --> return-record["返回记录"]
+    spawn-instance --> spawn-error-decision["生成错误判断"]
+    spawn-error-decision -->|错误| fail-spawn["生成失败"]
+    fail-spawn --> cleanup-resources["清理资源"]
+    cleanup-resources --> set-status-stopped["设置状态为 stopped"]
+</pre>
+
+<h2>数据流 — RPC 路由（单次 rpc 与 rpc-stream）</h2>
+<pre class="mermaid">
+graph TD
+    rpc-command-from-client["来自客户端的 RPC 命令"] --> supervisor-handle-rpc["supervisor 处理 RPC"]
+    supervisor-handle-rpc --> rpc-process-send["RPC 进程发送"]
+    rpc-process-send --> assign-request-id["分配请求 ID"]
+    assign-request-id --> write-stdin-jsonl["写入 stdin JSON-Lines"]
+    write-stdin-jsonl --> child-processes-command["子进程处理命令"]
+    child-processes-command --> stdout-data-chunk["stdout 数据块"]
+    stdout-data-chunk --> handle-line["处理行"]
+    handle-line --> response-type-decision["响应类型判断"]
+    response-type-decision -->|响应| resolve-pending["解决待处理请求"]
+    response-type-decision -->|extension_ui_request| ui-request-handler["UI 请求处理器"]
+    response-type-decision -->|会话事件| subscriber-event["订阅者事件"]
+    resolve-pending --> return-response["返回响应"]
+    return-response --> should-refresh-decision["是否刷新判断"]
+    should-refresh-decision -->|是| sync-metadata["同步元数据"]
+    sync-metadata --> write-response-socket["向套接字写入响应"]
+    should-refresh-decision -->|否| write-response-socket
+    rpc-stream-setup["rpc-stream 设置"] --> open-rpc-stream["打开 RPC 流"]
+    open-rpc-stream --> subscriber-event
+    subscriber-event --> session-event-to-socket["会话事件到套接字"]
+    ui-request-handler --> ui-request-to-socket["UI 请求到套接字"]
+    rpc-stream-handle-request["rpc-stream 处理请求"] --> handle-ui-response["处理 UI 响应"]
+    rpc-stream-handle-request --> supervisor-handle-rpc
+</pre>
+
+<h2>数据流 — 工作进程崩溃 / 意外退出</h2>
+<pre class="mermaid">
+graph TD
+    child-process-exit["子进程退出"] --> reject-all-pending["拒绝所有待处理请求"]
+    child-process-error["子进程错误"] --> reject-all-pending
+    reject-all-pending --> notify-exit-listeners["通知退出监听器"]
+    notify-exit-listeners --> supervisor-handle-unexpected-exit["supervisor 处理意外退出"]
+    supervisor-handle-unexpected-exit --> live-instance-check["活动实例检查"]
+    live-instance-check -->|已消失| exit-noop["退出无操作"]
+    live-instance-check -->|存在| status-stopping-check["状态停止检查"]
+    status-stopping-check -->|stopping 或 stopped| exit-noop
+    status-stopping-check -->|运行中| set-status-error["设置状态为 error"]
+    set-status-error --> clear-bindings["清除绑定"]
+    clear-bindings --> clear-rpc-process["清除 RPC 进程"]
+    clear-rpc-process --> has-radius-pi-decision["是否有 Radius Pi 判断"]
+    has-radius-pi-decision -->|是| disconnect-radius-pi["断开 Radius Pi"]
+    has-radius-pi-decision -->|否| delete-live-instance["删除活动实例"]
+    disconnect-radius-pi --> delete-live-instance
+</pre>
+
+<h2>状态机 — 工作进程生命周期（InstanceStatus）</h2>
+<pre class="mermaid">
+graph TD
+    state-starting["starting 状态"] -->|生成成功| state-online["online 状态"]
+    state-starting -->|生成失败| state-error["error 状态"]
+    state-starting -->|子进程退出| state-error
+    state-online -->|请求停止| state-stopping["stopping 状态"]
+    state-online -->|子进程退出| state-error
+    state-stopping -->|清理完成| state-stopped["stopped 状态"]
+    state-error -->|failSpawn 清理| state-stopped
+    state-online -->|重启后恢复| state-stopped
+    state-starting -->|重启后恢复| state-stopped
+    state-stopped -->|终止状态| state-stopped
+</pre>
+
+<h2>结构视图 — 模块组成</h2>
+<pre class="mermaid">
+graph TD
+    cli-entry["CLI 入口"] --> serve-module["serve 模块"]
+    cli-entry --> ipc-client["IPC 客户端"]
+    serve-module --> ipc-server["IPC 服务器"]
+    serve-module --> supervisor["supervisor"]
+    serve-module --> radius["Radius"]
+    ipc-server --> ipc-protocol["IPC 协议"]
+    ipc-client --> ipc-protocol
+    ipc-server --> handler["处理器"]
+    handler --> supervisor
+    handler --> types["类型"]
+    supervisor --> rpc-process["RPC 进程"]
+    supervisor --> storage["存储"]
+    supervisor --> radius
+    supervisor --> types
+    rpc-process --> config["配置"]
+    rpc-process --> child-agent["子智能体"]
+    storage --> config
+    radius --> config
+    radius --> storage
+    radius --> radius-server["Radius 服务器"]
+</pre>
+
+<script>
+window.__sourceMap = {
+  "serve-cli-invoke": { "file": "packages/orchestrator/src/cli.ts", "startLine": 92, "endLine": 95 },
+  "serve-fn": { "file": "packages/orchestrator/src/serve.ts", "startLine": 9, "endLine": 17 },
+  "mkdir-socket-dir": { "file": "packages/orchestrator/src/serve.ts", "startLine": 10, "endLine": 11 },
+  "start-ipc-server": { "file": "packages/orchestrator/src/ipc/server.ts", "startLine": 46, "endLine": 49 },
+  "stale-socket-check": { "file": "packages/orchestrator/src/ipc/server.ts", "startLine": 162, "endLine": 173 },
+  "socket-exists-decision": { "file": "packages/orchestrator/src/ipc/server.ts", "startLine": 162, "endLine": 165 },
+  "is-live-decision": { "file": "packages/orchestrator/src/ipc/server.ts", "startLine": 175, "endLine": 208 },
+  "throw-already-running": { "file": "packages/orchestrator/src/ipc/server.ts", "startLine": 169, "endLine": 169 },
+  "unlink-stale": { "file": "packages/orchestrator/src/ipc/server.ts", "startLine": 172, "endLine": 172 },
+  "listen-server": { "file": "packages/orchestrator/src/ipc/server.ts", "startLine": 151, "endLine": 157 },
+  "recover-after-restart": { "file": "packages/orchestrator/src/supervisor.ts", "startLine": 244, "endLine": 255 },
+  "radius-enabled-decision": { "file": "packages/orchestrator/src/serve.ts", "startLine": 20, "endLine": 20 },
+  "radius-presence-start": { "file": "packages/orchestrator/src/serve.ts", "startLine": 21, "endLine": 25 },
+  "register-machine": { "file": "packages/orchestrator/src/radius.ts", "startLine": 237, "endLine": 260 },
+  "start-machine-heartbeat": { "file": "packages/orchestrator/src/radius.ts", "startLine": 262, "endLine": 274 },
+  "radius-disabled-log": { "file": "packages/orchestrator/src/serve.ts", "startLine": 26, "endLine": 28 },
+  "startup-error-decision": { "file": "packages/orchestrator/src/serve.ts", "startLine": 29, "endLine": 35 },
+  "server-close-cleanup": { "file": "packages/orchestrator/src/serve.ts", "startLine": 30, "endLine": 34 },
+  "listen-forever": { "file": "packages/orchestrator/src/serve.ts", "startLine": 37, "endLine": 76 },
+  "signal-handler": { "file": "packages/orchestrator/src/serve.ts", "startLine": 59, "endLine": 72 },
+  "shutdown": { "file": "packages/orchestrator/src/serve.ts", "startLine": 40, "endLine": 57 },
+  "supervisor-shutdown": { "file": "packages/orchestrator/src/supervisor.ts", "startLine": 335, "endLine": 339 },
+  "radius-stop": { "file": "packages/orchestrator/src/radius.ts", "startLine": 171, "endLine": 192 },
+  "user-client-cmd": { "file": "packages/orchestrator/src/cli.ts", "startLine": 97, "endLine": 154 },
+  "send-ipc-request": { "file": "packages/orchestrator/src/ipc/client.ts", "startLine": 5, "endLine": 63 },
+  "connect-socket": { "file": "packages/orchestrator/src/ipc/client.ts", "startLine": 9, "endLine": 9 },
+  "socket-data-receive": { "file": "packages/orchestrator/src/ipc/server.ts", "startLine": 53, "endLine": 64 },
+  "parse-request-line": { "file": "packages/orchestrator/src/ipc/protocol.ts", "startLine": 134, "endLine": 137 },
+  "is-rpc-stream-decision": { "file": "packages/orchestrator/src/ipc/server.ts", "startLine": 68, "endLine": 68 },
+  "handle-ipc-request": { "file": "packages/orchestrator/src/handler.ts", "startLine": 57, "endLine": 129 },
+  "request-type-decision": { "file": "packages/orchestrator/src/handler.ts", "startLine": 58, "endLine": 58 },
+  "spawn-case": { "file": "packages/orchestrator/src/handler.ts", "startLine": 59, "endLine": 69 },
+  "list-case": { "file": "packages/orchestrator/src/handler.ts", "startLine": 71, "endLine": 77 },
+  "status-case": { "file": "packages/orchestrator/src/handler.ts", "startLine": 79, "endLine": 90 },
+  "stop-case": { "file": "packages/orchestrator/src/handler.ts", "startLine": 92, "endLine": 103 },
+  "rpc-case": { "file": "packages/orchestrator/src/handler.ts", "startLine": 105, "endLine": 116 },
+  "supervisor-method": { "file": "packages/orchestrator/src/supervisor.ts", "startLine": 270, "endLine": 333 },
+  "build-response": { "file": "packages/orchestrator/src/handler.ts", "startLine": 63, "endLine": 115 },
+  "write-response-socket": { "file": "packages/orchestrator/src/ipc/server.ts", "startLine": 138, "endLine": 139 },
+  "client-receive-data": { "file": "packages/orchestrator/src/ipc/client.ts", "startLine": 22, "endLine": 36 },
+  "parse-response": { "file": "packages/orchestrator/src/ipc/protocol.ts", "startLine": 139, "endLine": 142 },
+  "print-response": { "file": "packages/orchestrator/src/cli.ts", "startLine": 25, "endLine": 27 },
+  "unknown-instance-error": { "file": "packages/orchestrator/src/handler.ts", "startLine": 41, "endLine": 47 },
+  "parse-error-decision": { "file": "packages/orchestrator/src/ipc/server.ts", "startLine": 140, "endLine": 147 },
+  "write-error-response": { "file": "packages/orchestrator/src/ipc/server.ts", "startLine": 141, "endLine": 146 },
+  "spawn-request-arrives": { "file": "packages/orchestrator/src/handler.ts", "startLine": 59, "endLine": 63 },
+  "spawn-instance": { "file": "packages/orchestrator/src/supervisor.ts", "startLine": 270, "endLine": 298 },
+  "create-live-instance": { "file": "packages/orchestrator/src/supervisor.ts", "startLine": 271, "endLine": 284 },
+  "upsert-instance-storage": { "file": "packages/orchestrator/src/storage.ts", "startLine": 54, "endLine": 65 },
+  "create-rpc-process": { "file": "packages/orchestrator/src/rpc-process.ts", "startLine": 199, "endLine": 201 },
+  "get-spawn-command": { "file": "packages/orchestrator/src/rpc-process.ts", "startLine": 50, "endLine": 61 },
+  "spawn-child-process": { "file": "packages/orchestrator/src/rpc-process.ts", "startLine": 37, "endLine": 48 },
+  "attach-listeners": { "file": "packages/orchestrator/src/rpc-process.ts", "startLine": 63, "endLine": 99 },
+  "bind-rpc-process": { "file": "packages/orchestrator/src/supervisor.ts", "startLine": 99, "endLine": 113 },
+  "sync-instance-record": { "file": "packages/orchestrator/src/supervisor.ts", "startLine": 140, "endLine": 155 },
+  "get-state-rpc": { "file": "packages/orchestrator/src/rpc-process.ts", "startLine": 143, "endLine": 159 },
+  "radius-register-pi": { "file": "packages/orchestrator/src/radius.ts", "startLine": 194, "endLine": 215 },
+  "start-pi-heartbeat": { "file": "packages/orchestrator/src/radius.ts", "startLine": 276, "endLine": 293 },
+  "set-status-online": { "file": "packages/orchestrator/src/supervisor.ts", "startLine": 66, "endLine": 73 },
+  "return-record": { "file": "packages/orchestrator/src/supervisor.ts", "startLine": 293, "endLine": 294 },
+  "spawn-error-decision": { "file": "packages/orchestrator/src/supervisor.ts", "startLine": 295, "endLine": 297 },
+  "fail-spawn": { "file": "packages/orchestrator/src/supervisor.ts", "startLine": 176, "endLine": 185 },
+  "cleanup-resources": { "file": "packages/orchestrator/src/supervisor.ts", "startLine": 157, "endLine": 174 },
+  "set-status-stopped": { "file": "packages/orchestrator/src/supervisor.ts", "startLine": 181, "endLine": 181 },
+  "rpc-command-from-client": { "file": "packages/orchestrator/src/handler.ts", "startLine": 105, "endLine": 108 },
+  "supervisor-handle-rpc": { "file": "packages/orchestrator/src/supervisor.ts", "startLine": 321, "endLine": 333 },
+  "rpc-process-send": { "file": "packages/orchestrator/src/rpc-process.ts", "startLine": 143, "endLine": 159 },
+  "assign-request-id": { "file": "packages/orchestrator/src/rpc-process.ts", "startLine": 147, "endLine": 148 },
+  "write-stdin-jsonl": { "file": "packages/orchestrator/src/rpc-process.ts", "startLine": 151, "endLine": 151 },
+  "child-processes-command": { "file": "packages/orchestrator/src/rpc-process.ts", "startLine": 39, "endLine": 43 },
+  "stdout-data-chunk": { "file": "packages/orchestrator/src/rpc-process.ts", "startLine": 64, "endLine": 79 },
+  "handle-line": { "file": "packages/orchestrator/src/rpc-process.ts", "startLine": 101, "endLine": 128 },
+  "response-type-decision": { "file": "packages/orchestrator/src/rpc-process.ts", "startLine": 103, "endLine": 103 },
+  "resolve-pending": { "file": "packages/orchestrator/src/rpc-process.ts", "startLine": 108, "endLine": 114 },
+  "ui-request-handler": { "file": "packages/orchestrator/src/rpc-process.ts", "startLine": 117, "endLine": 119 },
+  "subscriber-event": { "file": "packages/orchestrator/src/supervisor.ts", "startLine": 102, "endLine": 105 },
+  "return-response": { "file": "packages/orchestrator/src/handler.ts", "startLine": 109, "endLine": 115 },
+  "should-refresh-decision": { "file": "packages/orchestrator/src/supervisor.ts", "startLine": 329, "endLine": 329 },
+  "sync-metadata": { "file": "packages/orchestrator/src/supervisor.ts", "startLine": 140, "endLine": 155 },
+  "rpc-stream-setup": { "file": "packages/orchestrator/src/ipc/server.ts", "startLine": 68, "endLine": 95 },
+  "open-rpc-stream": { "file": "packages/orchestrator/src/supervisor.ts", "startLine": 197, "endLine": 233 },
+  "session-event-to-socket": { "file": "packages/orchestrator/src/ipc/server.ts", "startLine": 81, "endLine": 83 },
+  "ui-request-to-socket": { "file": "packages/orchestrator/src/ipc/server.ts", "startLine": 84, "endLine": 86 },
+  "rpc-stream-handle-request": { "file": "packages/orchestrator/src/ipc/server.ts", "startLine": 109, "endLine": 131 },
+  "handle-ui-response": { "file": "packages/orchestrator/src/rpc-process.ts", "startLine": 161, "endLine": 166 },
+  "child-process-exit": { "file": "packages/orchestrator/src/rpc-process.ts", "startLine": 93, "endLine": 98 },
+  "child-process-error": { "file": "packages/orchestrator/src/rpc-process.ts", "startLine": 86, "endLine": 91 },
+  "reject-all-pending": { "file": "packages/orchestrator/src/rpc-process.ts", "startLine": 130, "endLine": 135 },
+  "notify-exit-listeners": { "file": "packages/orchestrator/src/rpc-process.ts", "startLine": 137, "endLine": 141 },
+  "supervisor-handle-unexpected-exit": { "file": "packages/orchestrator/src/supervisor.ts", "startLine": 115, "endLine": 134 },
+  "live-instance-check": { "file": "packages/orchestrator/src/supervisor.ts", "startLine": 116, "endLine": 118 },
+  "exit-noop": { "file": "packages/orchestrator/src/supervisor.ts", "startLine": 117, "endLine": 117 },
+  "status-stopping-check": { "file": "packages/orchestrator/src/supervisor.ts", "startLine": 119, "endLine": 121 },
+  "set-status-error": { "file": "packages/orchestrator/src/supervisor.ts", "startLine": 122, "endLine": 122 },
+  "clear-bindings": { "file": "packages/orchestrator/src/supervisor.ts", "startLine": 90, "endLine": 97 },
+  "clear-rpc-process": { "file": "packages/orchestrator/src/supervisor.ts", "startLine": 124, "endLine": 124 },
+  "has-radius-pi-decision": { "file": "packages/orchestrator/src/supervisor.ts", "startLine": 125, "endLine": 125 },
+  "disconnect-radius-pi": { "file": "packages/orchestrator/src/radius.ts", "startLine": 217, "endLine": 235 },
+  "delete-live-instance": { "file": "packages/orchestrator/src/supervisor.ts", "startLine": 133, "endLine": 133 },
+  "state-starting": { "file": "packages/orchestrator/src/types.ts", "startLine": 1, "endLine": 1 },
+  "state-online": { "file": "packages/orchestrator/src/types.ts", "startLine": 1, "endLine": 1 },
+  "state-stopping": { "file": "packages/orchestrator/src/types.ts", "startLine": 1, "endLine": 1 },
+  "state-stopped": { "file": "packages/orchestrator/src/types.ts", "startLine": 1, "endLine": 1 },
+  "state-error": { "file": "packages/orchestrator/src/types.ts", "startLine": 1, "endLine": 1 },
+  "cli-entry": { "file": "packages/orchestrator/src/cli.ts", "startLine": 79, "endLine": 161 },
+  "serve-module": { "file": "packages/orchestrator/src/serve.ts", "startLine": 9, "endLine": 77 },
+  "ipc-server": { "file": "packages/orchestrator/src/ipc/server.ts", "startLine": 46, "endLine": 160 },
+  "ipc-client": { "file": "packages/orchestrator/src/ipc/client.ts", "startLine": 5, "endLine": 63 },
+  "ipc-protocol": { "file": "packages/orchestrator/src/ipc/protocol.ts", "startLine": 1, "endLine": 143 },
+  "handler": { "file": "packages/orchestrator/src/handler.ts", "startLine": 57, "endLine": 161 },
+  "supervisor": { "file": "packages/orchestrator/src/supervisor.ts", "startLine": 63, "endLine": 355 },
+  "rpc-process": { "file": "packages/orchestrator/src/rpc-process.ts", "startLine": 25, "endLine": 201 },
+  "storage": { "file": "packages/orchestrator/src/storage.ts", "startLine": 1, "endLine": 71 },
+  "config": { "file": "packages/orchestrator/src/config.ts", "startLine": 1, "endLine": 70 },
+  "radius": { "file": "packages/orchestrator/src/radius.ts", "startLine": 148, "endLine": 445 },
+  "types": { "file": "packages/orchestrator/src/types.ts", "startLine": 1, "endLine": 26 },
+  "child-agent": { "file": "packages/orchestrator/src/rpc-process.ts", "startLine": 1, "endLine": 11 },
+  "radius-server": { "file": "packages/orchestrator/src/radius.ts", "startLine": 46, "endLine": 61 }
+};
+</script>
+
+<aside id="source-panel"><div id="source-header"></div><div id="monaco-container"></div></aside>
+<script src="../assets/codeindex-runtime.js"></script>
+<script src="../assets/codeindex.js"></script>
+</body>
+</html>

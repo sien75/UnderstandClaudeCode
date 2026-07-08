@@ -1,0 +1,577 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Interactive Coding Agent CLI (`pi`)</title>
+<link rel="stylesheet" href="../assets/codeindex.css">
+</head>
+<body>
+<a href="index.html" class="back-link">← Back to overview</a>
+<h1>Interactive Coding Agent CLI (`pi`)</h1>
+
+<p>This module is the user-facing package <code>@earendil-works/pi-coding-agent</code> — the <code>pi</code> command line tool. It is the integration layer that wires the rest of the monorepo together: it owns the CLI entry, the three runtime modes (interactive TUI, one-shot print, headless JSON-RPC), the built-in filesystem/shell tools (read, bash, edit, write, plus optional grep/find/ls), session and config management, and the system prompt. It drives the <code>@earendil-works/pi-agent-core</code> runtime, which in turn talks to LLM providers via <code>@earendil-works/pi-ai</code>.</p>
+
+<p><strong>What a user can do with <code>pi</code>:</strong></p>
+<ul>
+<li><strong>Interactive chat</strong>: run <code>pi</code> in a terminal to get a full-screen TUI with streaming model output, file/bash/edit/write tool calls rendered inline, slash commands, skills, prompt templates, model cycling (Ctrl+P), and mid-stream steering.</li>
+<li><strong>One-shot prompt</strong>: <code>pi -p "list .ts files"</code> (or <code>pi --mode json "..."</code>) runs a single prompt non-interactively, prints the final answer (or a JSON event stream), and exits. Piped stdin is treated as part of the prompt.</li>
+<li><strong>Headless RPC</strong>: <code>pi --mode rpc</code> turns the process into a JSON-line server on stdin/stdout — an orchestrator (editor extension, CI runner, another agent) sends commands like <code>prompt</code>, <code>steer</code>, <code>abort</code>, <code>switch_session</code>, <code>fork</code> and receives streamed session events.</li>
+<li><strong>Session management</strong>: resume (<code>--continue</code> / <code>--resume</code>), open by id/path (<code>--session</code>), fork (<code>--fork</code>), name (<code>--name</code>), or run ephemeral (<code>--no-session</code>).</li>
+<li><strong>Slash commands / skills</strong>: in a prompt, text starting with <code>/</code> is an extension command; <code>/skill:name args</code> inlines a skill file; <code>/template args</code> expands a prompt template.</li>
+<li><strong>Package/config subcommands</strong>: <code>pi install &lt;source&gt;</code>, <code>pi remove</code>, <code>pi update</code>, <code>pi list</code>, <code>pi config</code> manage extensions and settings; these exit before any agent runtime is built.</li>
+<li><strong>Export</strong>: <code>pi --export session.jsonl [output.html]</code> renders a saved session to HTML and exits.</li>
+</ul>
+
+<p>The chain is triggered the moment the user runs <code>pi ...</code>: <code>cli.ts</code> hands <code>process.argv</code> to <code>main()</code>, which parses args, builds a session + agent runtime, then dispatches to one of the three modes. The mode feeds user text to <code>AgentSession.prompt()</code>, which drives the <code>Agent</code> loop in <code>pi-agent-core</code>; the Agent calls the LLM provider, executes tool calls against the filesystem/shell, and loops until the model stops requesting tools. Streaming events flow back through <code>AgentSession</code> to the mode's listener, which renders them (TUI) or serializes them (print/rpc).</p>
+
+<dl>
+<dt>Module</dt><dd>The <code>pi</code> CLI turns a user's typed request (plus files, piped stdin, or JSON-RPC commands) into a series of LLM turns interleaved with filesystem/shell tool executions, ending in a rendered answer — interactive, printed, or streamed as JSON events.</dd>
+<dt>Input</dt><dd>CLI args + a prompt (typed text, <code>@file</code> references, piped stdin, or JSON-RPC <code>prompt</code> commands), evaluated against the current working directory.</dd>
+<dt>Output</dt><dd>For interactive: a live TUI. For print: final assistant text on stdout (or a JSON event stream). For rpc: a JSON-line event/response stream on stdout. Side effects: files read/written/edited, shell commands executed.</dd>
+<dt>Notes</dt><dd>The package itself does not implement the LLM turn loop; that lives in <code>@earendil-works/pi-agent-core</code> (<code>Agent</code>). This package supplies the tools, system prompt, auth/settings/model registry, session persistence, extension hooks, and the user-facing modes. External boundaries: the LLM provider is reached via <code>streamSimple</code> in the <code>streamFn</code> configured on the <code>Agent</code>; the filesystem and shell are reached only through the built-in tools.</dd>
+</dl>
+
+<h2>Diagram 1 — CLI dispatch (entry to mode selection)</h2>
+
+<p>This is the <code>main()</code> spine: from raw argv through arg parsing, early-exit subcommands, session selection, runtime construction, and final mode dispatch. Every diamond is a real branch in source; several lead to <code>process.exit</code>.</p>
+
+<pre class="mermaid">
+graph TD
+    cli-entry["cli.ts: process.title set, HTTP dispatcher configured, main(argv) called"]
+    main-start["main(): offline flag + Windows quarantine cleanup, bootstrap settings + HTTP proxy"]
+    pkg-cmd{"handlePackageCommand? (install/remove/update/list/config)"}
+    pkg-exit["package/config subcommand handled, process.exit"]
+    parse-args["parseArgs(args) -> Args, emit diagnostics"]
+    diag-err{"any diagnostic is error?"}
+    diag-exit["print errors, process.exit(1)"]
+    version{"--version?"}
+    version-exit["print VERSION, process.exit(0)"]
+    export{"--export?"}
+    export-run["exportFromFile -> HTML, process.exit(0)"]
+    export-fail["export error -> process.exit(1)"]
+    resolve-mode["resolveAppMode (interactive | print | json | rpc)"]
+    take-stdout["takeOverStdout (non-interactive / non-metadata)"]
+    validate-flags["validateForkFlags + validateSessionIdFlags"]
+    migrations["runMigrations(cwd)"]
+    first-setup{"interactive + first-time setup needed?"}
+    first-setup-run["showFirstTimeSetup (theme + analytics)"]
+    session-dir["resolve sessionDir (--session-dir / env / settings)"]
+    create-session["createSessionManager (--session/--resume/--continue/--fork/--session-id/--no-session)"]
+    cwd-issue{"session cwd missing?"}
+    cwd-interactive["prompt for fallback cwd (interactive)"]
+    cwd-noninteractive["MissingSessionCwdError -> process.exit(1)"]
+    cwd-cancel["user cancelled -> process.exit(0)"]
+    build-runtime["build createRuntime factory + createAgentSessionRuntime -> AgentSessionRuntime"]
+
+    cli-entry --> main-start
+    main-start --> pkg-cmd
+    pkg-cmd -->|yes| pkg-exit
+    pkg-cmd -->|no| parse-args
+    parse-args --> diag-err
+    diag-err -->|yes| diag-exit
+    diag-err -->|no| version
+    version -->|yes| version-exit
+    version -->|no| export
+    export -->|yes| export-run
+    export-run --> export-fail
+    export -->|no| resolve-mode
+    resolve-mode --> take-stdout
+    take-stdout --> validate-flags
+    validate-flags --> migrations
+    migrations --> first-setup
+    first-setup -->|yes| first-setup-run
+    first-setup -->|no| session-dir
+    first-setup-run --> session-dir
+    session-dir --> create-session
+    create-session --> cwd-issue
+    cwd-issue -->|yes, interactive| cwd-interactive
+    cwd-issue -->|yes, non-interactive| cwd-noninteractive
+    cwd-issue -->|no| build-runtime
+    cwd-interactive -->|continue| build-runtime
+    cwd-interactive -->|cancel| cwd-cancel
+</pre>
+
+<p>The runtime factory built above (<code>build-runtime</code>) is then handed to the final pre-dispatch phase: help / list-models early exits, piped-stdin reading, theme init, runtime-diagnostic checks, no-model guard, and finally the <code>appMode</code> branch into rpc / interactive / print. The <code>build-runtime</code> node is reused below as the boundary between the two sub-diagrams.</p>
+
+<pre class="mermaid">
+graph TD
+    build-runtime["build createRuntime factory + createAgentSessionRuntime -> AgentSessionRuntime"]
+    help{"--help?"}
+    help-exit["printHelp(extensionFlags), process.exit(0)"]
+    list-models{"--list-models?"}
+    list-models-exit["listModels(registry, pattern), process.exit(0)"]
+    read-stdin["read piped stdin (skip rpc)"]
+    prep-msg["prepareInitialMessage (@files + stdin + prompt text)"]
+    init-theme["initTheme(settings)"]
+    diag-report["report runtime diagnostics"]
+    diag-fatal{"any runtime diagnostic is error?"}
+    diag-fatal-exit["process.exit(1) (+ extension hint)"]
+    no-model{"non-interactive + no model?"}
+    no-model-exit["formatNoModelsAvailableMessage, process.exit(1)"]
+    dispatch{"appMode?"}
+    rpc-mode["runRpcMode(runtime)"]
+    interactive-mode["new InteractiveMode(runtime).run()"]
+    print-mode["runPrintMode(runtime, text|json)"]
+
+    build-runtime --> help
+    help -->|yes| help-exit
+    help -->|no| list-models
+    list-models -->|yes| list-models-exit
+    list-models -->|no| read-stdin
+    read-stdin --> prep-msg
+    prep-msg --> init-theme
+    init-theme --> diag-report
+    diag-report --> diag-fatal
+    diag-fatal -->|yes| diag-fatal-exit
+    diag-fatal -->|no| no-model
+    no-model -->|yes| no-model-exit
+    no-model -->|no| dispatch
+    dispatch -->|rpc| rpc-mode
+    dispatch -->|interactive| interactive-mode
+    dispatch -->|print/json| print-mode
+</pre>
+
+<h2>Diagram 2 — Runtime &amp; session creation (the createRuntime factory)</h2>
+
+<p>When <code>main()</code> reaches the runtime-building step, it does not call <code>createAgentSession</code> directly. Instead it builds a <code>createRuntime</code> factory closed over process-global inputs, then hands it to <code>createAgentSessionRuntime</code>. The same factory is reused later for <code>/new</code>, <code>/resume</code>, <code>/fork</code>, and <code>/import</code> — each of which tears down the current session and re-runs the factory for a new cwd/session.</p>
+
+<pre class="mermaid">
+graph TD
+    factory-call["createRuntime(cwd, agentDir, sessionManager, sessionStartEvent)"]
+    trust-check{"project has trust-requiring resources + no override?"}
+    trust-resolve["resolveProjectTrusted (interactive prompt / settings default / trust store)"]
+    trust-cached["projectTrusted = override or trust store or false"]
+    services["createAgentSessionServices: SettingsManager, ModelRegistry, DefaultResourceLoader.reload()"]
+    provider-reg["register pending extension providers into ModelRegistry"]
+    ext-flags["applyExtensionFlagValues (CLI unknown flags -> extension flagValues)"]
+    model-scope["resolveModelScope(parsed.models / enabled-models, registry) -> scopedModels"]
+    session-opts["buildSessionOptions: resolve model + thinking + tools/excludeTools from CLI/scope/settings"]
+    api-key{"--api-key given?"}
+    api-key-set["authStorage.setRuntimeApiKey(model.provider, key)"]
+    api-key-err["diagnostic: --api-key requires a model"]
+    create-session["createAgentSessionFromServices -> createAgentSession (sdk.ts)"]
+    sdk-model["resolve model: options.model / session restore / findInitialModel"]
+    sdk-thinking["resolve + clamp thinking level to model capabilities"]
+    sdk-tools["resolve active tools (default read/bash/edit/write; allow/deny lists)"]
+    sdk-agent["new Agent(streamFn, convertToLlm, onPayload/onResponse, transformContext, steeringMode, ...)"]
+    sdk-restore{"existing session messages?"}
+    sdk-restore-yes["restore messages into agent.state, append thinking entry if missing"]
+    sdk-restore-no["append initial model + thinking entries to session log"]
+    sdk-session["new AgentSession(agent, sessionManager, settingsManager, resourceLoader, ...)"]
+    runtime-apply["AgentSessionRuntime(session, services, createRuntime, diagnostics)"]
+
+    factory-call --> trust-check
+    trust-check -->|yes| trust-resolve
+    trust-check -->|no| trust-cached
+    trust-resolve --> trust-cached
+    trust-cached --> services
+    services --> provider-reg
+    provider-reg --> ext-flags
+    ext-flags --> model-scope
+    model-scope --> session-opts
+    session-opts --> api-key
+    api-key -->|yes, model resolved| api-key-set
+    api-key -->|yes, no model| api-key-err
+    api-key -->|no| create-session
+    api-key-set --> create-session
+    api-key-err --> create-session
+    create-session --> sdk-model
+    sdk-model --> sdk-thinking
+    sdk-thinking --> sdk-tools
+    sdk-tools --> sdk-agent
+    sdk-agent --> sdk-restore
+    sdk-restore -->|yes| sdk-restore-yes
+    sdk-restore -->|no| sdk-restore-no
+    sdk-restore-yes --> sdk-session
+    sdk-restore-no --> sdk-session
+    sdk-session --> runtime-apply
+</pre>
+
+<h2>Diagram 3 — The prompt loop (AgentSession → Agent → tools → LLM)</h2>
+
+<p>This is the heart of the data flow. <code>AgentSession.prompt()</code> is the entry called by all three modes. It expands commands/templates, validates auth, and calls <code>_runAgentPrompt</code>, which calls <code>agent.prompt()</code> and then loops on <code>agent.continue()</code> while post-run handling (auto-retry, compaction, queued follow-ups) says to continue. The <code>Agent</code> itself (in <code>pi-agent-core</code>) owns the LLM call and the tool-call dispatch loop; the coding-agent package supplies the <code>streamFn</code> (which calls <code>streamSimple</code> with provider auth/headers) and the tool definitions whose <code>execute</code> functions touch the filesystem/shell.</p>
+
+<pre class="mermaid">
+graph TD
+    prompt-call["session.prompt(text, options)"]
+    is-slash{"text starts with '/'?"}
+    ext-cmd["_tryExecuteExtensionCommand -> command.handler; return (no LLM call)"]
+    input-hook{"extension 'input' handlers?"}
+    input-handle["emitInput -> action 'handled'; return"]
+    input-transform["emitInput -> transform text/images"]
+    expand["expand skill commands + prompt templates"]
+    streaming{"isStreaming?"}
+    stream-no-behavior["error: must specify streamingBehavior"]
+    queue-steer["_queueSteer(expandedText)"]
+    queue-followup["_queueFollowUp(expandedText)"]
+    flush-bash["_flushPendingBashMessages"]
+    model-check{"model set + auth configured?"}
+    model-err["throw no-model / no-api-key / re-login error"]
+    compact-check["_checkCompaction(lastAssistant, false)"]
+    build-msgs["build messages array: user content + images + pending nextTurn messages"]
+    before-start["emitBeforeAgentStart (extensions can inject messages + override system prompt)"]
+    run-prompt["_runAgentPrompt(messages)"]
+    agent-prompt["agent.prompt(messages) -> drives LLM stream + tool-call loop in pi-agent-core"]
+    streamfn["streamFn: resolve auth+headers via ModelRegistry, merge attribution, before_provider_headers hook, streamSimple(model, context, ...)"]
+    llm["LLM provider (HTTP)"]
+    tool-call["tool call requested by model"]
+    before-tool["agent.beforeToolCall: extension 'tool_call' hook (can block/modify)"]
+    tool-exec["tool.execute against filesystem/shell (read/bash/edit/write/grep/find/ls)"]
+    after-tool["agent.afterToolCall: extension 'tool_result' hook"]
+    tool-result["tool result fed back to model"]
+    agent-end["assistant message finished (stopReason)"]
+    post-run["_handlePostAgentRun(lastAssistant)"]
+    retry{"retryable error?"}
+    retry-prep["_prepareRetry: exponential backoff, auto_retry_start event"]
+    retry-exhausted["auto_retry_end (failure); stop"]
+    compact{"compaction needed (context overflow)?"}
+    compact-run["run compaction -> continue"]
+    queued{"agent.hasQueuedMessages() (steer/followUp/agent_end extensions)?"}
+    done["agent idle; emit agent_end to listeners"]
+    agent-continue["agent.continue() (next turn with tool results / queued messages)"]
+
+    prompt-call --> is-slash
+    is-slash -->|yes, command found| ext-cmd
+    is-slash -->|no| input-hook
+    input-hook -->|yes| input-handle
+    input-hook -->|no| expand
+    input-handle -->|handled| ext-cmd
+    input-handle -->|transform| input-transform
+    input-transform --> expand
+    expand --> streaming
+    streaming -->|yes, no behavior| stream-no-behavior
+    streaming -->|yes, steer| queue-steer
+    streaming -->|yes, followUp| queue-followup
+    streaming -->|no| flush-bash
+    flush-bash --> model-check
+    model-check -->|no| model-err
+    model-check -->|yes| compact-check
+    compact-check --> build-msgs
+    build-msgs --> before-start
+    before-start --> run-prompt
+    run-prompt --> agent-prompt
+    agent-prompt --> streamfn
+    streamfn --> llm
+    llm --> tool-call
+    tool-call --> before-tool
+    before-tool --> tool-exec
+    tool-exec --> after-tool
+    after-tool --> tool-result
+    tool-result --> agent-continue
+    agent-continue --> streamfn
+    tool-result -->|no more tools| agent-end
+    agent-end --> post-run
+    post-run --> retry
+    retry -->|yes| retry-prep
+    retry-prep --> agent-continue
+    retry -->|no, exhausted| retry-exhausted
+    retry -->|no| compact
+    compact -->|yes| compact-run
+    compact-run --> agent-continue
+    compact -->|no| queued
+    queued -->|yes| agent-continue
+    queued -->|no| done
+</pre>
+
+<h2>Diagram 4 — Tool execution boundary (filesystem &amp; shell)</h2>
+
+<p>The tools are the only way the agent touches the user's machine. They are constructed in <code>_buildRuntime</code> via <code>createAllToolDefinitions(cwd, options)</code> and registered into <code>agent.state.tools</code>. Each tool's <code>execute</code> runs inside the <code>Agent</code> loop (diagram 3). The bash tool spawns a real shell process; read/edit/write operate on real files. grep/find/ls are read-only and off by default.</p>
+
+<pre class="mermaid">
+graph TD
+    registry["agent.state.tools set by _refreshToolRegistry"]
+    tool-names["default active: read, bash, edit, write; optional: grep, find, ls (read-only, off by default)"]
+    allow-deny["apply --tools allowlist + --exclude-tools denylist + --no-tools/--no-builtin-tools"]
+    model-requests["model emits a tool_call (name + args)"]
+    dispatch["Agent dispatches to matching tool.execute(args)"]
+    read-tool["read tool: resolve path, fs.readFile, detect image, truncate to DEFAULT_MAX_LINES/bytes"]
+    bash-tool["bash tool: getShellConfig, spawn(shell, args, {cwd, detached, env}), OutputAccumulator, timeout/abort -> killProcessTree"]
+    edit-tool["edit tool: resolve file, read, apply find/replace via withFileMutationQueue"]
+    write-tool["write tool: resolve path, write file (creates/overwrites) via withFileMutationQueue"]
+    grep-tool["grep tool: ripgrep child process (read-only)"]
+    find-tool["find tool: glob walk (read-only)"]
+    ls-tool["ls tool: directory listing (read-only)"]
+    fs["filesystem (real files)"]
+    shell["shell process (real commands)"]
+    result-truncate["truncate output; attach ToolDetails (truncation info, fullOutputPath)"]
+    result-back["tool result (text or error) returned to Agent -> fed to model"]
+
+    registry --> tool-names
+    tool-names --> allow-deny
+    allow-deny --> model-requests
+    model-requests --> dispatch
+    dispatch -->|read| read-tool
+    dispatch -->|bash| bash-tool
+    dispatch -->|edit| edit-tool
+    dispatch -->|write| write-tool
+    dispatch -->|grep| grep-tool
+    dispatch -->|find| find-tool
+    dispatch -->|ls| ls-tool
+    read-tool --> fs
+    bash-tool --> shell
+    edit-tool --> fs
+    write-tool --> fs
+    grep-tool --> fs
+    find-tool --> fs
+    ls-tool --> fs
+    read-tool --> result-truncate
+    bash-tool --> result-truncate
+    edit-tool --> result-truncate
+    write-tool --> result-truncate
+    grep-tool --> result-truncate
+    find-tool --> result-truncate
+    ls-tool --> result-truncate
+    result-truncate --> result-back
+</pre>
+
+<h2>Diagram 5 — Mode dispatch (interactive / print / rpc)</h2>
+
+<p>After the runtime is built and diagnostics pass, <code>main()</code> branches on <code>appMode</code>. Each mode subscribes a different listener to <code>session.subscribe()</code> and feeds prompts differently.</p>
+
+<pre class="mermaid">
+graph TD
+    dispatch{"appMode (resolved in main)"}
+    interactive["InteractiveMode(runtime).run()"]
+    interactive-init["init(): build TUI, bind extensions, subscribe session events -> render streaming output"]
+    interactive-startup["async checks: new pi version, package updates, tmux keyboard; show migration/fallback warnings"]
+    interactive-initial{"initialMessage or initialMessages?"}
+    interactive-send-initial["session.prompt(initialMessage, {images})"]
+    interactive-loop["main loop: getUserInput() -> session.prompt(userInput)"]
+    interactive-err["catch per-prompt error -> showError, continue loop"]
+    print["runPrintMode(runtime, {mode, messages, initialMessage})"]
+    print-signal["register SIGTERM/SIGHUP -> kill detached children + dispose"]
+    print-rebind["rebindSession: bind extensions (json/print mode), subscribe events"]
+    print-json{"mode == json?"}
+    print-json-out["write each session event as JSON line on stdout"]
+    print-send["send initialMessage + each message via session.prompt()"]
+    print-text["read last assistant message; write text content on stdout (exit 1 on error/aborted stop)"]
+    print-cleanup["dispose runtime, flush stdout, restore stdout, set exitCode"]
+    rpc["runRpcMode(runtime)"]
+    rpc-stdout["takeOverStdout; output() writes JSON lines"]
+    rpc-ui["createExtensionUIContext: select/confirm/input/notify emit extension_ui_request, await response"]
+    rpc-rebind["rebind session (rpc mode), subscribe events -> JSON line per event"]
+    rpc-stdin["attachJsonlLineReader on stdin -> handleInputLine per line"]
+    rpc-parse["JSON.parse(line)"]
+    rpc-parse-err["parse error -> output error response, continue"]
+    rpc-ui-resp{"extension_ui_response?"}
+    rpc-ui-resolve["resolve pending extension UI request"]
+    rpc-cmd["handleCommand(command) -> prompt/steer/abort/new_session/set_model/compact/bash/switch_session/fork/..."]
+    rpc-out["output response JSON line"]
+    rpc-shutdown{"shutdown requested or stdin ended?"}
+    rpc-shutdown-run["dispose runtime, flush stdout, process.exit"]
+
+    dispatch -->|interactive| interactive
+    interactive --> interactive-init
+    interactive-init --> interactive-startup
+    interactive-startup --> interactive-initial
+    interactive-initial -->|yes| interactive-send-initial
+    interactive-initial -->|no| interactive-loop
+    interactive-send-initial --> interactive-loop
+    interactive-loop --> interactive-err
+    interactive-err --> interactive-loop
+    dispatch -->|print/json| print
+    print --> print-signal
+    print-signal --> print-rebind
+    print-rebind --> print-json
+    print-json -->|yes| print-json-out
+    print-json -->|no| print-text
+    print-json-out --> print-send
+    print-send --> print-text
+    print-text --> print-cleanup
+    dispatch -->|rpc| rpc
+    rpc --> rpc-stdout
+    rpc-stdout --> rpc-ui
+    rpc-ui --> rpc-rebind
+    rpc-rebind --> rpc-stdin
+    rpc-stdin --> rpc-parse
+    rpc-parse --> rpc-parse-err
+    rpc-parse-err --> rpc-stdin
+    rpc-parse --> rpc-ui-resp
+    rpc-ui-resp -->|yes| rpc-ui-resolve
+    rpc-ui-resolve --> rpc-stdin
+    rpc-ui-resp -->|no| rpc-cmd
+    rpc-cmd --> rpc-out
+    rpc-out --> rpc-shutdown
+    rpc-shutdown -->|no| rpc-stdin
+    rpc-shutdown -->|yes| rpc-shutdown-run
+</pre>
+
+<h2>State machines flagged</h2>
+
+<ul>
+<li><strong>Agent streaming state</strong> (<code>agent.state.isStreaming</code>): idle → streaming (during <code>agent.prompt</code>/<code>agent.continue</code>) → idle. <code>AgentSession.isStreaming</code> gates whether <code>prompt()</code> queues via steer/followUp or sends immediately. This is the core state machine governing user input routing.</li>
+<li><strong>Session lifecycle</strong> (<code>AgentSessionRuntime</code>): a runtime is created, then can be torn down and replaced via <code>newSession</code> / <code>switchSession</code> / <code>fork</code> / <code>importFromJsonl</code> / <code>reload</code> / <code>dispose</code>. Each replacement emits <code>session_before_switch</code>, tears down (emits <code>session_shutdown</code> with reason new/resume/fork/reload/quit), re-runs the factory, and rebinds.</li>
+<li><strong>Auto-retry state</strong> (<code>_retryAttempt</code>): on a retryable error (overloaded/rate-limit/server, but not context overflow), emits <code>auto_retry_start</code> with exponential backoff, continues the agent; on exhaustion emits <code>auto_retry_end</code> with success=false.</li>
+<li><strong>Compaction state</strong>: when the last assistant message overflows context, <code>_checkCompaction</code> runs a compaction turn (emits <code>compaction_start</code>/<code>compaction_end</code>) and continues the agent with the compacted context. Context-overflow errors are routed to compaction, not retry.</li>
+<li><strong>Project trust state</strong>: untrusted → trusted, cached per-cwd in <code>projectTrustByCwd</code>; <code>--approve</code>/<code>--no-approve</code> override; interactive mode can prompt.</li>
+<li><strong>RPC shutdown state</strong> (<code>shutdownRequested</code>/<code>shuttingDown</code>): a <code>shutdown</code> command or stdin-end sets the flag; after the current command finishes, <code>checkShutdownRequested</code> runs the full teardown.</li>
+</ul>
+
+<h2>Notes on external boundaries</h2>
+
+<ul>
+<li><strong>LLM provider</strong>: reached only inside <code>streamFn</code> configured on the <code>Agent</code> in <code>sdk.ts</code>. It calls <code>modelRegistry.getApiKeyAndHeaders(model)</code> for credentials, merges provider-attribution headers, lets extensions adjust headers via the <code>before_provider_headers</code> hook, then calls <code>streamSimple</code> from <code>@earendil-works/pi-ai</code>. The <code>onPayload</code>/<code>onResponse</code> hooks let extensions observe/modify the outgoing request and the incoming response status/headers.</li>
+<li><strong>Filesystem &amp; shell</strong>: reached only through the seven built-in tools. The bash tool spawns a real shell (<code>spawn</code> with <code>getShellEnv</code> and configurable <code>shellPath</code>/<code>commandPrefix</code>), tracks the process tree for abort/timeout, and streams stdout/stderr. read/edit/write/grep/find/ls operate on real files under <code>cwd</code>. File-mutating tools are serialized through <code>withFileMutationQueue</code>.</li>
+<li><strong>TUI rendering</strong>: <code>InteractiveMode</code> subscribes to <code>AgentSession</code> events and renders streaming text, tool calls, and approvals through <code>@earendil-works/pi-tui</code> components. The TUI also captures user input (steering, slash commands, model cycling) and feeds it back into <code>session.prompt</code>.</li>
+<li><strong>Session persistence</strong>: <code>SessionManager</code> appends every agent event to a JSONL session file under the session directory; on resume/continue/fork it rebuilds the message context from that file. This is what makes <code>--continue</code>, <code>--resume</code>, and <code>/fork</code> work.</li>
+<li><strong>Extensions</strong>: loaded by <code>DefaultResourceLoader</code>; they can register slash commands, custom tools, prompt-template/skill/theme providers, model providers, and hook into <code>input</code>, <code>tool_call</code>, <code>tool_result</code>, <code>before_agent_start</code>, <code>before_provider_request</code>, <code>after_provider_response</code>, <code>session_start</code>/<code>session_shutdown</code>, <code>session_before_switch</code>/<code>session_before_fork</code>, and <code>context</code> transform events.</li>
+</ul>
+
+<script>
+window.__sourceMap = {
+  "cli-entry": { "file": "packages/coding-agent/src/cli.ts", "startLine": 1, "endLine": 20 },
+  "main-start": { "file": "packages/coding-agent/src/main.ts", "startLine": 468, "endLine": 484 },
+  "pkg-cmd": { "file": "packages/coding-agent/src/main.ts", "startLine": 486, "endLine": 501 },
+  "pkg-exit": { "file": "packages/coding-agent/src/main.ts", "startLine": 486, "endLine": 501 },
+  "parse-args": { "file": "packages/coding-agent/src/main.ts", "startLine": 503, "endLine": 513 },
+  "diag-err": { "file": "packages/coding-agent/src/main.ts", "startLine": 504, "endLine": 512 },
+  "diag-exit": { "file": "packages/coding-agent/src/main.ts", "startLine": 509, "endLine": 512 },
+  "version": { "file": "packages/coding-agent/src/main.ts", "startLine": 515, "endLine": 518 },
+  "version-exit": { "file": "packages/coding-agent/src/main.ts", "startLine": 515, "endLine": 518 },
+  "export": { "file": "packages/coding-agent/src/main.ts", "startLine": 520, "endLine": 532 },
+  "export-run": { "file": "packages/coding-agent/src/main.ts", "startLine": 520, "endLine": 532 },
+  "export-fail": { "file": "packages/coding-agent/src/main.ts", "startLine": 525, "endLine": 529 },
+  "resolve-mode": { "file": "packages/coding-agent/src/main.ts", "startLine": 100, "endLine": 111 },
+  "take-stdout": { "file": "packages/coding-agent/src/main.ts", "startLine": 534, "endLine": 538 },
+  "validate-flags": { "file": "packages/coding-agent/src/main.ts", "startLine": 545, "endLine": 546 },
+  "migrations": { "file": "packages/coding-agent/src/main.ts", "startLine": 549, "endLine": 550 },
+  "first-setup": { "file": "packages/coding-agent/src/main.ts", "startLine": 557, "endLine": 560 },
+  "first-setup-run": { "file": "packages/coding-agent/src/main.ts", "startLine": 557, "endLine": 560 },
+  "session-dir": { "file": "packages/coding-agent/src/main.ts", "startLine": 567, "endLine": 572 },
+  "create-session": { "file": "packages/coding-agent/src/main.ts", "startLine": 572, "endLine": 572 },
+  "cwd-issue": { "file": "packages/coding-agent/src/main.ts", "startLine": 573, "endLine": 585 },
+  "cwd-interactive": { "file": "packages/coding-agent/src/main.ts", "startLine": 575, "endLine": 580 },
+  "cwd-noninteractive": { "file": "packages/coding-agent/src/main.ts", "startLine": 582, "endLine": 584 },
+  "cwd-cancel": { "file": "packages/coding-agent/src/main.ts", "startLine": 577, "endLine": 579 },
+  "build-runtime": { "file": "packages/coding-agent/src/main.ts", "startLine": 610, "endLine": 741 },
+  "help": { "file": "packages/coding-agent/src/main.ts", "startLine": 747, "endLine": 753 },
+  "help-exit": { "file": "packages/coding-agent/src/main.ts", "startLine": 747, "endLine": 753 },
+  "list-models": { "file": "packages/coding-agent/src/main.ts", "startLine": 755, "endLine": 759 },
+  "list-models-exit": { "file": "packages/coding-agent/src/main.ts", "startLine": 755, "endLine": 759 },
+  "read-stdin": { "file": "packages/coding-agent/src/main.ts", "startLine": 762, "endLine": 769 },
+  "prep-msg": { "file": "packages/coding-agent/src/main.ts", "startLine": 771, "endLine": 776 },
+  "init-theme": { "file": "packages/coding-agent/src/main.ts", "startLine": 777, "endLine": 778 },
+  "diag-report": { "file": "packages/coding-agent/src/main.ts", "startLine": 786, "endLine": 786 },
+  "diag-fatal": { "file": "packages/coding-agent/src/main.ts", "startLine": 787, "endLine": 792 },
+  "diag-fatal-exit": { "file": "packages/coding-agent/src/main.ts", "startLine": 787, "endLine": 792 },
+  "no-model": { "file": "packages/coding-agent/src/main.ts", "startLine": 795, "endLine": 798 },
+  "no-model-exit": { "file": "packages/coding-agent/src/main.ts", "startLine": 795, "endLine": 798 },
+  "dispatch": { "file": "packages/coding-agent/src/main.ts", "startLine": 806, "endLine": 853 },
+  "rpc-mode": { "file": "packages/coding-agent/src/main.ts", "startLine": 806, "endLine": 808 },
+  "interactive-mode": { "file": "packages/coding-agent/src/main.ts", "startLine": 809, "endLine": 838 },
+  "print-mode": { "file": "packages/coding-agent/src/main.ts", "startLine": 839, "endLine": 853 },
+
+  "factory-call": { "file": "packages/coding-agent/src/main.ts", "startLine": 610, "endLine": 734 },
+  "trust-check": { "file": "packages/coding-agent/src/main.ts", "startLine": 620, "endLine": 627 },
+  "trust-resolve": { "file": "packages/coding-agent/src/main.ts", "startLine": 635, "endLine": 657 },
+  "trust-cached": { "file": "packages/coding-agent/src/main.ts", "startLine": 623, "endLine": 627 },
+  "services": { "file": "packages/coding-agent/src/core/agent-session-services.ts", "startLine": 137, "endLine": 178 },
+  "provider-reg": { "file": "packages/coding-agent/src/core/agent-session-services.ts", "startLine": 154, "endLine": 166 },
+  "ext-flags": { "file": "packages/coding-agent/src/core/agent-session-services.ts", "startLine": 84, "endLine": 130 },
+  "model-scope": { "file": "packages/coding-agent/src/main.ts", "startLine": 685, "endLine": 687 },
+  "session-opts": { "file": "packages/coding-agent/src/main.ts", "startLine": 688, "endLine": 699 },
+  "api-key": { "file": "packages/coding-agent/src/main.ts", "startLine": 701, "endLine": 710 },
+  "api-key-set": { "file": "packages/coding-agent/src/main.ts", "startLine": 708, "endLine": 709 },
+  "api-key-err": { "file": "packages/coding-agent/src/main.ts", "startLine": 703, "endLine": 707 },
+  "create-session": { "file": "packages/coding-agent/src/core/agent-session-services.ts", "startLine": 187, "endLine": 207 },
+  "sdk-model": { "file": "packages/coding-agent/src/core/sdk.ts", "startLine": 192, "endLine": 222 },
+  "sdk-thinking": { "file": "packages/coding-agent/src/core/sdk.ts", "startLine": 224, "endLine": 243 },
+  "sdk-tools": { "file": "packages/coding-agent/src/core/sdk.ts", "startLine": 245, "endLine": 251 },
+  "sdk-agent": { "file": "packages/coding-agent/src/core/sdk.ts", "startLine": 294, "endLine": 369 },
+  "sdk-restore": { "file": "packages/coding-agent/src/core/sdk.ts", "startLine": 372, "endLine": 383 },
+  "sdk-restore-yes": { "file": "packages/coding-agent/src/core/sdk.ts", "startLine": 372, "endLine": 376 },
+  "sdk-restore-no": { "file": "packages/coding-agent/src/core/sdk.ts", "startLine": 377, "endLine": 383 },
+  "sdk-session": { "file": "packages/coding-agent/src/core/sdk.ts", "startLine": 385, "endLine": 399 },
+  "runtime-apply": { "file": "packages/coding-agent/src/core/agent-session-runtime.ts", "startLine": 406, "endLine": 424 },
+
+  "prompt-call": { "file": "packages/coding-agent/src/core/agent-session.ts", "startLine": 1036, "endLine": 1184 },
+  "is-slash": { "file": "packages/coding-agent/src/core/agent-session.ts", "startLine": 1044, "endLine": 1051 },
+  "ext-cmd": { "file": "packages/coding-agent/src/core/agent-session.ts", "startLine": 1189, "endLine": 1213 },
+  "input-hook": { "file": "packages/coding-agent/src/core/agent-session.ts", "startLine": 1056, "endLine": 1071 },
+  "input-handle": { "file": "packages/coding-agent/src/core/agent-session.ts", "startLine": 1063, "endLine": 1066 },
+  "input-transform": { "file": "packages/coding-agent/src/core/agent-session.ts", "startLine": 1067, "endLine": 1070 },
+  "expand": { "file": "packages/coding-agent/src/core/agent-session.ts", "startLine": 1074, "endLine": 1078 },
+  "streaming": { "file": "packages/coding-agent/src/core/agent-session.ts", "startLine": 1081, "endLine": 1094 },
+  "stream-no-behavior": { "file": "packages/coding-agent/src/core/agent-session.ts", "startLine": 1082, "endLine": 1086 },
+  "queue-steer": { "file": "packages/coding-agent/src/core/agent-session.ts", "startLine": 1090, "endLine": 1091 },
+  "queue-followup": { "file": "packages/coding-agent/src/core/agent-session.ts", "startLine": 1088, "endLine": 1089 },
+  "flush-bash": { "file": "packages/coding-agent/src/core/agent-session.ts", "startLine": 1097, "endLine": 1097 },
+  "model-check": { "file": "packages/coding-agent/src/core/agent-session.ts", "startLine": 1100, "endLine": 1114 },
+  "model-err": { "file": "packages/coding-agent/src/core/agent-session.ts", "startLine": 1100, "endLine": 1114 },
+  "compact-check": { "file": "packages/coding-agent/src/core/agent-session.ts", "startLine": 1118, "endLine": 1121 },
+  "build-msgs": { "file": "packages/coding-agent/src/core/agent-session.ts", "startLine": 1123, "endLine": 1142 },
+  "before-start": { "file": "packages/coding-agent/src/core/agent-session.ts", "startLine": 1144, "endLine": 1172 },
+  "run-prompt": { "file": "packages/coding-agent/src/core/agent-session.ts", "startLine": 1183, "endLine": 1183 },
+  "agent-prompt": { "file": "packages/coding-agent/src/core/agent-session.ts", "startLine": 987, "endLine": 987 },
+  "streamfn": { "file": "packages/coding-agent/src/core/sdk.ts", "startLine": 302, "endLine": 339 },
+  "llm": { "file": "packages/coding-agent/src/core/sdk.ts", "startLine": 329, "endLine": 329 },
+  "tool-call": { "file": "packages/coding-agent/src/core/agent-session.ts", "startLine": 420, "endLine": 439 },
+  "before-tool": { "file": "packages/coding-agent/src/core/agent-session.ts", "startLine": 420, "endLine": 439 },
+  "tool-exec": { "file": "packages/coding-agent/src/core/agent-session.ts", "startLine": 2458, "endLine": 2461 },
+  "after-tool": { "file": "packages/coding-agent/src/core/agent-session.ts", "startLine": 441, "endLine": 470 },
+  "tool-result": { "file": "packages/coding-agent/src/core/agent-session.ts", "startLine": 988, "endLine": 990 },
+  "agent-end": { "file": "packages/coding-agent/src/core/agent-session.ts", "startLine": 998, "endLine": 1002 },
+  "post-run": { "file": "packages/coding-agent/src/core/agent-session.ts", "startLine": 997, "endLine": 1025 },
+  "retry": { "file": "packages/coding-agent/src/core/agent-session.ts", "startLine": 1004, "endLine": 1006 },
+  "retry-prep": { "file": "packages/coding-agent/src/core/agent-session.ts", "startLine": 2540, "endLine": 2570 },
+  "retry-exhausted": { "file": "packages/coding-agent/src/core/agent-session.ts", "startLine": 1008, "endLine": 1016 },
+  "compact": { "file": "packages/coding-agent/src/core/agent-session.ts", "startLine": 1018, "endLine": 1019 },
+  "compact-run": { "file": "packages/coding-agent/src/core/agent-session.ts", "startLine": 1018, "endLine": 1020 },
+  "queued": { "file": "packages/coding-agent/src/core/agent-session.ts", "startLine": 1024, "endLine": 1024 },
+  "done": { "file": "packages/coding-agent/src/core/agent-session.ts", "startLine": 991, "endLine": 994 },
+  "agent-continue": { "file": "packages/coding-agent/src/core/agent-session.ts", "startLine": 989, "endLine": 990 },
+
+  "registry": { "file": "packages/coding-agent/src/core/agent-session.ts", "startLine": 2491, "endLine": 2494 },
+  "tool-names": { "file": "packages/coding-agent/src/core/agent-session.ts", "startLine": 2487, "endLine": 2490 },
+  "allow-deny": { "file": "packages/coding-agent/src/core/sdk.ts", "startLine": 245, "endLine": 251 },
+  "model-requests": { "file": "packages/coding-agent/src/core/agent-session.ts", "startLine": 420, "endLine": 420 },
+  "dispatch": { "file": "packages/coding-agent/src/core/agent-session.ts", "startLine": 420, "endLine": 439 },
+  "read-tool": { "file": "packages/coding-agent/src/core/tools/read.ts", "startLine": 43, "endLine": 60 },
+  "bash-tool": { "file": "packages/coding-agent/src/core/tools/bash.ts", "startLine": 82, "endLine": 130 },
+  "edit-tool": { "file": "packages/coding-agent/src/core/tools/edit.ts", "startLine": 1, "endLine": 437 },
+  "write-tool": { "file": "packages/coding-agent/src/core/tools/write.ts", "startLine": 1, "endLine": 267 },
+  "grep-tool": { "file": "packages/coding-agent/src/core/tools/grep.ts", "startLine": 1, "endLine": 385 },
+  "find-tool": { "file": "packages/coding-agent/src/core/tools/find.ts", "startLine": 1, "endLine": 374 },
+  "ls-tool": { "file": "packages/coding-agent/src/core/tools/ls.ts", "startLine": 1, "endLine": 225 },
+  "fs": { "file": "packages/coding-agent/src/core/tools/read.ts", "startLine": 52, "endLine": 56 },
+  "shell": { "file": "packages/coding-agent/src/core/tools/bash.ts", "startLine": 96, "endLine": 103 },
+  "result-truncate": { "file": "packages/coding-agent/src/core/tools/truncate.ts", "startLine": 1, "endLine": 276 },
+  "result-back": { "file": "packages/coding-agent/src/core/agent-session.ts", "startLine": 441, "endLine": 470 },
+
+  "interactive": { "file": "packages/coding-agent/src/modes/interactive/interactive-mode.ts", "startLine": 779, "endLine": 852 },
+  "interactive-init": { "file": "packages/coding-agent/src/modes/interactive/interactive-mode.ts", "startLine": 626, "endLine": 626 },
+  "interactive-startup": { "file": "packages/coding-agent/src/modes/interactive/interactive-mode.ts", "startLine": 783, "endLine": 819 },
+  "interactive-initial": { "file": "packages/coding-agent/src/modes/interactive/interactive-mode.ts", "startLine": 822, "endLine": 840 },
+  "interactive-send-initial": { "file": "packages/coding-agent/src/modes/interactive/interactive-mode.ts", "startLine": 822, "endLine": 829 },
+  "interactive-loop": { "file": "packages/coding-agent/src/modes/interactive/interactive-mode.ts", "startLine": 843, "endLine": 851 },
+  "interactive-err": { "file": "packages/coding-agent/src/modes/interactive/interactive-mode.ts", "startLine": 825, "endLine": 828 },
+  "print": { "file": "packages/coding-agent/src/modes/print-mode.ts", "startLine": 32, "endLine": 159 },
+  "print-signal": { "file": "packages/coding-agent/src/modes/print-mode.ts", "startLine": 47, "endLine": 65 },
+  "print-rebind": { "file": "packages/coding-agent/src/modes/print-mode.ts", "startLine": 71, "endLine": 109 },
+  "print-json": { "file": "packages/coding-agent/src/modes/print-mode.ts", "startLine": 112, "endLine": 117 },
+  "print-json-out": { "file": "packages/coding-agent/src/modes/print-mode.ts", "startLine": 104, "endLine": 108 },
+  "print-send": { "file": "packages/coding-agent/src/modes/print-mode.ts", "startLine": 121, "endLine": 128 },
+  "print-text": { "file": "packages/coding-agent/src/modes/print-mode.ts", "startLine": 129, "endLine": 146 },
+  "print-cleanup": { "file": "packages/coding-agent/src/modes/print-mode.ts", "startLine": 152, "endLine": 158 },
+  "rpc": { "file": "packages/coding-agent/src/modes/rpc/rpc-mode.ts", "startLine": 53, "endLine": 170 },
+  "rpc-stdout": { "file": "packages/coding-agent/src/modes/rpc/rpc-mode.ts", "startLine": 54, "endLine": 61 },
+  "rpc-ui": { "file": "packages/coding-agent/src/modes/rpc/rpc-mode.ts", "startLine": 135, "endLine": 170 },
+  "rpc-rebind": { "file": "packages/coding-agent/src/modes/rpc/rpc-mode.ts", "startLine": 53, "endLine": 170 },
+  "rpc-stdin": { "file": "packages/coding-agent/src/modes/rpc/rpc-mode.ts", "startLine": 780, "endLine": 788 },
+  "rpc-parse": { "file": "packages/coding-agent/src/modes/rpc/rpc-mode.ts", "startLine": 723, "endLine": 737 },
+  "rpc-parse-err": { "file": "packages/coding-agent/src/modes/rpc/rpc-mode.ts", "startLine": 727, "endLine": 736 },
+  "rpc-ui-resp": { "file": "packages/coding-agent/src/modes/rpc/rpc-mode.ts", "startLine": 740, "endLine": 753 },
+  "rpc-ui-resolve": { "file": "packages/coding-agent/src/modes/rpc/rpc-mode.ts", "startLine": 746, "endLine": 752 },
+  "rpc-cmd": { "file": "packages/coding-agent/src/modes/rpc/rpc-mode.ts", "startLine": 755, "endLine": 762 },
+  "rpc-out": { "file": "packages/coding-agent/src/modes/rpc/rpc-mode.ts", "startLine": 758, "endLine": 761 },
+  "rpc-shutdown": { "file": "packages/coding-agent/src/modes/rpc/rpc-mode.ts", "startLine": 718, "endLine": 721 },
+  "rpc-shutdown-run": { "file": "packages/coding-agent/src/modes/rpc/rpc-mode.ts", "startLine": 690, "endLine": 716 }
+};
+</script>
+
+<aside id="source-panel"><div id="source-header"></div><div id="monaco-container"></div></aside>
+<script src="../assets/codeindex-runtime.js"></script>
+<script src="../assets/codeindex.js"></script>
+</body>
+</html>

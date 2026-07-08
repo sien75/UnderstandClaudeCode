@@ -1,0 +1,375 @@
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  line-height: 1.6;
+  color: #1a1a1a;
+  background: #fafafa;
+}
+
+/* -- Layout: main + source panel -- */
+
+body.codeindex-layout {
+  display: flex;
+  height: 100vh;
+  min-height: 100vh;
+  overflow: hidden;
+}
+
+body.codeindex-layout > .codeindex-main {
+  flex: 1 1 62%;
+  max-width: 62%;
+  overflow-y: auto;
+  height: 100vh;
+  padding: 2rem 2.5rem;
+}
+
+body:not(.codeindex-layout) > * {
+  max-width: 900px;
+  margin-left: auto;
+  margin-right: auto;
+  padding-left: 2.5rem;
+  padding-right: 2.5rem;
+}
+
+body:not(.codeindex-layout) > a {
+  display: block;
+  text-decoration: none;
+  color: inherit;
+}
+
+/* -- Source panel -- */
+
+#source-panel {
+  flex: 0 0 38%;
+  max-width: 38%;
+  border-left: 1px solid #e0e0e0;
+  background: #1e1e1e;
+  color: #d4d4d4;
+  display: none;
+  flex-direction: column;
+  height: 100vh;
+  position: sticky;
+  top: 0;
+}
+
+#source-panel.visible {
+  display: flex;
+}
+
+#source-header {
+  padding: 0.75rem 1rem;
+  font-size: 0.85rem;
+  font-family: "SF Mono", "Fira Code", monospace;
+  background: #252526;
+  border-bottom: 1px solid #333;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+#source-header .file-path { opacity: 0.8; }
+#source-header .line-range { opacity: 0.5; font-size: 0.8rem; }
+
+#source-close {
+  background: none;
+  border: none;
+  color: #d4d4d4;
+  font-size: 1.2rem;
+  cursor: pointer;
+  padding: 0 0.25rem;
+  opacity: 0.6;
+}
+#source-close:hover { opacity: 1; }
+
+#monaco-container {
+  flex: 1;
+  overflow: hidden;
+}
+
+.codeindex-highlight-line {
+  background: rgba(255, 213, 79, 0.15) !important;
+}
+
+.codeindex-highlight-gutter {
+  background: rgba(255, 213, 79, 0.3);
+  width: 3px !important;
+  margin-left: 3px;
+}
+
+/* -- Typography -- */
+
+h1 {
+  font-size: 1.8rem;
+  font-weight: 700;
+  margin-bottom: 1rem;
+  color: #111;
+}
+
+h2 {
+  font-size: 1.3rem;
+  font-weight: 600;
+  margin-top: 2rem;
+  margin-bottom: 0.75rem;
+  color: #222;
+}
+
+p {
+  margin-bottom: 1rem;
+  color: #333;
+}
+
+/* -- Definition list (input/output) -- */
+
+dl {
+  background: #f5f5f5;
+  border-radius: 8px;
+  padding: 1rem 1.25rem;
+  margin-bottom: 1.5rem;
+}
+
+dt {
+  font-weight: 600;
+  font-size: 0.85rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: #666;
+  margin-top: 0.5rem;
+}
+
+dt:first-child { margin-top: 0; }
+
+dd {
+  margin-left: 0;
+  margin-bottom: 0.25rem;
+  color: #333;
+}
+
+/* -- Mermaid -- */
+
+.codeindex-mermaid-shell {
+  margin: 1.5rem 0;
+}
+
+.codeindex-mermaid-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 0.35rem;
+  padding: 0.45rem 0.5rem;
+  background: #f7f7f7;
+  border: 1px solid #e8e8e8;
+  border-bottom: 0;
+  border-radius: 8px 8px 0 0;
+}
+
+.codeindex-mermaid-zoom-button {
+  min-width: 2rem;
+  height: 1.75rem;
+  padding: 0 0.5rem;
+  border: 1px solid #d0d0d0;
+  border-radius: 4px;
+  background: #fff;
+  color: #333;
+  font: inherit;
+  font-size: 0.8rem;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.codeindex-mermaid-zoom-button:hover {
+  background: #f0f0f0;
+  border-color: #b8b8b8;
+}
+
+.codeindex-mermaid-zoom-label {
+  min-width: 3rem;
+  text-align: center;
+  font-size: 0.8rem;
+  color: #555;
+}
+
+.mermaid {
+  background: #fff;
+  border: 1px solid #e8e8e8;
+  border-radius: 8px;
+  padding: 1.5rem;
+  margin: 1.5rem 0;
+  overflow-x: auto;
+}
+
+.codeindex-mermaid-shell .mermaid {
+  border-radius: 0 0 8px 8px;
+  margin: 0;
+}
+
+.mermaid svg {
+  display: block;
+}
+
+.mermaid .node { cursor: pointer; }
+
+/* -- Notes list -- */
+
+ul {
+  margin: 1rem 0;
+  padding-left: 1.5rem;
+}
+
+li {
+  margin-bottom: 0.5rem;
+  color: #444;
+}
+
+/* -- Navigation -- */
+
+.codeindex-nav {
+  margin-bottom: 1.5rem;
+}
+
+.codeindex-nav a {
+  color: #555;
+  text-decoration: none;
+  font-size: 0.9rem;
+}
+
+.codeindex-nav a:hover {
+  color: #111;
+}
+
+/* -- Index page: module cards -- */
+
+.codeindex-modules {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 1rem;
+  margin: 1.5rem 0;
+}
+
+.codeindex-module-card {
+  display: block;
+  background: #fff;
+  border: 1px solid #e0e0e0;
+  border-radius: 8px;
+  padding: 1.25rem;
+  text-decoration: none;
+  color: inherit;
+  transition: border-color 0.15s, box-shadow 0.15s;
+}
+
+.codeindex-module-card:hover {
+  border-color: #bbb;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.06);
+}
+
+/* Module card links on index page */
+a.module-card {
+  display: block;
+  text-decoration: none;
+  color: inherit;
+  /* Use explicit top/bottom margins so the horizontal auto margins from
+     body:not(.codeindex-layout) > * keep the cards centered. */
+  margin-top: 1rem;
+  margin-bottom: 1rem;
+}
+
+a.module-card section {
+  display: block;
+  background: #fff;
+  border: 1px solid #e0e0e0;
+  border-radius: 8px;
+  padding: 1.25rem;
+  transition: border-color 0.15s, box-shadow 0.15s;
+}
+
+a.module-card:hover section {
+  border-color: #bbb;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.06);
+}
+
+a.module-card h2 {
+  margin-top: 0;
+}
+
+.codeindex-module-card h3 {
+  font-size: 1.05rem;
+  font-weight: 600;
+  margin-bottom: 0.5rem;
+  color: #111;
+}
+
+.codeindex-module-card p {
+  font-size: 0.9rem;
+  color: #555;
+  margin-bottom: 0;
+}
+
+/* -- Coverage bar -- */
+
+.codeindex-coverage {
+  margin-top: 2rem;
+  padding-top: 1.5rem;
+  border-top: 1px solid #e0e0e0;
+}
+
+.codeindex-coverage-bar {
+  height: 12px;
+  background: #e0e0e0;
+  border-radius: 6px;
+  overflow: hidden;
+  display: flex;
+  margin: 0.75rem 0;
+}
+
+.codeindex-coverage-bar .deep { background: #4caf50; }
+.codeindex-coverage-bar .mapped { background: #ff9800; }
+.codeindex-coverage-bar .ignored { background: #9e9e9e; }
+
+.codeindex-coverage-legend {
+  display: flex;
+  gap: 1.5rem;
+  font-size: 0.85rem;
+  color: #666;
+}
+
+.codeindex-coverage-legend span::before {
+  content: '';
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border-radius: 2px;
+  margin-right: 0.35rem;
+  vertical-align: middle;
+}
+
+.codeindex-coverage-legend .deep::before { background: #4caf50; }
+.codeindex-coverage-legend .mapped::before { background: #ff9800; }
+.codeindex-coverage-legend .ignored::before { background: #9e9e9e; }
+.codeindex-coverage-legend .unknown::before { background: #e0e0e0; }
+
+/* -- Project root banner -- */
+
+#codeindex-root-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.6rem 1.25rem;
+  background: #fffde7;
+  border-bottom: 1px solid #f0e68c;
+  font-size: 0.9rem;
+  color: #5d4037;
+}
+
+#codeindex-root-banner button {
+  padding: 0.35rem 0.85rem;
+  border: 1px solid #c9a834;
+  border-radius: 4px;
+  background: #fff;
+  color: #5d4037;
+  font-size: 0.85rem;
+  cursor: pointer;
+}
+
+#codeindex-root-banner button:hover {
+  background: #f5f0d0;
+}

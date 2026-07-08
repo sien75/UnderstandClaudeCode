@@ -1,0 +1,339 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Multi-Agent Orchestrator</title>
+<link rel="stylesheet" href="../assets/codeindex.css">
+</head>
+<body>
+<a href="index.html" class="back-link">← Back to overview</a>
+<h1>Multi-Agent Orchestrator</h1>
+<p>The <code>@earendil-works/pi-orchestrator</code> package is a supervisor process that spawns and manages multiple coding-agent child processes, routes tasks and RPC traffic between a caller (CLI or external client) and those workers, and coordinates their lifecycle. From the user's perspective, you run <code>orchestrator serve</code> once to start the long-running supervisor daemon; then every other command — <code>list</code>, <code>spawn</code>, <code>status</code>, <code>stop</code>, <code>rpc</code>, <code>rpc-stream</code> — is a thin client that connects to that daemon over a Unix socket, sends a JSON-Lines request, and prints the JSON response. The supervisor itself spawns each agent as a child process and speaks to it over its stdin/stdout using the same JSON-Lines RPC protocol defined by <code>@earendil-works/pi-coding-agent</code>. Optionally, the supervisor also registers itself and each worker with a remote "Radius" presence service so other machines can discover and reach the orchestrator.</p>
+
+<dl>
+<dt>cli.ts — command dispatcher</dt>
+<dd>Parses <code>process.argv</code> and routes to either <code>serve()</code> (start the daemon) or one of the client commands that call <code>sendIpcRequest</code>. For <code>rpc-stream</code> it opens a raw bidirectional socket and pipes stdin JSON-Lines into it. <strong>Input:</strong> argv flags. <strong>Output:</strong> printed JSON response or a running daemon.</dd>
+<dt>serve.ts — daemon entry</dt>
+<dd>Starts the IPC socket server, recovers persisted instance state after a restart, optionally starts Radius presence, then blocks forever until a signal or fatal error triggers a graceful shutdown that closes the server, stops all workers, and unlinks the socket. <strong>Input:</strong> nothing (side effect: a running socket). <strong>Output:</strong> a long-lived process.</dd>
+<dt>ipc/server.ts — socket server</dt>
+<dd>Accepts Unix-socket connections, reads newline-delimited JSON, parses each line into an <code>OrchestratorRequest</code>, dispatches it to the handler, and writes the JSON response back. For <code>rpc_stream</code> requests it upgrades the connection into a long-lived bidirectional bridge that fans agent session events and UI requests out to the client and queues inbound RPC commands serially. <strong>Input:</strong> JSON-Lines requests on a socket. <strong>Output:</strong> JSON-Lines responses and streamed events.</dd>
+<dt>ipc/client.ts — socket client</dt>
+<dd>One-shot helper used by every non-serve CLI subcommand: opens a connection to the orchestrator socket, writes one request, reads one response, and returns it. <strong>Input:</strong> an <code>OrchestratorRequest</code>. <strong>Output:</strong> an <code>OrchestratorResponse</code>.</dd>
+<dt>ipc/protocol.ts — wire format</dt>
+<dd>Defines the request/response discriminated unions and the <code>encodeMessage</code>/<code>parseRequestLine</code>/<code>parseResponseLine</code> helpers. Every byte on the socket is <code>JSON.stringify(msg) + "\n"</code>.</dd>
+<dt>handler.ts — request router</dt>
+<dd>Switches on <code>request.type</code> and delegates to the matching <code>supervisor</code> method, mapping <code>InstanceRecord</code> to the wire-friendly <code>InstanceSummary</code>. Also exposes <code>openRpcStream</code> which adapts the supervisor's stream handle into the socket-facing callback shape.</dd>
+<dt>supervisor.ts — lifecycle and routing core</dt>
+<dd>Holds the in-memory <code>liveInstances</code> map (one <code>LiveInstance</code> per worker, binding a persisted <code>InstanceRecord</code> to the live <code>RpcProcessInstance</code>, subscriber set, and UI-request handler). Owns spawn, stop, RPC routing, stream subscription, crash recovery, and shutdown. Persists instance metadata to <code>instances.json</code> and refreshes it after session-changing RPCs. Wires itself as the Radius coordinator.</dd>
+<dt>rpc-process.ts — child process wrapper</dt>
+<dd>Spawns one <code>pi --mode rpc</code> (or <code>pi-coding-agent/rpc-entry</code>) child process per worker, frames JSON-Lines over stdin/stdout, correlates responses to pending requests by <code>id</code>, fans session events and <code>extension_ui_request</code> messages to listeners, and detects child exit/error. <strong>Input:</strong> <code>RpcCommand</code>. <strong>Output:</strong> <code>RpcResponse</code> + async <code>AgentSessionEvent</code> stream. <strong>External boundary:</strong> a child Node process.</dd>
+<dt>storage.ts — persistence</dt>
+<dd>Reads/writes <code>instances.json</code> and <code>machine.json</code> under the orchestrator dir. Pure JSON file IO, no caching.</dd>
+<dt>config.ts — paths and environment</dt>
+<dd>Resolves the orchestrator directory (<code>PI_ORCHESTRATOR_DIR</code> or <code>~/.pi/orchestrator</code>), the socket path, the instances/machine/auth paths, the package version, and the <code>isBunBinary</code> flag that picks the child spawn command.</dd>
+<dt>radius.ts — remote presence</dt>
+<dd>Optional integration with the Radius service: registers this machine and each Pi (worker), runs heartbeats with exponential backoff + jitter, and re-registers after repeated 404s. <strong>External boundary:</strong> the Radius HTTP API.</dd>
+<dt>types.ts — shared types</dt>
+<dd><code>InstanceStatus</code> ("starting" | "online" | "stopping" | "stopped" | "error"), <code>InstanceRecord</code>, <code>MachineRecord</code>, <code>RadiusRegistration</code>.</dd>
+</dl>
+
+<h2>Data Flow — serve startup</h2>
+<pre class="mermaid">
+graph TD
+    serve-cli-invoke --> serve-fn
+    serve-fn --> mkdir-socket-dir
+    serve-fn --> start-ipc-server
+    start-ipc-server --> stale-socket-check
+    stale-socket-check --> socket-exists-decision
+    socket-exists-decision -->|exists| is-live-decision
+    is-live-decision -->|live| throw-already-running
+    is-live-decision -->|stale| unlink-stale
+    socket-exists-decision -->|not exists| listen-server
+    unlink-stale --> listen-server
+    listen-server --> recover-after-restart
+    recover-after-restart --> radius-enabled-decision
+    radius-enabled-decision -->|enabled| radius-presence-start
+    radius-presence-start --> register-machine
+    register-machine --> start-machine-heartbeat
+    start-machine-heartbeat --> listen-forever
+    radius-enabled-decision -->|disabled| radius-disabled-log
+    radius-disabled-log --> listen-forever
+    start-ipc-server --> startup-error-decision
+    startup-error-decision -->|error| server-close-cleanup
+    listen-forever --> signal-handler
+    signal-handler --> shutdown
+    shutdown --> supervisor-shutdown
+    shutdown --> radius-stop
+</pre>
+
+<h2>Data Flow — client command request/response (list/spawn/status/stop/rpc)</h2>
+<pre class="mermaid">
+graph TD
+    user-client-cmd --> send-ipc-request
+    send-ipc-request --> connect-socket
+    connect-socket --> socket-data-receive
+    socket-data-receive --> parse-request-line
+    parse-request-line --> is-rpc-stream-decision
+    is-rpc-stream-decision -->|one-shot| handle-ipc-request
+    handle-ipc-request --> request-type-decision
+    request-type-decision -->|spawn| spawn-case
+    request-type-decision -->|list| list-case
+    request-type-decision -->|status| status-case
+    request-type-decision -->|stop| stop-case
+    request-type-decision -->|rpc| rpc-case
+    spawn-case --> supervisor-method
+    list-case --> supervisor-method
+    status-case --> supervisor-method
+    stop-case --> supervisor-method
+    rpc-case --> supervisor-method
+    supervisor-method --> build-response
+    build-response --> write-response-socket
+    write-response-socket --> client-receive-data
+    client-receive-data --> parse-response
+    parse-response --> print-response
+    handle-ipc-request --> unknown-instance-error
+    unknown-instance-error --> write-response-socket
+    socket-data-receive --> parse-error-decision
+    parse-error-decision -->|parse fail| write-error-response
+    write-error-response --> client-receive-data
+</pre>
+
+<h2>Data Flow — spawn worker (into the child process)</h2>
+<pre class="mermaid">
+graph TD
+    spawn-request-arrives --> spawn-instance
+    spawn-instance --> create-live-instance
+    create-live-instance --> upsert-instance-storage
+    spawn-instance --> create-rpc-process
+    create-rpc-process --> get-spawn-command
+    get-spawn-command --> spawn-child-process
+    spawn-child-process --> attach-listeners
+    create-rpc-process --> bind-rpc-process
+    bind-rpc-process --> sync-instance-record
+    sync-instance-record --> get-state-rpc
+    get-state-rpc --> radius-register-pi
+    radius-register-pi --> start-pi-heartbeat
+    start-pi-heartbeat --> set-status-online
+    set-status-online --> return-record
+    spawn-instance --> spawn-error-decision
+    spawn-error-decision -->|error| fail-spawn
+    fail-spawn --> cleanup-resources
+    cleanup-resources --> set-status-stopped
+</pre>
+
+<h2>Data Flow — RPC routing (one-shot rpc and rpc-stream)</h2>
+<pre class="mermaid">
+graph TD
+    rpc-command-from-client --> supervisor-handle-rpc
+    supervisor-handle-rpc --> rpc-process-send
+    rpc-process-send --> assign-request-id
+    assign-request-id --> write-stdin-jsonl
+    write-stdin-jsonl --> child-processes-command
+    child-processes-command --> stdout-data-chunk
+    stdout-data-chunk --> handle-line
+    handle-line --> response-type-decision
+    response-type-decision -->|response| resolve-pending
+    response-type-decision -->|extension_ui_request| ui-request-handler
+    response-type-decision -->|session event| subscriber-event
+    resolve-pending --> return-response
+    return-response --> should-refresh-decision
+    should-refresh-decision -->|yes| sync-metadata
+    sync-metadata --> write-response-socket
+    should-refresh-decision -->|no| write-response-socket
+    rpc-stream-setup --> open-rpc-stream
+    open-rpc-stream --> subscriber-event
+    subscriber-event --> session-event-to-socket
+    ui-request-handler --> ui-request-to-socket
+    rpc-stream-handle-request --> handle-ui-response
+    rpc-stream-handle-request --> supervisor-handle-rpc
+</pre>
+
+<h2>Data Flow — worker crash / unexpected exit</h2>
+<pre class="mermaid">
+graph TD
+    child-process-exit --> reject-all-pending
+    child-process-error --> reject-all-pending
+    reject-all-pending --> notify-exit-listeners
+    notify-exit-listeners --> supervisor-handle-unexpected-exit
+    supervisor-handle-unexpected-exit --> live-instance-check
+    live-instance-check -->|gone| exit-noop
+    live-instance-check -->|present| status-stopping-check
+    status-stopping-check -->|stopping or stopped| exit-noop
+    status-stopping-check -->|running| set-status-error
+    set-status-error --> clear-bindings
+    clear-bindings --> clear-rpc-process
+    clear-rpc-process --> has-radius-pi-decision
+    has-radius-pi-decision -->|yes| disconnect-radius-pi
+    has-radius-pi-decision -->|no| delete-live-instance
+    disconnect-radius-pi --> delete-live-instance
+</pre>
+
+<h2>State Machine — worker lifecycle (InstanceStatus)</h2>
+<pre class="mermaid">
+graph TD
+    state-starting -->|spawn success| state-online
+    state-starting -->|spawn fail| state-error
+    state-starting -->|child exit| state-error
+    state-online -->|stop requested| state-stopping
+    state-online -->|child exit| state-error
+    state-stopping -->|cleanup done| state-stopped
+    state-error -->|failSpawn cleanup| state-stopped
+    state-online -->|recover after restart| state-stopped
+    state-starting -->|recover after restart| state-stopped
+    state-stopped -->|terminal| state-stopped
+</pre>
+
+<h2>Structure view — module composition</h2>
+<pre class="mermaid">
+graph TD
+    cli-entry --> serve-module
+    cli-entry --> ipc-client
+    serve-module --> ipc-server
+    serve-module --> supervisor
+    serve-module --> radius
+    ipc-server --> ipc-protocol
+    ipc-client --> ipc-protocol
+    ipc-server --> handler
+    handler --> supervisor
+    handler --> types
+    supervisor --> rpc-process
+    supervisor --> storage
+    supervisor --> radius
+    supervisor --> types
+    rpc-process --> config
+    rpc-process --> child-agent
+    storage --> config
+    radius --> config
+    radius --> storage
+    radius --> radius-server
+</pre>
+
+<script>
+window.__sourceMap = {
+  "serve-cli-invoke": { "file": "packages/orchestrator/src/cli.ts", "startLine": 92, "endLine": 95 },
+  "serve-fn": { "file": "packages/orchestrator/src/serve.ts", "startLine": 9, "endLine": 17 },
+  "mkdir-socket-dir": { "file": "packages/orchestrator/src/serve.ts", "startLine": 10, "endLine": 11 },
+  "start-ipc-server": { "file": "packages/orchestrator/src/ipc/server.ts", "startLine": 46, "endLine": 49 },
+  "stale-socket-check": { "file": "packages/orchestrator/src/ipc/server.ts", "startLine": 162, "endLine": 173 },
+  "socket-exists-decision": { "file": "packages/orchestrator/src/ipc/server.ts", "startLine": 162, "endLine": 165 },
+  "is-live-decision": { "file": "packages/orchestrator/src/ipc/server.ts", "startLine": 175, "endLine": 208 },
+  "throw-already-running": { "file": "packages/orchestrator/src/ipc/server.ts", "startLine": 169, "endLine": 169 },
+  "unlink-stale": { "file": "packages/orchestrator/src/ipc/server.ts", "startLine": 172, "endLine": 172 },
+  "listen-server": { "file": "packages/orchestrator/src/ipc/server.ts", "startLine": 151, "endLine": 157 },
+  "recover-after-restart": { "file": "packages/orchestrator/src/supervisor.ts", "startLine": 244, "endLine": 255 },
+  "radius-enabled-decision": { "file": "packages/orchestrator/src/serve.ts", "startLine": 20, "endLine": 20 },
+  "radius-presence-start": { "file": "packages/orchestrator/src/serve.ts", "startLine": 21, "endLine": 25 },
+  "register-machine": { "file": "packages/orchestrator/src/radius.ts", "startLine": 237, "endLine": 260 },
+  "start-machine-heartbeat": { "file": "packages/orchestrator/src/radius.ts", "startLine": 262, "endLine": 274 },
+  "radius-disabled-log": { "file": "packages/orchestrator/src/serve.ts", "startLine": 26, "endLine": 28 },
+  "startup-error-decision": { "file": "packages/orchestrator/src/serve.ts", "startLine": 29, "endLine": 35 },
+  "server-close-cleanup": { "file": "packages/orchestrator/src/serve.ts", "startLine": 30, "endLine": 34 },
+  "listen-forever": { "file": "packages/orchestrator/src/serve.ts", "startLine": 37, "endLine": 76 },
+  "signal-handler": { "file": "packages/orchestrator/src/serve.ts", "startLine": 59, "endLine": 72 },
+  "shutdown": { "file": "packages/orchestrator/src/serve.ts", "startLine": 40, "endLine": 57 },
+  "supervisor-shutdown": { "file": "packages/orchestrator/src/supervisor.ts", "startLine": 335, "endLine": 339 },
+  "radius-stop": { "file": "packages/orchestrator/src/radius.ts", "startLine": 171, "endLine": 192 },
+  "user-client-cmd": { "file": "packages/orchestrator/src/cli.ts", "startLine": 97, "endLine": 154 },
+  "send-ipc-request": { "file": "packages/orchestrator/src/ipc/client.ts", "startLine": 5, "endLine": 63 },
+  "connect-socket": { "file": "packages/orchestrator/src/ipc/client.ts", "startLine": 9, "endLine": 9 },
+  "socket-data-receive": { "file": "packages/orchestrator/src/ipc/server.ts", "startLine": 53, "endLine": 64 },
+  "parse-request-line": { "file": "packages/orchestrator/src/ipc/protocol.ts", "startLine": 134, "endLine": 137 },
+  "is-rpc-stream-decision": { "file": "packages/orchestrator/src/ipc/server.ts", "startLine": 68, "endLine": 68 },
+  "handle-ipc-request": { "file": "packages/orchestrator/src/handler.ts", "startLine": 57, "endLine": 129 },
+  "request-type-decision": { "file": "packages/orchestrator/src/handler.ts", "startLine": 58, "endLine": 58 },
+  "spawn-case": { "file": "packages/orchestrator/src/handler.ts", "startLine": 59, "endLine": 69 },
+  "list-case": { "file": "packages/orchestrator/src/handler.ts", "startLine": 71, "endLine": 77 },
+  "status-case": { "file": "packages/orchestrator/src/handler.ts", "startLine": 79, "endLine": 90 },
+  "stop-case": { "file": "packages/orchestrator/src/handler.ts", "startLine": 92, "endLine": 103 },
+  "rpc-case": { "file": "packages/orchestrator/src/handler.ts", "startLine": 105, "endLine": 116 },
+  "supervisor-method": { "file": "packages/orchestrator/src/supervisor.ts", "startLine": 270, "endLine": 333 },
+  "build-response": { "file": "packages/orchestrator/src/handler.ts", "startLine": 63, "endLine": 115 },
+  "write-response-socket": { "file": "packages/orchestrator/src/ipc/server.ts", "startLine": 138, "endLine": 139 },
+  "client-receive-data": { "file": "packages/orchestrator/src/ipc/client.ts", "startLine": 22, "endLine": 36 },
+  "parse-response": { "file": "packages/orchestrator/src/ipc/protocol.ts", "startLine": 139, "endLine": 142 },
+  "print-response": { "file": "packages/orchestrator/src/cli.ts", "startLine": 25, "endLine": 27 },
+  "unknown-instance-error": { "file": "packages/orchestrator/src/handler.ts", "startLine": 41, "endLine": 47 },
+  "parse-error-decision": { "file": "packages/orchestrator/src/ipc/server.ts", "startLine": 140, "endLine": 147 },
+  "write-error-response": { "file": "packages/orchestrator/src/ipc/server.ts", "startLine": 141, "endLine": 146 },
+  "spawn-request-arrives": { "file": "packages/orchestrator/src/handler.ts", "startLine": 59, "endLine": 63 },
+  "spawn-instance": { "file": "packages/orchestrator/src/supervisor.ts", "startLine": 270, "endLine": 298 },
+  "create-live-instance": { "file": "packages/orchestrator/src/supervisor.ts", "startLine": 271, "endLine": 284 },
+  "upsert-instance-storage": { "file": "packages/orchestrator/src/storage.ts", "startLine": 54, "endLine": 65 },
+  "create-rpc-process": { "file": "packages/orchestrator/src/rpc-process.ts", "startLine": 199, "endLine": 201 },
+  "get-spawn-command": { "file": "packages/orchestrator/src/rpc-process.ts", "startLine": 50, "endLine": 61 },
+  "spawn-child-process": { "file": "packages/orchestrator/src/rpc-process.ts", "startLine": 37, "endLine": 48 },
+  "attach-listeners": { "file": "packages/orchestrator/src/rpc-process.ts", "startLine": 63, "endLine": 99 },
+  "bind-rpc-process": { "file": "packages/orchestrator/src/supervisor.ts", "startLine": 99, "endLine": 113 },
+  "sync-instance-record": { "file": "packages/orchestrator/src/supervisor.ts", "startLine": 140, "endLine": 155 },
+  "get-state-rpc": { "file": "packages/orchestrator/src/rpc-process.ts", "startLine": 143, "endLine": 159 },
+  "radius-register-pi": { "file": "packages/orchestrator/src/radius.ts", "startLine": 194, "endLine": 215 },
+  "start-pi-heartbeat": { "file": "packages/orchestrator/src/radius.ts", "startLine": 276, "endLine": 293 },
+  "set-status-online": { "file": "packages/orchestrator/src/supervisor.ts", "startLine": 66, "endLine": 73 },
+  "return-record": { "file": "packages/orchestrator/src/supervisor.ts", "startLine": 293, "endLine": 294 },
+  "spawn-error-decision": { "file": "packages/orchestrator/src/supervisor.ts", "startLine": 295, "endLine": 297 },
+  "fail-spawn": { "file": "packages/orchestrator/src/supervisor.ts", "startLine": 176, "endLine": 185 },
+  "cleanup-resources": { "file": "packages/orchestrator/src/supervisor.ts", "startLine": 157, "endLine": 174 },
+  "set-status-stopped": { "file": "packages/orchestrator/src/supervisor.ts", "startLine": 181, "endLine": 181 },
+  "rpc-command-from-client": { "file": "packages/orchestrator/src/handler.ts", "startLine": 105, "endLine": 108 },
+  "supervisor-handle-rpc": { "file": "packages/orchestrator/src/supervisor.ts", "startLine": 321, "endLine": 333 },
+  "rpc-process-send": { "file": "packages/orchestrator/src/rpc-process.ts", "startLine": 143, "endLine": 159 },
+  "assign-request-id": { "file": "packages/orchestrator/src/rpc-process.ts", "startLine": 147, "endLine": 148 },
+  "write-stdin-jsonl": { "file": "packages/orchestrator/src/rpc-process.ts", "startLine": 151, "endLine": 151 },
+  "child-processes-command": { "file": "packages/orchestrator/src/rpc-process.ts", "startLine": 39, "endLine": 43 },
+  "stdout-data-chunk": { "file": "packages/orchestrator/src/rpc-process.ts", "startLine": 64, "endLine": 79 },
+  "handle-line": { "file": "packages/orchestrator/src/rpc-process.ts", "startLine": 101, "endLine": 128 },
+  "response-type-decision": { "file": "packages/orchestrator/src/rpc-process.ts", "startLine": 103, "endLine": 103 },
+  "resolve-pending": { "file": "packages/orchestrator/src/rpc-process.ts", "startLine": 108, "endLine": 114 },
+  "ui-request-handler": { "file": "packages/orchestrator/src/rpc-process.ts", "startLine": 117, "endLine": 119 },
+  "subscriber-event": { "file": "packages/orchestrator/src/supervisor.ts", "startLine": 102, "endLine": 105 },
+  "return-response": { "file": "packages/orchestrator/src/handler.ts", "startLine": 109, "endLine": 115 },
+  "should-refresh-decision": { "file": "packages/orchestrator/src/supervisor.ts", "startLine": 329, "endLine": 329 },
+  "sync-metadata": { "file": "packages/orchestrator/src/supervisor.ts", "startLine": 140, "endLine": 155 },
+  "rpc-stream-setup": { "file": "packages/orchestrator/src/ipc/server.ts", "startLine": 68, "endLine": 95 },
+  "open-rpc-stream": { "file": "packages/orchestrator/src/supervisor.ts", "startLine": 197, "endLine": 233 },
+  "session-event-to-socket": { "file": "packages/orchestrator/src/ipc/server.ts", "startLine": 81, "endLine": 83 },
+  "ui-request-to-socket": { "file": "packages/orchestrator/src/ipc/server.ts", "startLine": 84, "endLine": 86 },
+  "rpc-stream-handle-request": { "file": "packages/orchestrator/src/ipc/server.ts", "startLine": 109, "endLine": 131 },
+  "handle-ui-response": { "file": "packages/orchestrator/src/rpc-process.ts", "startLine": 161, "endLine": 166 },
+  "child-process-exit": { "file": "packages/orchestrator/src/rpc-process.ts", "startLine": 93, "endLine": 98 },
+  "child-process-error": { "file": "packages/orchestrator/src/rpc-process.ts", "startLine": 86, "endLine": 91 },
+  "reject-all-pending": { "file": "packages/orchestrator/src/rpc-process.ts", "startLine": 130, "endLine": 135 },
+  "notify-exit-listeners": { "file": "packages/orchestrator/src/rpc-process.ts", "startLine": 137, "endLine": 141 },
+  "supervisor-handle-unexpected-exit": { "file": "packages/orchestrator/src/supervisor.ts", "startLine": 115, "endLine": 134 },
+  "live-instance-check": { "file": "packages/orchestrator/src/supervisor.ts", "startLine": 116, "endLine": 118 },
+  "exit-noop": { "file": "packages/orchestrator/src/supervisor.ts", "startLine": 117, "endLine": 117 },
+  "status-stopping-check": { "file": "packages/orchestrator/src/supervisor.ts", "startLine": 119, "endLine": 121 },
+  "set-status-error": { "file": "packages/orchestrator/src/supervisor.ts", "startLine": 122, "endLine": 122 },
+  "clear-bindings": { "file": "packages/orchestrator/src/supervisor.ts", "startLine": 90, "endLine": 97 },
+  "clear-rpc-process": { "file": "packages/orchestrator/src/supervisor.ts", "startLine": 124, "endLine": 124 },
+  "has-radius-pi-decision": { "file": "packages/orchestrator/src/supervisor.ts", "startLine": 125, "endLine": 125 },
+  "disconnect-radius-pi": { "file": "packages/orchestrator/src/radius.ts", "startLine": 217, "endLine": 235 },
+  "delete-live-instance": { "file": "packages/orchestrator/src/supervisor.ts", "startLine": 133, "endLine": 133 },
+  "state-starting": { "file": "packages/orchestrator/src/types.ts", "startLine": 1, "endLine": 1 },
+  "state-online": { "file": "packages/orchestrator/src/types.ts", "startLine": 1, "endLine": 1 },
+  "state-stopping": { "file": "packages/orchestrator/src/types.ts", "startLine": 1, "endLine": 1 },
+  "state-stopped": { "file": "packages/orchestrator/src/types.ts", "startLine": 1, "endLine": 1 },
+  "state-error": { "file": "packages/orchestrator/src/types.ts", "startLine": 1, "endLine": 1 },
+  "cli-entry": { "file": "packages/orchestrator/src/cli.ts", "startLine": 79, "endLine": 161 },
+  "serve-module": { "file": "packages/orchestrator/src/serve.ts", "startLine": 9, "endLine": 77 },
+  "ipc-server": { "file": "packages/orchestrator/src/ipc/server.ts", "startLine": 46, "endLine": 160 },
+  "ipc-client": { "file": "packages/orchestrator/src/ipc/client.ts", "startLine": 5, "endLine": 63 },
+  "ipc-protocol": { "file": "packages/orchestrator/src/ipc/protocol.ts", "startLine": 1, "endLine": 143 },
+  "handler": { "file": "packages/orchestrator/src/handler.ts", "startLine": 57, "endLine": 161 },
+  "supervisor": { "file": "packages/orchestrator/src/supervisor.ts", "startLine": 63, "endLine": 355 },
+  "rpc-process": { "file": "packages/orchestrator/src/rpc-process.ts", "startLine": 25, "endLine": 201 },
+  "storage": { "file": "packages/orchestrator/src/storage.ts", "startLine": 1, "endLine": 71 },
+  "config": { "file": "packages/orchestrator/src/config.ts", "startLine": 1, "endLine": 70 },
+  "radius": { "file": "packages/orchestrator/src/radius.ts", "startLine": 148, "endLine": 445 },
+  "types": { "file": "packages/orchestrator/src/types.ts", "startLine": 1, "endLine": 26 },
+  "child-agent": { "file": "packages/orchestrator/src/rpc-process.ts", "startLine": 1, "endLine": 11 },
+  "radius-server": { "file": "packages/orchestrator/src/radius.ts", "startLine": 46, "endLine": 61 }
+};
+</script>
+
+<aside id="source-panel"><div id="source-header"></div><div id="monaco-container"></div></aside>
+<script src="../assets/codeindex-runtime.js"></script>
+<script src="../assets/codeindex.js"></script>
+</body>
+</html>

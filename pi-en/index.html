@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pi Agent Harness — Code Index</title>
+<link rel="stylesheet" href="assets/codeindex.css">
+</head>
+<body>
+<h1>Pi Agent Harness</h1>
+
+<p>This is <strong>pi</strong> — an open-source, self-extensible coding agent harness, shipped as a TypeScript monorepo. You run the <code>pi</code> command in your terminal; it turns a natural-language request into a multi-turn coding session: chatting with an LLM, calling tools that read and edit your files and run shell commands, and streaming the whole thing back to a terminal UI. Under the hood it is five packages that compose into one pipeline: a unified multi-provider LLM API, an agent runtime that runs the ask-the-model / run-the-tool loop, the coding-agent CLI that wires tools + system prompt + modes on top of that runtime, a terminal UI library that renders it all, and an orchestrator for running many agents as supervised child processes.</p>
+
+<h2>What users can do</h2>
+<ul>
+  <li>Start an interactive coding chat in the terminal (<code>pi</code>) → <a href="modules/interactive-coding-agent-cli.html">Interactive Coding Agent CLI</a> + <a href="modules/terminal-ui-library.html">Terminal UI Library</a></li>
+  <li>Run a one-shot prompt without entering the TUI (<code>pi -p "fix this test"</code>) → <a href="modules/interactive-coding-agent-cli.html">Interactive Coding Agent CLI</a></li>
+  <li>Invoke a skill or slash command mid-session (e.g. <code>/cl</code>, custom skills) → <a href="modules/interactive-coding-agent-cli.html">Interactive Coding Agent CLI</a></li>
+  <li>Resume, fork, or import a previous session → <a href="modules/interactive-coding-agent-cli.html">Interactive Coding Agent CLI</a></li>
+  <li>Steer the agent mid-turn (queue a redirecting message while it works) → <a href="modules/agent-runtime-loop.html">Agent Runtime Loop</a></li>
+  <li>Bring your own LLM provider — OpenAI, Anthropic, Google, Bedrock, Mistral, and more, via API key or OAuth → <a href="modules/multi-provider-llm-api.html">Multi-Provider LLM API</a></li>
+  <li>Run <code>pi</code> headless as a JSON-RPC server (used by the orchestrator and IDE integrations) → <a href="modules/interactive-coding-agent-cli.html">Interactive Coding Agent CLI</a></li>
+  <li>Run many agents at once: start a supervisor daemon, spawn/list/stop worker agents, stream their sessions → <a href="modules/multi-agent-orchestrator.html">Multi-Agent Orchestrator</a></li>
+</ul>
+
+<h2>How the pieces fit together</h2>
+<p>Data flows top-to-bottom: the user types in the <a href="modules/terminal-ui-library.html">TUI</a>; the <a href="modules/interactive-coding-agent-cli.html">coding agent</a> builds a system prompt and tool set and hands the prompt to the <a href="modules/agent-runtime-loop.html">agent runtime</a>; the runtime asks the LLM through the <a href="modules/multi-provider-llm-api.html">LLM API</a>; tool calls come back and execute against your filesystem and shell; results flow back into the loop until the agent is done. The <a href="modules/multi-agent-orchestrator.html">orchestrator</a> sits beside this, spawning many <code>pi</code> RPC workers and routing tasks to them.</p>
+
+<a class="module-card" href="modules/multi-provider-llm-api.html">
+  <section>
+    <h2>Multi-Provider LLM API</h2>
+    <p>Turn a caller's prompt + provider credentials into a streamed LLM response — one unified API across OpenAI, Anthropic, Google, Bedrock, and more.</p>
+  </section>
+</a>
+
+<a class="module-card" href="modules/agent-runtime-loop.html">
+  <section>
+    <h2>Agent Runtime Loop</h2>
+    <p>Turn a prompt plus a set of tools into a multi-turn LLM conversation — ask the model, run the tools it asks for, feed results back, repeat until done.</p>
+  </section>
+</a>
+
+<a class="module-card" href="modules/interactive-coding-agent-cli.html">
+  <section>
+    <h2>Interactive Coding Agent CLI</h2>
+    <p>Turn the <code>pi</code> command into a working coding session — wires the system prompt, the read/bash/edit/write tools, and interactive/one-shot/RPC modes onto the agent runtime.</p>
+  </section>
+</a>
+
+<a class="module-card" href="modules/terminal-ui-library.html">
+  <section>
+    <h2>Terminal UI Library</h2>
+    <p>Turn raw stdin bytes and a component tree into a rendered terminal screen — decodes key presses, diffs frames, and only redraws what changed.</p>
+  </section>
+</a>
+
+<a class="module-card" href="modules/multi-agent-orchestrator.html">
+  <section>
+    <h2>Multi-Agent Orchestrator</h2>
+    <p>Turn a single <code>orchestrator serve</code> command into a supervised fleet of coding-agent workers — spawn, route RPC, stream sessions, recover from crashes.</p>
+  </section>
+</a>
+
+<pre class="coverage">=== Coverage Status ===
+Total lines:     264006
+Deep:            19406 (7.4%)
+Mapped:          87753
+Ignored:         154015
+Uncovered:       2832
+Coverage:        98.9%
+
+Uncovered files (3):
+  - packages/coding-agent/docs/packages.md
+  - packages/coding-agent/test/fixtures/empty-agent/.gitkeep
+  - packages/coding-agent/test/fixtures/empty-cwd/.gitkeep
+</pre>
+<script src="assets/codeindex-runtime.js"></script>
+<script src="assets/codeindex.js"></script>
+</body>
+</html>

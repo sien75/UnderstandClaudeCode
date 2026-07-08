@@ -1,0 +1,290 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>多提供商 LLM API</title>
+<link rel="stylesheet" href="../assets/codeindex.css">
+</head>
+<body>
+<a href="index.html" class="back-link">← 返回总览</a>
+<h1>多提供商 LLM API</h1>
+<p>这是 <code>@earendil-works/pi-ai</code> 包 —— 一个让应用通过统一的流式接口与多种不同 LLM 提供商（Anthropic、OpenAI、Google、AWS Bedrock 等约 25 家）对话的单一库。业务价值在于：编码智能体或 CLI 工具可以在不重写调用点的情况下更换请求背后的模型，并且认证、重试、提示缓存和 “thinking” 控制对所有提供商只实现一次。本报告沿着请求的真实路径展开 —— 从调用方选择模型，到认证解析、提供商路由，再到 HTTP 调用以及返回的流式事件。此外有两条旁路：一条用于 OAuth 登录的 CLI，以及一个保留旧全局 API 的 <code>compat</code> 入口，供尚未迁移的应用使用。</p>
+
+<h2>调用方在这里能做什么</h2>
+<dl>
+<dt>流式聊天补全</dt>
+<dd>主要操作。调用方（智能体运行时或上层应用）从 <code>Models</code> 集合中挑选一个 <code>Model</code>，传入 <code>Context</code>（系统提示词 + 对话消息 + 可选工具定义），然后获得一个 <code>AssistantMessageEventStream</code> —— 一个异步可迭代对象，会发出部分文本、thinking 和工具调用增量，最后以一条最终的 <code>AssistantMessage</code> 结束。入口为 <code>models.stream(model, context, options)</code> 或 <code>models.complete(...)</code>（后者只是等待流的结果）。</dd>
+<dt>带“推理级别”的流式调用</dt>
+<dd><code>streamSimple</code> / <code>completeSimple</code> 接受人类友好的 <code>reasoning: "low" | "medium" | "high" | ...</code>，而不是各提供商特定的 thinking 参数。提供商把它映射到上游 API 所需的值。</dd>
+<dt>登录 OAuth 提供商</dt>
+<dd>通过 CLI（<code>npx @earendil-works/pi-ai login &lt;provider&gt;</code>）运行 Anthropic / GitHub Copilot / OpenAI Codex 的 OAuth 流程，并将凭据保存到本地 <code>auth.json</code>。这是唯一一个面向人的交互式入口。</dd>
+<dt>生成图片</dt>
+<dd>并行的图片生成流水线（<code>ImagesModels</code>）具有同样的形态 —— 目前只接入了 OpenRouter images。</dd>
+</dl>
+
+<p>下面的内容全部从<strong>数据流视角</strong>展开：提示词从哪进入、如何认证、如何被路由、如何被转换成提供商负载、如何通过网络发送，以及流式响应如何被标准化回 pi 的事件协议。状态机细节（OAuth token 刷新）和结构细节（provider-adapter 层级）会在自然出现的位置标注。</p>
+
+<h2>请求生命周期，端到端</h2>
+<p>下图是 <code>models.stream(model, context, options)</code> 的主流程。因为链路较长，拆成两张子图：第一张覆盖准备阶段（认证解析与路由到正确的 provider/API 实现），第二张覆盖实际的 provider HTTP 调用与响应解码。节点 ID 采用短横线命名，对应文末 <code>window.__sourceMap</code> 表中的源码位置。</p>
+
+<pre class="mermaid">
+graph TD
+    caller["调用方调用 models.stream(model, context, options)"]
+    lazyStream["lazyStream 同步返回一个流，在后台异步完成准备工作"]
+    requireProvider["requireProvider: 按 model.provider 查找 Provider"]
+    applyAuth["applyAuth: 解析该模型的凭据"]
+    resolveAuth["resolveProviderAuth: 已存凭据或环境凭据"]
+    decideCred{"凭据类型?"}
+    oauthStored["已存 OAuth 凭据"]
+    oauthExpiry{"Token 是否过期?"}
+    oauthRefresh["在凭据存储锁下进行刷新"]
+    oauthToAuth["oauth.toAuth: 派生 bearer apiKey"]
+    apiKeyStored["已存 API key 凭据"]
+    apiKeyResolve["apiKey.resolve: 已存 key 或环境变量"]
+    ambientOnly["仅环境凭据 (AWS profile, ADC file, env)"]
+    noAuth["未解析到认证 — 请求无认证继续"]
+    mergeAuth["将认证合并进 request options (apiKey/headers/env 覆盖 model.baseUrl)"]
+    providerStream["provider.stream(requestModel, context, requestOptions)"]
+    dispatchApi["createProvider 分发: 按 model.api 选择 API 实现"]
+    apiImpl["API 实现模块 (例如 anthropic-messages.stream)"]
+    setupError["准备失败 -> 流发出 error 事件并结束"]
+    noProvider["未知 provider -> 抛出 ModelsError"]
+
+    caller --> lazyStream
+    lazyStream --> requireProvider
+    requireProvider --> noProvider
+    requireProvider --> applyAuth
+    applyAuth --> resolveAuth
+    resolveAuth --> decideCred
+    decideCred -- OAuth --> oauthStored
+    oauthStored --> oauthExpiry
+    oauthExpiry -- yes --> oauthRefresh
+    oauthExpiry -- no --> oauthToAuth
+    oauthRefresh --> oauthToAuth
+    decideCred -- API key --> apiKeyStored
+    apiKeyStored --> apiKeyResolve
+    decideCred -- 无已存凭据 --> ambientOnly
+    ambientOnly --> apiKeyResolve
+    resolveAuth -- undefined --> noAuth
+    oauthToAuth --> mergeAuth
+    apiKeyResolve --> mergeAuth
+    noAuth --> mergeAuth
+    mergeAuth --> providerStream
+    providerStream --> dispatchApi
+    dispatchApi --> apiImpl
+    lazyStream -. 准备拒绝 .-> setupError
+</pre>
+
+<p>本节说明：</p>
+<ul>
+<li><strong>同步返回流，异步准备。</strong> <code>Models.stream()</code> 必须同步返回一个 <code>AssistantMessageEventStream</code>（调用方不应在消费前 <code>await</code>）。认证解析和懒加载模块都是异步的，因此 <code>lazyStream</code> 立即返回一个空流，准备完成后把事件推入其中。如果准备阶段抛出异常（未知 provider、OAuth 刷新失败），流会以一个携带空 <code>AssistantMessage</code> 的 <code>error</code> 事件结束 —— 不会向调用方抛出异常。</li>
+<li><strong>认证按请求解析，而不是按提供商解析。</strong> <code>resolveProviderAuth</code> 优先使用显式的 <code>options.apiKey</code> 覆盖，其次是已存凭据，最后是环境来源（环境变量、AWS profile、ADC 文件）。已存凭据“拥有”该 provider：只有在没有已存凭据时才会 consult 环境变量。这避免了刷新失败后静默回退到环境变量。</li>
+<li><strong>OAuth 刷新采用双检锁。</strong> 乐观过期检查不加锁；若发现过期，刷新在 <code>CredentialStore.modify()</code> 内部执行，该函数按 provider 串行化写操作（内存中通过 promise 链；持久化存储会使用文件锁）。在锁内会重新检查过期时间，防止并发请求重复刷新。刷新失败抛出 <code>ModelsError("oauth")</code>，并保留已存凭据以便重试 / 重新登录。</li>
+<li><strong>提供商路由是两级分发。</strong> <code>Models</code> 按 <code>model.provider</code> 找到 <code>Provider</code>；provider（由 <code>createProvider</code> 构建）再按 <code>model.api</code> 分发到正确的 <code>ProviderStreams</code> 实现。单 API 的 provider 只传递一个 <code>api</code>；混合 API 的 provider 传递一个以 <code>model.api</code> 为键的 map。如果没有实现匹配该 API，流会以 <code>ModelsError("stream")</code> 报错。</li>
+</ul>
+
+<h2>Provider HTTP 调用内部（以 Anthropic 为参考实现）</h2>
+<p><code>src/api/</code> 下的每个 API 实现模块都导出相同形态的 <code>stream</code> 和 <code>streamSimple</code> 函数。区别仅在于负载构造和事件解码。这里最详细观察的是 Anthropic messages 实现（<code>api/anthropic-messages.ts</code>）；OpenAI-completions、OpenAI-responses、Google、Bedrock 等遵循同样的骨架，只加入提供商特定的转换。</p>
+
+<pre class="mermaid">
+graph TD
+    enter["stream(model, context, options) 被调用"]
+    createStream["创建 AssistantMessageEventStream + 空输出 AssistantMessage"]
+    hasClient{"options.client 是否已提供?"}
+    buildClient["createClient: 选择 API-key / OAuth-bearer / Copilot-bearer 认证 + beta headers"]
+    assertAuth["assertRequestAuth: 若无 apiKey 且无 auth header 则快速失败"]
+    copilotHeaders["若为 github-copilot: 构建 Copilot 动态 headers (vision awareness)"]
+    buildParams["buildParams: 将 Context messages/tools 转为 Anthropic MessageCreateParams"]
+    onPayloadCb["options.onPayload 回调可重写 payload"]
+    httpCall["client.messages.create({stream:true}) -> 向 api.anthropic.com 发起 HTTP POST"]
+    onResponseCb["options.onResponse 回调接收 status + headers"]
+    pushStart["流发出 start 事件"]
+    decodeSse["iterateAnthropicEvents: 解码 SSE 行，用 repair 解析 JSON"]
+    blockEvents{"SSE 事件类型"}
+    msgStart["message_start: 记录 responseId + input usage + cost"]
+    blockStart["content_block_start: 打开 text/thinking/redacted_thinking/tool_use 块"]
+    blockDelta["content_block_delta: 追加 text/thinking/input_json/signature"]
+    blockStop["content_block_stop:  finalize 块，发出 text_end/thinking_end/toolcall_end"]
+    msgDelta["message_delta: 最终 stop_reason + output usage + reasoning tokens"]
+    success["发出 done 事件并携带最终 AssistantMessage，结束流"]
+    failure["捕获异常: 设置 stopReason error/aborted，发出 error 事件，结束流"]
+
+    enter --> createStream
+    createStream --> hasClient
+    hasClient -- no --> assertAuth
+    assertAuth --> copilotHeaders
+    copilotHeaders --> buildClient
+    hasClient -- yes --> buildParams
+    buildClient --> buildParams
+    buildParams --> onPayloadCb
+    onPayloadCb --> httpCall
+    httpCall --> onResponseCb
+    onResponseCb --> pushStart
+    pushStart --> decodeSse
+    decodeSse --> blockEvents
+    blockEvents -- message_start --> msgStart
+    blockEvents -- content_block_start --> blockStart
+    blockEvents -- content_block_delta --> blockDelta
+    blockEvents -- content_block_stop --> blockStop
+    blockEvents -- message_delta --> msgDelta
+    msgStart --> decodeSse
+    blockStart --> decodeSse
+    blockDelta --> decodeSse
+    blockStop --> decodeSse
+    msgDelta --> success
+    decodeSse -. abort/网络/解析错误 .-> failure
+</pre>
+
+<p>Provider 调用说明：</p>
+<ul>
+<li><strong>外部边界。</strong> <code>client.messages.create()</code> 是离开进程的调用 —— 一个带 SSE 响应体的认证 HTTP POST，地址为 <code>https://api.anthropic.com/v1/messages</code>。此前全部是本地转换；此后全部是解码远程流。其他提供商也有同样的边界（OpenAI responses 端点、Google generateContent、Bedrock Converse 等）。</li>
+<li><strong>三种认证风味，一个 client 构造器。</strong> <code>createClient</code> 按三种情况分支：(a) GitHub Copilot — bearer token + Copilot 动态 headers；(b) OAuth token — bearer auth 加上 Claude Code identity headers（<code>claude-code-20250219</code>、<code>oauth-2025-04-20</code> beta flags、<code>user-agent: claude-cli/...</code>）；(c) 普通 API key — <code>x-api-key</code> header。OAuth “隐身”路径使得 Claude Pro/Max 订阅 token 能像付费 API key 一样调用同一 API。</li>
+<li><strong>onPayload / onResponse 钩子。</strong> 调用方可以在最终 provider payload 发出前检查或替换它，并在原始 HTTP 响应状态/headers 到达后立即观察。这样上层就能在不触碰 provider 内部的情况下完成请求日志、脱敏和 A/B 路由。</li>
+<li><strong>流式 JSON 修复。</strong> 工具调用参数增量以部分 JSON 片段到达。<code>parseStreamingJson</code> 增量解析它们，使部分 <code>arguments</code> 对象始终可读；<code>parseJsonWithRepair</code> 修复损坏的 SSE 数据。它们位于 <code>utils/json-parse.ts</code>。</li>
+<li><strong>用量和成本在线计算。</strong> Token 计数分散在 <code>message_start</code>（input/cache）和 <code>message_delta</code>（output、reasoning）中到达。<code>calculateCost(model, usage)</code> 在每次更新时按模型的百万 token 价格相乘；最终的 <code>AssistantMessage</code> 携带完整计费的 <code>Usage</code>。Anthropic 的 1h cache writes 按 2 倍基础输入计费，在 <code>calculateCost</code> 中特殊处理。</li>
+<li><strong>中止与错误语义。</strong> SSE 循环内部会检查 <code>AbortSignal</code>；一旦中止或抛出任何错误，部分 <code>AssistantMessage</code> 会以 <code>stopReason: "aborted" | "error"</code> 和 <code>errorMessage</code> 完成，然后作为 <code>error</code> 事件发出。流不会向调用方抛出 —— 失败被当作值传递。</li>
+</ul>
+
+<h2>OAuth 登录流程（状态机）</h2>
+<p>这是另一个入口 —— CLI 的 <code>login</code> 命令，以及支撑它的 <code>OAuthAuth.login</code> 接口。Anthropic 流程（authorization code + PKCE）是参考；Copilot 和 OpenAI Codex 遵循同样的形态，只是端点不同。</p>
+
+<pre class="mermaid">
+graph TD
+    cliLogin["CLI: npx pi-ai login anthropic"]
+    pickProvider["getOAuthProvider(id) 从注册表获取"]
+    startServer["startCallbackServer: 本地 node:http 监听端口 53692"]
+    pkce["generatePKCE: verifier + challenge"]
+    buildAuthUrl["构建 authorize URL，含 client_id, challenge, state, scopes"]
+    notifyUrl["callbacks.notify auth_url -> CLI 打印 URL"]
+    userBrowser["用户在浏览器中授权 (外部)"]
+    waitForCode["server.waitForCode 竞速 callback vs 手动粘贴 code"]
+    codeArrived{"是否收到 code?"}
+    exchangeCode["exchangeAuthorizationCode: POST token endpoint"]
+    tokenResp["收到 access + refresh + expires_in"]
+    saveCreds["CLI 保存 {type:oauth,...credentials} 到 auth.json"]
+    done["登录完成"]
+
+    cliLogin --> pickProvider
+    pickProvider --> startServer
+    startServer --> pkce
+    pkce --> buildAuthUrl
+    buildAuthUrl --> notifyUrl
+    notifyUrl --> userBrowser
+    userBrowser --> waitForCode
+    waitForCode --> codeArrived
+    codeArrived -- yes --> exchangeCode
+    codeArrived -- no/error --> done
+    exchangeCode --> tokenResp
+    tokenResp --> saveCreds
+    saveCreds --> done
+</pre>
+
+<p>配套的刷新状态机在过期后的第一次认证请求时懒执行，并在凭据存储锁下运行，即主图中的 <code>oauthExpiry → oauthRefresh</code> 分支。<code>refreshAnthropicToken</code> 向同一 token 端点 POST <code>grant_type=refresh_token</code> 并返回新的 <code>OAuthCredentials</code>；对 <code>expires</code> 预留 5 分钟偏移（<code>expires_in * 1000 - 5 * 60 * 1000</code>），让下一次请求主动刷新，而不是在边界竞速。</p>
+
+<h2>Provider-adapter 层级（结构视图）</h2>
+<p>从结构上看，每个内置 provider 都由 <code>createProvider()</code> 用相同部件构建：一个 <code>id</code>、一个 <code>baseUrl</code>、一个 <code>auth</code> 块（<code>ApiKeyAuth</code> / <code>OAuthAuth</code> 中的一种或两种）、静态模型列表（或动态 provider 的 <code>refreshModels</code> 拉取器），以及一个 <code>api</code> 实现。内置目录在 <code>providers/all.ts</code> 中组装，它把约 30 个 provider 工厂接入一个新的 <code>Models</code>，通过 <code>builtinModels()</code>。大多数 provider 很薄：例如 <code>anthropicProvider()</code> 只声明环境变量 <code>ANTHROPIC_OAUTH_TOKEN</code>/<code>ANTHROPIC_API_KEY</code>、一个懒加载 OAuth loader、Anthropic 模型目录，以及懒加载的 <code>anthropicMessagesApi()</code> 流。有意思的结构变体：</p>
+<ul>
+<li><strong>Amazon Bedrock</strong>（<code>providers/amazon-bedrock.ts</code>）是环境凭据场景：它的 <code>ApiKeyAuth.resolve</code> 返回空 <code>auth</code> 对象（没有 apiKey），因为 AWS profile / IAM / ECS / IRSA 等来源的 AWS SDK 默认凭据链会在 API 实现内部完成 SigV4 签名。只有已存 bearer token 才是非环境路径。</li>
+<li><strong>混合 API provider</strong>（OpenAI、Google、Google Vertex）传递一个以 <code>model.api</code> 为键的 <code>api</code> map，使单个 provider 可同时服务 <code>openai-completions</code> 和 <code>openai-responses</code>，或 <code>google-generative-ai</code> 与 <code>google-vertex</code>，按模型分发。</li>
+<li><strong>到处是懒加载包装。</strong> <code>api/*.lazy.ts</code> 文件把每个 API 实现模块包装在 <code>lazyApi(() => import("./real.ts"))</code> 中，因此沉重的 provider SDK（Anthropic SDK、AWS Bedrock SDK、Google SDK）只在真正发起该 API 请求时才加载。<code>auth/helpers.ts → lazyOAuth</code> 对 OAuth 流程模块也做同样处理，把 Node 专属的 <code>http.createServer</code> 代码排除在浏览器打包之外。</li>
+</ul>
+
+<h2>Legacy compat 入口</h2>
+<p><code>compat.ts</code> 保留了旧的全局 API（<code>stream()</code>、<code>complete()</code>、<code>getModel()</code>），存在于 <code>Models</code>/<code>Provider</code> 重构之前。它维护一个独立的进程内 <code>apiProviderRegistry</code>，以 API id 为键，在导入时自动注册 9 个内置 API 实现，并通过 env API-key 注入（<code>withEnvApiKey</code>）进行分发。显式标记为待删除，等 coding-agent 迁移到 <code>createModels()</code> 后移除。新代码不应使用它；这里仅作记录，因为现有应用仍可能导入 <code>@earendil-works/pi-ai/compat</code>。</p>
+
+<h2>环境变量 key 解析</h2>
+<p><code>env-api-keys.ts</code> 在不触碰凭据的前提下回答“该 provider 是否通过环境配置？”。<code>findEnvKeys</code> 把 provider id 映射到常规环境变量（<code>OPENAI_API_KEY</code>、<code>ANTHROPIC_API_KEY</code> 等）；<code>getEnvApiKey</code> 对环境凭据 provider 更进一步：对 <code>google-vertex</code> 检查 ADC 文件存在性以及 <code>GOOGLE_CLOUD_PROJECT</code>/<code>GOOGLE_CLOUD_LOCATION</code>；对 <code>amazon-bedrock</code> 识别完整 AWS 凭据链（profile、access keys、bearer token、ECS URIs、web identity）。它对已配置环境凭据的 provider 返回哨兵值 <code>"&lt;authenticated&gt;"</code>，让调用方在状态 UI 中显示“已配置”而不暴露真实密钥。该模块作为 <code>ApiKeyAuth.resolve</code> 实现和 <code>compat</code> 环境注入层的后备路径；<code>Models</code> 主路径使用 provider 自身的 <code>auth.apiKey.resolve</code>。</p>
+
+<h2>图片生成（并行流水线）</h2>
+<p><code>images-models.ts</code> 镜像了聊天侧：<code>ImagesProvider</code> / <code>ImagesModels</code> / <code>createImagesProvider</code> 具有同样的认证解析和选项合并逻辑，但契约是单个 <code>Promise&lt;AssistantImages&gt;</code> 而不是流（图片生成不是流式）。失败作为 <code>stopReason: "error"</code> 的 <code>AssistantImages</code> 返回 —— 仍然是失败即值，不向调用方抛出。目前只有 <code>openrouter-images</code> 作为内置图片 provider 接入。</p>
+
+<h2>模块摘要</h2>
+<dl>
+<dt>packages/ai/src/index.ts</dt>
+<dd>核心公共 API 的桶式重新导出，无副作用。provider 工厂和 API 实现位于子路径导出；本文件故意不引入生成的目录或 OAuth 实现，以保持浏览器包体积精简。</dd>
+<dt>packages/ai/src/cli.ts</dt>
+<dd><code>npx @earendil-works/pi-ai</code> 二进制。支持 <code>login &lt;provider&gt;</code> 和 <code>list</code>；在 cwd 的 <code>auth.json</code> 中加载/保存 OAuth 凭据。没有聊天命令 —— 它只是一个认证辅助工具。</dd>
+<dt>packages/ai/src/models.ts</dt>
+<dd>运行时核心。定义 <code>Provider</code>、<code>Models</code>、<code>createModels</code>、<code>createProvider</code>，以及认证应用 + 每次请求分发逻辑。提示词 + 上下文在这里变成 <code>AssistantMessageEventStream</code>。</dd>
+<dt>packages/ai/src/auth/resolve.ts</dt>
+<dd>认证决策树：显式覆盖 → 已存凭据（带锁刷新 OAuth 或 API key）→ 环境。失败包装为 <code>ModelsError</code>，错误码为 <code>auth</code>/<code>oauth</code>。</dd>
+<dt>packages/ai/src/auth/types.ts</dt>
+<dd>认证契约：<code>CredentialStore</code>（序列化读-改-写）、<code>ApiKeyAuth</code> / <code>OAuthAuth</code>（含 <code>refresh</code>/<code>toAuth</code> 拆分，让 <code>Models</code> 拥有锁刷新模式）。</dd>
+<dt>packages/ai/src/api/anthropic-messages.ts</dt>
+<dd>参考 API 实现。将 <code>Context</code> 转换为 Anthropic <code>MessageCreateParams</code>，用正确的认证风味构建 SDK client，解码 SSE，并发出 pi 的统一事件协议。其他 <code>api/*.ts</code> 文件遵循此骨架。</dd>
+<dt>packages/ai/src/api/lazy.ts</dt>
+<dd><code>lazyStream</code> + <code>lazyApi</code> —— 同步流/异步准备桥梁，每个 <code>Models.stream</code> 和懒加载 API 包装都经过这里。准备失败变成流 error 事件。</dd>
+<dt>packages/ai/src/env-api-keys.ts</dt>
+<dd>Provider → env-var 映射，用于状态/可用性检查；识别环境 AWS 和 Google ADC 配置。供 compat 和状态 UI 使用，不参与 <code>Models</code> 请求路径。</dd>
+<dt>packages/ai/src/compat.ts</dt>
+<dd>已弃用的全局 API 表面，含 API-provider 注册表和环境 key 注入。尽可能路由到 <code>builtinModels()</code>，否则通过注册表分发。计划删除。</dd>
+<dt>packages/ai/src/utils/oauth/anthropic.ts</dt>
+<dd>Anthropic OAuth（Claude Pro/Max）：PKCE + 本地回调服务器 + 手动粘贴 code 竞速、token 交换，以及 <code>anthropicOAuth</code> <code>OAuthAuth</code> 适配器（<code>login</code>/<code>refresh</code>/<code>toAuth</code>）。</dd>
+<dt>packages/ai/src/providers/all.ts</dt>
+<dd>把所有内置 provider 工厂组装成 <code>Models</code> / <code>ImagesModels</code> 集合，并暴露带类型的静态目录读取（<code>getBuiltinModel</code>）。</dd>
+</dl>
+
+<script>
+window.__sourceMap = {
+  "caller": { "file": "packages/ai/src/models.ts", "startLine": 258, "endLine": 268 },
+  "lazyStream": { "file": "packages/ai/src/api/lazy.ts", "startLine": 39, "endLine": 56 },
+  "requireProvider": { "file": "packages/ai/src/models.ts", "startLine": 222, "endLine": 228 },
+  "applyAuth": { "file": "packages/ai/src/models.ts", "startLine": 230, "endLine": 256 },
+  "resolveAuth": { "file": "packages/ai/src/auth/resolve.ts", "startLine": 40, "endLine": 71 },
+  "decideCred": { "file": "packages/ai/src/auth/resolve.ts", "startLine": 57, "endLine": 67 },
+  "oauthStored": { "file": "packages/ai/src/auth/resolve.ts", "startLine": 59, "endLine": 61 },
+  "oauthExpiry": { "file": "packages/ai/src/auth/resolve.ts", "startLine": 94, "endLine": 94 },
+  "oauthRefresh": { "file": "packages/ai/src/auth/resolve.ts", "startLine": 86, "endLine": 113 },
+  "oauthToAuth": { "file": "packages/ai/src/auth/resolve.ts", "startLine": 115, "endLine": 119 },
+  "apiKeyStored": { "file": "packages/ai/src/auth/resolve.ts", "startLine": 62, "endLine": 64 },
+  "apiKeyResolve": { "file": "packages/ai/src/auth/resolve.ts", "startLine": 122, "endLine": 133 },
+  "ambientOnly": { "file": "packages/ai/src/auth/resolve.ts", "startLine": 69, "endLine": 70 },
+  "noAuth": { "file": "packages/ai/src/models.ts", "startLine": 244, "endLine": 245 },
+  "mergeAuth": { "file": "packages/ai/src/models.ts", "startLine": 246, "endLine": 255 },
+  "providerStream": { "file": "packages/ai/src/models.ts", "startLine": 265, "endLine": 267 },
+  "dispatchApi": { "file": "packages/ai/src/models.ts", "startLine": 331, "endLine": 345 },
+  "apiImpl": { "file": "packages/ai/src/api/anthropic-messages.ts", "startLine": 468, "endLine": 741 },
+  "setupError": { "file": "packages/ai/src/api/lazy.ts", "startLine": 49, "endLine": 53 },
+  "noProvider": { "file": "packages/ai/src/models.ts", "startLine": 224, "endLine": 226 },
+  "enter": { "file": "packages/ai/src/api/anthropic-messages.ts", "startLine": 468, "endLine": 472 },
+  "createStream": { "file": "packages/ai/src/api/anthropic-messages.ts", "startLine": 473, "endLine": 492 },
+  "hasClient": { "file": "packages/ai/src/api/anthropic-messages.ts", "startLine": 498, "endLine": 501 },
+  "buildClient": { "file": "packages/ai/src/api/anthropic-messages.ts", "startLine": 813, "endLine": 899 },
+  "assertAuth": { "file": "packages/ai/src/api/anthropic-messages.ts", "startLine": 264, "endLine": 274 },
+  "copilotHeaders": { "file": "packages/ai/src/api/anthropic-messages.ts", "startLine": 505, "endLine": 512 },
+  "buildParams": { "file": "packages/ai/src/api/anthropic-messages.ts", "startLine": 901, "endLine": 901 },
+  "onPayloadCb": { "file": "packages/ai/src/api/anthropic-messages.ts", "startLine": 530, "endLine": 533 },
+  "httpCall": { "file": "packages/ai/src/api/anthropic-messages.ts", "startLine": 539, "endLine": 540 },
+  "onResponseCb": { "file": "packages/ai/src/api/anthropic-messages.ts", "startLine": 540, "endLine": 540 },
+  "pushStart": { "file": "packages/ai/src/api/anthropic-messages.ts", "startLine": 541, "endLine": 541 },
+  "decodeSse": { "file": "packages/ai/src/api/anthropic-messages.ts", "startLine": 427, "endLine": 466 },
+  "blockEvents": { "file": "packages/ai/src/api/anthropic-messages.ts", "startLine": 546, "endLine": 546 },
+  "msgStart": { "file": "packages/ai/src/api/anthropic-messages.ts", "startLine": 547, "endLine": 559 },
+  "blockStart": { "file": "packages/ai/src/api/anthropic-messages.ts", "startLine": 560, "endLine": 601 },
+  "blockDelta": { "file": "packages/ai/src/api/anthropic-messages.ts", "startLine": 602, "endLine": 647 },
+  "blockStop": { "file": "packages/ai/src/api/anthropic-messages.ts", "startLine": 648, "endLine": 679 },
+  "msgDelta": { "file": "packages/ai/src/api/anthropic-messages.ts", "startLine": 680, "endLine": 714 },
+  "success": { "file": "packages/ai/src/api/anthropic-messages.ts", "startLine": 725, "endLine": 726 },
+  "failure": { "file": "packages/ai/src/api/anthropic-messages.ts", "startLine": 727, "endLine": 737 },
+  "cliLogin": { "file": "packages/ai/src/cli.ts", "startLine": 106, "endLine": 137 },
+  "pickProvider": { "file": "packages/ai/src/cli.ts", "startLine": 29, "endLine": 33 },
+  "startServer": { "file": "packages/ai/src/utils/oauth/anthropic.ts", "startLine": 100, "endLine": 169 },
+  "pkce": { "file": "packages/ai/src/utils/oauth/anthropic.ts", "startLine": 238, "endLine": 239 },
+  "buildAuthUrl": { "file": "packages/ai/src/utils/oauth/anthropic.ts", "startLine": 246, "endLine": 256 },
+  "notifyUrl": { "file": "packages/ai/src/utils/oauth/anthropic.ts", "startLine": 257, "endLine": 261 },
+  "userBrowser": { "file": "packages/ai/src/utils/oauth/anthropic.ts", "startLine": 31, "endLine": 32 },
+  "waitForCode": { "file": "packages/ai/src/utils/oauth/anthropic.ts", "startLine": 277, "endLine": 294 },
+  "codeArrived": { "file": "packages/ai/src/utils/oauth/anthropic.ts", "startLine": 283, "endLine": 283 },
+  "exchangeCode": { "file": "packages/ai/src/utils/oauth/anthropic.ts", "startLine": 191, "endLine": 227 },
+  "tokenResp": { "file": "packages/ai/src/utils/oauth/anthropic.ts", "startLine": 222, "endLine": 226 },
+  "saveCreds": { "file": "packages/ai/src/cli.ts", "startLine": 65, "endLine": 68 },
+  "done": { "file": "packages/ai/src/cli.ts", "startLine": 69, "endLine": 69 }
+};
+</script>
+
+<aside id="source-panel"><div id="source-header"></div><div id="monaco-container"></div></aside>
+<script src="../assets/codeindex-runtime.js"></script>
+<script src="../assets/codeindex.js"></script>
+</body>
+</html>
