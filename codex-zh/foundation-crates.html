@@ -1,0 +1,128 @@
+<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>基础能力 crate：把配置与请求变成可执行、受约束的 Codex 行为</title><link rel="stylesheet" href="assets/codeindex.css"></head><body><p><a href="index.html">← 返回总览</a></p><h1>基础能力 crate：把配置与请求变成可执行、受约束的 Codex 行为</h1>
+
+<p>这些独立 crate 不直接拥有一次对话，却共同支撑每次对话：它们先把默认值、用户配置和托管配置折叠为稳定的功能集合，再据此选择工具与执行后端；命令进入策略匹配和权限收敛后，才会被包装进平台沙箱。旁路能力负责云端策略缓存、Git 工作区识别、技能安装、密钥保护、反馈采集、提示词组装和终端识别。</p>
+
+<dl>
+<dt>输入</dt><dd>本地与云端配置、模型工具调用、命令和工作目录、调用者授予的附加权限</dd>
+<dt>输出</dt><dd>一组确定的功能开关、模型可见工具、策略判定，以及可以安全交给操作系统执行的沙箱请求</dd>
+</dl>
+
+<pre class="mermaid">
+graph TD
+  config-in["读取默认值、基础配置、配置档与临时覆盖"] --> resolve-features["按优先级合并功能开关"]
+  resolve-features --> normalize-features{"是否有依赖功能需要补齐？"}
+  normalize-features -->|是| enable-dependency["补齐协作或代码模式依赖"]
+  normalize-features -->|否| choose-tools["直接选择模型工具"]
+  enable-dependency --> choose-tools
+  choose-tools --> shell-enabled{"Shell 与统一执行是否启用？"}
+  shell-enabled -->|否| classic-shell["使用经典后端或禁用 Shell"]
+  shell-enabled -->|是| composition-enabled{"是否允许统一执行与 zsh 组合？"}
+  composition-enabled -->|是| zsh-unified["选择统一 PTY + zsh 桥接"]
+  composition-enabled -->|否| direct-unified["选择直接统一 PTY，或安全回退"]
+</pre>
+
+<p>功能注册表同时记录生命周期：稳定能力可默认开启，实验能力进入菜单，开发中能力保持关闭，已移除键只负责兼容旧配置。这样上层不必在各处重复解释旧键，也不会由一个组合开关意外开启其依赖能力。</p>
+
+<pre class="mermaid">
+graph TD
+  command-in["收到命令与可选策略文件"] --> parse-policy["解析 Starlark 策略并校验示例"]
+  parse-policy --> policy-valid{"策略是否合法？"}
+  policy-valid -->|否| reject-policy["返回带文件与行号的错误"]
+  policy-valid -->|是| exact-match["按首个程序名匹配前缀规则"]
+  exact-match --> found-rule{"找到明确规则？"}
+  found-rule -->|是| rule-decision["汇总 allow、prompt 或 deny"]
+  found-rule -->|否| host-match["尝试解析主机可执行文件别名"]
+  host-match --> host-found{"主机规则命中？"}
+  host-found -->|是| rule-decision
+  host-found -->|否| heuristic["使用调用方启发式兜底"]
+  rule-decision --> normalize-permissions["规范化临时网络与文件权限"]
+  heuristic --> normalize-permissions
+  normalize-permissions --> permission-valid{"权限路径与 glob 是否有效？"}
+  permission-valid -->|否| reject-permission["拒绝不安全的权限扩张"]
+  permission-valid -->|是| intersect-permissions["只保留请求与实际授权的交集"]
+  intersect-permissions --> choose-sandbox{"平台沙箱是否必须？"}
+  choose-sandbox -->|否| unsandboxed["保留原命令执行形态"]
+  choose-sandbox -->|是| platform-sandbox["选择 Seatbelt、bubblewrap/Landlock 或 Windows 沙箱"]
+  platform-sandbox --> transform-request["注入策略、工作目录、代理与证书后生成执行请求"]
+</pre>
+
+<p>权限链遵循“不能越授越多”：附加权限先去重并规范化路径，读权限的 glob 只允许表达拒绝；随后授权结果与原请求求交集，保留仍有约束作用的 deny 项。沙箱管理器还会依据平台、网络要求和显式偏好决定是否必须启用原生沙箱。</p>
+
+<pre class="mermaid">
+graph TD
+  startup["Codex 启动"] --> eligible{"登录身份属于受管工作区？"}
+  eligible -->|否| no-cloud["不加载云端策略"]
+  eligible -->|是| cache-read["读取并验证签名缓存"]
+  cache-read --> cache-hit{"缓存有效且身份一致？"}
+  cache-hit -->|是| snapshot-config["冻结本次启动使用的配置快照"]
+  cache-hit -->|否| fetch-cloud["带超时和鉴权恢复从后端获取"]
+  fetch-cloud --> fetch-ok{"获取且校验成功？"}
+  fetch-ok -->|否| load-error["报告可分类的加载错误"]
+  fetch-ok -->|是| save-cache["原子保存签名缓存"]
+  save-cache --> snapshot-config
+  snapshot-config --> background-refresh["后台定时刷新缓存供下次启动使用"]
+  startup --> install-skills["按内容指纹安装内置技能"]
+  startup --> detect-terminal["识别终端与复用器并形成 User-Agent"]
+  startup --> scope-secrets["按 Codex Home 与工作区隔离密钥"]
+  scope-secrets --> redact-secrets["日志或反馈输出前清除常见凭证"]
+  startup --> git-support["识别仓库、基线、分支和文件监视能力"]
+  startup --> prompt-support["把权限、评审、目标等上下文组装为有界提示片段"]
+</pre>
+
+<ul>
+<li>云配置的启动快照不会被后台刷新中途替换，避免同一次运行的策略语义漂移。</li>
+<li>技能安装使用嵌入内容指纹与 marker，内容未变化时无需重复写入。</li>
+<li>Git、文件搜索、反馈、代理和安装上下文 crate 都保持窄 API，让 core/app-server 只编排，不复制平台细节。</li>
+<li>execpolicy-legacy 仅维持旧策略格式兼容；新命令策略由 execpolicy 的解析、规则和判定模型承接。</li>
+</ul>
+
+<script>
+window.__sourceMap = {
+  "config-in":{"file":"codex-rs/features/src/lib.rs","startLine":500,"endLine":522},
+  "resolve-features":{"file":"codex-rs/features/src/lib.rs","startLine":500,"endLine":522},
+  "normalize-features":{"file":"codex-rs/features/src/lib.rs","startLine":528,"endLine":535},
+  "enable-dependency":{"file":"codex-rs/features/src/lib.rs","startLine":528,"endLine":535},
+  "choose-tools":{"file":"codex-rs/tools/src/tool_config.rs","startLine":81,"endLine":115},
+  "shell-enabled":{"file":"codex-rs/tools/src/tool_config.rs","startLine":67,"endLine":79},
+  "classic-shell":{"file":"codex-rs/tools/src/tool_config.rs","startLine":49,"endLine":55},
+  "composition-enabled":{"file":"codex-rs/tools/src/tool_config.rs","startLine":67,"endLine":79},
+  "zsh-unified":{"file":"codex-rs/tools/src/tool_config.rs","startLine":67,"endLine":79},
+  "direct-unified":{"file":"codex-rs/tools/src/tool_config.rs","startLine":81,"endLine":115},
+  "command-in":{"file":"codex-rs/execpolicy/src/policy.rs","startLine":260,"endLine":266},
+  "parse-policy":{"file":"codex-rs/execpolicy/src/parser.rs","startLine":57,"endLine":79},
+  "policy-valid":{"file":"codex-rs/execpolicy/src/parser.rs","startLine":57,"endLine":79},
+  "reject-policy":{"file":"codex-rs/execpolicy/src/parser.rs","startLine":57,"endLine":79},
+  "exact-match":{"file":"codex-rs/execpolicy/src/policy.rs","startLine":297,"endLine":305},
+  "found-rule":{"file":"codex-rs/execpolicy/src/policy.rs","startLine":268,"endLine":295},
+  "rule-decision":{"file":"codex-rs/execpolicy/src/policy.rs","startLine":268,"endLine":295},
+  "host-match":{"file":"codex-rs/execpolicy/src/policy.rs","startLine":307,"endLine":336},
+  "host-found":{"file":"codex-rs/execpolicy/src/policy.rs","startLine":307,"endLine":336},
+  "heuristic":{"file":"codex-rs/execpolicy/src/policy.rs","startLine":268,"endLine":295},
+  "normalize-permissions":{"file":"codex-rs/sandboxing/src/policy_transforms.rs","startLine":19,"endLine":69},
+  "permission-valid":{"file":"codex-rs/sandboxing/src/policy_transforms.rs","startLine":19,"endLine":69},
+  "reject-permission":{"file":"codex-rs/sandboxing/src/policy_transforms.rs","startLine":19,"endLine":69},
+  "intersect-permissions":{"file":"codex-rs/sandboxing/src/policy_transforms.rs","startLine":125,"endLine":190},
+  "choose-sandbox":{"file":"codex-rs/sandboxing/src/manager.rs","startLine":197,"endLine":224},
+  "unsandboxed":{"file":"codex-rs/sandboxing/src/manager.rs","startLine":197,"endLine":224},
+  "platform-sandbox":{"file":"codex-rs/sandboxing/src/manager.rs","startLine":197,"endLine":224},
+  "transform-request":{"file":"codex-rs/sandboxing/src/manager.rs","startLine":226,"endLine":360},
+  "startup":{"file":"codex-rs/cloud-config/src/service.rs","startLine":114,"endLine":169},
+  "eligible":{"file":"codex-rs/cloud-config/src/service.rs","startLine":47,"endLine":54},
+  "no-cloud":{"file":"codex-rs/cloud-config/src/service.rs","startLine":171,"endLine":190},
+  "cache-read":{"file":"codex-rs/cloud-config/src/cache.rs","startLine":77,"endLine":145},
+  "cache-hit":{"file":"codex-rs/cloud-config/src/service.rs","startLine":171,"endLine":220},
+  "snapshot-config":{"file":"codex-rs/cloud-config/src/service.rs","startLine":114,"endLine":169},
+  "fetch-cloud":{"file":"codex-rs/cloud-config/src/service.rs","startLine":222,"endLine":320},
+  "fetch-ok":{"file":"codex-rs/cloud-config/src/service.rs","startLine":222,"endLine":320},
+  "load-error":{"file":"codex-rs/cloud-config/src/service.rs","startLine":114,"endLine":169},
+  "save-cache":{"file":"codex-rs/cloud-config/src/cache.rs","startLine":147,"endLine":205},
+  "background-refresh":{"file":"codex-rs/cloud-config/src/bundle_loader.rs","startLine":21,"endLine":53},
+  "install-skills":{"file":"codex-rs/skills/src/lib.rs","startLine":32,"endLine":56},
+  "detect-terminal":{"file":"codex-rs/terminal-detection/src/lib.rs","startLine":276,"endLine":283},
+  "scope-secrets":{"file":"codex-rs/secrets/src/lib.rs","startLine":159,"endLine":181},
+  "redact-secrets":{"file":"codex-rs/secrets/src/sanitizer.rs","startLine":15,"endLine":22},
+  "git-support":{"file":"codex-rs/git-utils/src/operations.rs","startLine":49,"endLine":59},
+  "prompt-support":{"file":"codex-rs/prompts/src/permissions_instructions.rs","startLine":63,"endLine":143}
+};
+</script>
+<aside id="source-panel"><div id="source-header"></div><div id="monaco-container"></div></aside><script src="assets/codeindex-runtime.js"></script><script src="assets/codeindex.js"></script></body></html>

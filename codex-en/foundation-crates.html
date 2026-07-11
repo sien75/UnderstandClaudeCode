@@ -1,0 +1,128 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Foundation Crates: Turning Configuration and Requests into Executable, Constrained Codex Behavior</title><link rel="stylesheet" href="assets/codeindex.css"></head><body><p><a href="index.html">← Back to Overview</a></p><h1>Foundation Crates: Turning Configuration and Requests into Executable, Constrained Codex Behavior</h1>
+
+<p>These independent crates do not directly own a conversation, yet together they support every conversation: they first fold defaults, user configuration, and managed configuration into a stable feature set, then select tools and execution backends accordingly; commands are wrapped into platform sandbox only after policy matching and permission convergence. Bypass capabilities handle cloud policy caching, Git workspace recognition, skill installation, secret protection, feedback collection, prompt assembly, and terminal identification.</p>
+
+<dl>
+<dt>Input</dt><dd>Local and cloud configuration, model tool calls, commands and working directory, additional permissions granted by the caller</dd>
+<dt>Output</dt><dd>A set of determined feature toggles, model-visible tools, policy decisions, and sandbox requests safe for operating system execution</dd>
+</dl>
+
+<pre class="mermaid">
+graph TD
+  config-in["Read defaults, base configuration, config profiles, and temporary overrides"] --> resolve-features["Merge feature toggles by priority"]
+  resolve-features --> normalize-features{"Are there dependent features that need to be completed?"}
+  normalize-features -->|Yes| enable-dependency["Complete collaboration or code mode dependencies"]
+  normalize-features -->|No| choose-tools["Directly select model tools"]
+  enable-dependency --> choose-tools
+  choose-tools --> shell-enabled{"Is Shell and unified execution enabled?"}
+  shell-enabled -->|No| classic-shell["Use classic backend or disable Shell"]
+  shell-enabled -->|Yes| composition-enabled{"Is unified execution combined with zsh allowed?"}
+  composition-enabled -->|Yes| zsh-unified["Select unified PTY + zsh bridge"]
+  composition-enabled -->|No| direct-unified["Select direct unified PTY, or safe fallback"]
+</pre>
+
+<p>The feature registry also records lifecycle: stable capabilities can be enabled by default, experimental capabilities enter the menu, in-development capabilities remain off, and removed keys only exist for backward compatibility with old configuration. This prevents the upper layer from repeatedly explaining old keys everywhere, and avoids a combined toggle accidentally enabling its dependent capabilities.</p>
+
+<pre class="mermaid">
+graph TD
+  command-in["Receive command and optional policy file"] --> parse-policy["Parse Starlark policy and validate examples"]
+  parse-policy --> policy-valid{"Is the policy valid?"}
+  policy-valid -->|No| reject-policy["Return error with file and line number"]
+  policy-valid -->|Yes| exact-match["Match prefix rules by first program name"]
+  exact-match --> found-rule{"Found a definite rule?"}
+  found-rule -->|Yes| rule-decision["Summarize allow, prompt, or deny"]
+  found-rule -->|No| host-match["Try to resolve host executable alias"]
+  host-match --> host-found{"Host rule matched?"}
+  host-found -->|Yes| rule-decision
+  host-found -->|No| heuristic["Fallback using caller heuristic"]
+  rule-decision --> normalize-permissions["Normalize temporary network and file permissions"]
+  heuristic --> normalize-permissions
+  normalize-permissions --> permission-valid{"Are permission paths and globs valid?"}
+  permission-valid -->|No| reject-permission["Reject unsafe permission expansion"]
+  permission-valid -->|Yes| intersect-permissions["Keep only the intersection of requested and granted permissions"]
+  intersect-permissions --> choose-sandbox{"Is platform sandbox mandatory?"}
+  choose-sandbox -->|No| unsandboxed["Retain original command execution form"]
+  choose-sandbox -->|Yes| platform-sandbox["Select Seatbelt, bubblewrap/Landlock, or Windows sandbox"]
+  platform-sandbox --> transform-request["Generate execution request after injecting policy, working directory, proxy, and certificates"]
+</pre>
+
+<p>The permission chain follows the principle of "cannot grant more than authorized": additional permissions are first deduplicated and paths normalized, read permission globs only allow expression of denials; the authorization result is then intersected with the original request, retaining still-constraining deny items. The sandbox manager also decides whether native sandbox must be enabled based on platform, network requirements, and explicit preference.</p>
+
+<pre class="mermaid">
+graph TD
+  startup["Codex starts"] --> eligible{"Does the login identity belong to a managed workspace?"}
+  eligible -->|No| no-cloud["Do not load cloud policy"]
+  eligible -->|Yes| cache-read["Read and verify signed cache"]
+  cache-read --> cache-hit{"Cache valid and identity matches?"}
+  cache-hit -->|Yes| snapshot-config["Freeze configuration snapshot for this startup"]
+  cache-hit -->|No| fetch-cloud["Fetch from backend with timeout and authentication"]
+  fetch-cloud --> fetch-ok{"Fetch and verification successful?"}
+  fetch-ok -->|No| load-error["Report classifiable load error"]
+  fetch-ok -->|Yes| save-cache["Atomically save signed cache"]
+  save-cache --> snapshot-config
+  snapshot-config --> background-refresh["Background periodic cache refresh for next startup"]
+  startup --> install-skills["Install built-in skills by content fingerprint"]
+  startup --> detect-terminal["Detect terminal and multiplexer, form User-Agent"]
+  startup --> scope-secrets["Scope secrets by Codex Home and workspace"]
+  scope-secrets --> redact-secrets["Clear common credentials before log or feedback output"]
+  startup --> git-support["Identify repository, baseline, branch, and file watching capabilities"]
+  startup --> prompt-support["Assemble permissions, review, goals, and other context into bounded prompt fragments"]
+</pre>
+
+<ul>
+<li>The startup snapshot of cloud configuration is not replaced by background refresh midway, avoiding policy semantic drift within the same run.</li>
+<li>Skill installation uses embedded content fingerprints and markers; no repeated writes are needed when content has not changed.</li>
+<li>Git, file search, feedback, agent, and installation context crates all maintain narrow APIs, allowing core/app-server to orchestrate without duplicating platform details.</li>
+<li>Execpolicy-legacy only maintains compatibility with old policy format; new command policies are handled by execpolicy's parsing, rule, and decision model.</li>
+</ul>
+
+<script>
+window.__sourceMap = {
+  "config-in":{"file":"codex-rs/features/src/lib.rs","startLine":500,"endLine":522},
+  "resolve-features":{"file":"codex-rs/features/src/lib.rs","startLine":500,"endLine":522},
+  "normalize-features":{"file":"codex-rs/features/src/lib.rs","startLine":528,"endLine":535},
+  "enable-dependency":{"file":"codex-rs/features/src/lib.rs","startLine":528,"endLine":535},
+  "choose-tools":{"file":"codex-rs/tools/src/tool_config.rs","startLine":81,"endLine":115},
+  "shell-enabled":{"file":"codex-rs/tools/src/tool_config.rs","startLine":67,"endLine":79},
+  "classic-shell":{"file":"codex-rs/tools/src/tool_config.rs","startLine":49,"endLine":55},
+  "composition-enabled":{"file":"codex-rs/tools/src/tool_config.rs","startLine":67,"endLine":79},
+  "zsh-unified":{"file":"codex-rs/tools/src/tool_config.rs","startLine":67,"endLine":79},
+  "direct-unified":{"file":"codex-rs/tools/src/tool_config.rs","startLine":81,"endLine":115},
+  "command-in":{"file":"codex-rs/execpolicy/src/policy.rs","startLine":260,"endLine":266},
+  "parse-policy":{"file":"codex-rs/execpolicy/src/parser.rs","startLine":57,"endLine":79},
+  "policy-valid":{"file":"codex-rs/execpolicy/src/parser.rs","startLine":57,"endLine":79},
+  "reject-policy":{"file":"codex-rs/execpolicy/src/parser.rs","startLine":57,"endLine":79},
+  "exact-match":{"file":"codex-rs/execpolicy/src/policy.rs","startLine":297,"endLine":305},
+  "found-rule":{"file":"codex-rs/execpolicy/src/policy.rs","startLine":268,"endLine":295},
+  "rule-decision":{"file":"codex-rs/execpolicy/src/policy.rs","startLine":268,"endLine":295},
+  "host-match":{"file":"codex-rs/execpolicy/src/policy.rs","startLine":307,"endLine":336},
+  "host-found":{"file":"codex-rs/execpolicy/src/policy.rs","startLine":307,"endLine":336},
+  "heuristic":{"file":"codex-rs/execpolicy/src/policy.rs","startLine":268,"endLine":295},
+  "normalize-permissions":{"file":"codex-rs/sandboxing/src/policy_transforms.rs","startLine":19,"endLine":69},
+  "permission-valid":{"file":"codex-rs/sandboxing/src/policy_transforms.rs","startLine":19,"endLine":69},
+  "reject-permission":{"file":"codex-rs/sandboxing/src/policy_transforms.rs","startLine":19,"endLine":69},
+  "intersect-permissions":{"file":"codex-rs/sandboxing/src/policy_transforms.rs","startLine":125,"endLine":190},
+  "choose-sandbox":{"file":"codex-rs/sandboxing/src/manager.rs","startLine":197,"endLine":224},
+  "unsandboxed":{"file":"codex-rs/sandboxing/src/manager.rs","startLine":197,"endLine":224},
+  "platform-sandbox":{"file":"codex-rs/sandboxing/src/manager.rs","startLine":197,"endLine":224},
+  "transform-request":{"file":"codex-rs/sandboxing/src/manager.rs","startLine":226,"endLine":360},
+  "startup":{"file":"codex-rs/cloud-config/src/service.rs","startLine":114,"endLine":169},
+  "eligible":{"file":"codex-rs/cloud-config/src/service.rs","startLine":47,"endLine":54},
+  "no-cloud":{"file":"codex-rs/cloud-config/src/service.rs","startLine":171,"endLine":190},
+  "cache-read":{"file":"codex-rs/cloud-config/src/cache.rs","startLine":77,"endLine":145},
+  "cache-hit":{"file":"codex-rs/cloud-config/src/service.rs","startLine":171,"endLine":220},
+  "snapshot-config":{"file":"codex-rs/cloud-config/src/service.rs","startLine":114,"endLine":169},
+  "fetch-cloud":{"file":"codex-rs/cloud-config/src/service.rs","startLine":222,"endLine":320},
+  "fetch-ok":{"file":"codex-rs/cloud-config/src/service.rs","startLine":222,"endLine":320},
+  "load-error":{"file":"codex-rs/cloud-config/src/service.rs","startLine":114,"endLine":169},
+  "save-cache":{"file":"codex-rs/cloud-config/src/cache.rs","startLine":147,"endLine":205},
+  "background-refresh":{"file":"codex-rs/cloud-config/src/bundle_loader.rs","startLine":21,"endLine":53},
+  "install-skills":{"file":"codex-rs/skills/src/lib.rs","startLine":32,"endLine":56},
+  "detect-terminal":{"file":"codex-rs/terminal-detection/src/lib.rs","startLine":276,"endLine":283},
+  "scope-secrets":{"file":"codex-rs/secrets/src/lib.rs","startLine":159,"endLine":181},
+  "redact-secrets":{"file":"codex-rs/secrets/src/sanitizer.rs","startLine":15,"endLine":22},
+  "git-support":{"file":"codex-rs/git-utils/src/operations.rs","startLine":49,"endLine":59},
+  "prompt-support":{"file":"codex-rs/prompts/src/permissions_instructions.rs","startLine":63,"endLine":143}
+};
+</script>
+<aside id="source-panel"><div id="source-header"></div><div id="monaco-container"></div></aside><script src="assets/codeindex-runtime.js"></script><script src="assets/codeindex.js"></script></body></html>

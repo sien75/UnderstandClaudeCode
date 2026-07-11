@@ -1,0 +1,120 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Agent Thread Protocol, State, History Persistence, and Recovery</title><link rel="stylesheet" href="assets/codeindex.css"></head><body><p><a href="index.html">← Back to Overview</a></p><h1>Agent Thread Protocol, State, History Persistence, and Recovery</h1>
+
+<p>An external client submits a user input, approval reply, or thread control action to Codex; the system turns it into an event stream with an associated ID, while writing recoverable session entries to rollout and queryable indexes and derived state to SQLite. When recovering a thread, the system first re-establishes a "live thread" handle, then loads history and rebuilds metadata; if initialization fails midway, it actively discards the half-baked result to avoid leaving a seemingly recoverable but incomplete thread.</p>
+
+<dl>
+<dt>Input</dt>
+<dd>User input, thread settings, approval replies, thread rollback/compression/close actions, and inter-agent communication.</dd>
+<dt>Output</dt>
+<dd>Associated event streams consumable by the client, JSONL history replayable line by line, paginated SQLite thread index, and derived state such as sub-agent relationships, memory, and traces.</dd>
+</dl>
+
+<pre class="mermaid">
+graph TD
+  submit-op["Client submits thread operation"] --> classify-op{"What type of operation?"}
+  classify-op -->|new input or settings| emit-event["Generate event with associated ID"]
+  classify-op -->|approval or tool reply| emit-event
+  classify-op -->|interrupt, rollback, compress, or close| emit-event
+  classify-op -->|agent communication| agent-message["Convert to model-visible agent message"]
+  agent-message --> emit-event
+  emit-event --> canonical-item["Filter persistable canonical history items"]
+  canonical-item --> append-live["Append item to live thread and observe metadata"]
+  append-live --> metadata-change{"Metadata changed such as title, preview, or time?"}
+  metadata-change -->|Yes| sync-metadata["Sync thread metadata"]
+  metadata-change -->|No| continue-run["Continue current thread"]
+  sync-metadata --> continue-run
+</pre>
+
+<p>The protocol layer separates "what is submitted" from "what happened": Op is the command from client to thread, EventMsg is the status and output from thread to client. Event.id re-associates asynchronous events back to the original submission; although agent communication goes through the normal submission lifecycle, it is first encoded as model history items, so inter-agent context is preserved after recovery.</p>
+
+<pre class="mermaid">
+graph TD
+  create-or-resume{"Create or resume?"}
+  create-or-resume -->|create| create-thread["Register new thread and prepare metadata synchronizer"]
+  create-or-resume -->|resume| resume-thread["Register thread being resumed"]
+  resume-thread --> history-provided{"Has the caller provided history?"}
+  history-provided -->|Yes| ready-live["Establish live thread handle"]
+  history-provided -->|No| load-history["Load canonical history from storage"]
+  load-history --> load-ok{"History loaded successfully?"}
+  load-ok -->|No| discard-partial["Discard half-resumed thread"]
+  load-ok -->|Yes| ready-live
+  create-thread --> init-ok{"Upper layer initialization successful?"}
+  ready-live --> init-ok
+  init-ok -->|No| init-guard["Initialization guard auto-cleans persisted state"]
+  init-ok -->|Yes| commit-live["Commit guard, thread enters normal operation"]
+  commit-live --> flush-choice{"What persistence guarantee is needed?"}
+  flush-choice -->|persist| persist-thread["Force materialize history file"]
+  flush-choice -->|flush| flush-thread["Wait for previous writes to flush"]
+  flush-choice -->|shutdown| shutdown-thread["Flush metadata and close background writer"]
+</pre>
+
+<p>Local thread storage treats the rollout file as a compatible and replayable fact stream, and SQLite as a fast query and derived state layer. The writer receives append, persist, flush, and close commands serially through a dedicated task; file creation can be deferred when not yet materialized, and on failure the termination error is retained for subsequent API returns. List reading prefers the state store, falling back to scanning rollout when missing or needing repair, and backfills discovered metadata into the index.</p>
+
+<pre class="mermaid">
+graph TD
+  persist-items["Send canonical items to background writer"] --> deferred-file{"History file already materialized?"}
+  deferred-file -->|No| queue-items["Queue items, wait for persistence needed"]
+  deferred-file -->|Yes| write-jsonl["Serialize items one by one as JSONL"]
+  queue-items --> force-materialize{"Received persist or shutdown?"}
+  force-materialize -->|No| keep-deferred["Maintain deferred state"]
+  force-materialize -->|Yes| write-meta["First write session metadata header line"]
+  write-meta --> write-jsonl
+  write-jsonl --> write-ok{"Write successful?"}
+  write-ok -->|No| recovery-mode["Enter recovery mode and retain pending items"]
+  write-ok -->|Yes| update-index["Write thread summary and time into SQLite index"]
+  recovery-mode --> retry-open["Reopen file on next operation and retry"]
+  retry-open --> write-jsonl
+  update-index --> derived-state["Update sub-agent graph, memory, and trace derived state"]
+  derived-state --> searchable["Threads are paginated, searchable, recoverable, and auditable"]
+</pre>
+
+<ul>
+<li>State machine boundary: thread goes from initializing, active, archived to deleted; sub-agent goes from open to closed, descendant queries are provided by SQLite graph relationships.</li>
+<li>Recovery boundary: rollout retains original order, SQLite can be backfilled from rollout; so index corruption does not equal history loss.</li>
+<li>Context fragments are identified by explicit start/end markers, avoiding confusion between normal user text and system-injected content during recovery or compression.</li>
+<li>Memory writes go through phased extraction, integration, and saving, with the read side attaching references and usage information; it is a derived result of thread history, not a replacement for rollout.</li>
+<li>Rollout-trace reduces protocol events into thread, reasoning, tool, and compression traces, serving as a diagnostic view; write failures use best-effort strategy and do not block the main thread.</li>
+</ul>
+
+<script>
+window.__sourceMap = {
+  "submit-op": {"file":"codex-rs/protocol/src/protocol.rs","startLine":499,"endLine":657},
+  "classify-op": {"file":"codex-rs/protocol/src/protocol.rs","startLine":499,"endLine":657},
+  "emit-event": {"file":"codex-rs/protocol/src/protocol.rs","startLine":1197,"endLine":1205},
+  "agent-message": {"file":"codex-rs/protocol/src/protocol.rs","startLine":668,"endLine":731},
+  "canonical-item": {"file":"codex-rs/thread-store/src/live_thread.rs","startLine":142,"endLine":174},
+  "append-live": {"file":"codex-rs/thread-store/src/live_thread.rs","startLine":142,"endLine":174},
+  "metadata-change": {"file":"codex-rs/thread-store/src/thread_metadata_sync.rs","startLine":103,"endLine":216},
+  "sync-metadata": {"file":"codex-rs/thread-store/src/live_thread.rs","startLine":142,"endLine":174},
+  "continue-run": {"file":"codex-rs/thread-store/src/live_thread.rs","startLine":86,"endLine":266},
+  "create-or-resume": {"file":"codex-rs/thread-store/src/live_thread.rs","startLine":86,"endLine":141},
+  "create-thread": {"file":"codex-rs/thread-store/src/live_thread.rs","startLine":87,"endLine":101},
+  "resume-thread": {"file":"codex-rs/thread-store/src/live_thread.rs","startLine":103,"endLine":141},
+  "history-provided": {"file":"codex-rs/thread-store/src/live_thread.rs","startLine":103,"endLine":141},
+  "ready-live": {"file":"codex-rs/thread-store/src/live_thread.rs","startLine":103,"endLine":141},
+  "load-history": {"file":"codex-rs/thread-store/src/live_thread.rs","startLine":103,"endLine":141},
+  "load-ok": {"file":"codex-rs/thread-store/src/live_thread.rs","startLine":103,"endLine":141},
+  "discard-partial": {"file":"codex-rs/thread-store/src/live_thread.rs","startLine":103,"endLine":141},
+  "init-ok": {"file":"codex-rs/thread-store/src/live_thread.rs","startLine":42,"endLine":84},
+  "init-guard": {"file":"codex-rs/thread-store/src/live_thread.rs","startLine":42,"endLine":84},
+  "commit-live": {"file":"codex-rs/thread-store/src/live_thread.rs","startLine":46,"endLine":67},
+  "flush-choice": {"file":"codex-rs/thread-store/src/live_thread.rs","startLine":176,"endLine":193},
+  "persist-thread": {"file":"codex-rs/thread-store/src/live_thread.rs","startLine":176,"endLine":179},
+  "flush-thread": {"file":"codex-rs/thread-store/src/live_thread.rs","startLine":181,"endLine":185},
+  "shutdown-thread": {"file":"codex-rs/thread-store/src/live_thread.rs","startLine":187,"endLine":193},
+  "persist-items": {"file":"codex-rs/rollout/src/recorder.rs","startLine":811,"endLine":827},
+  "deferred-file": {"file":"codex-rs/rollout/src/recorder.rs","startLine":1469,"endLine":1625},
+  "queue-items": {"file":"codex-rs/rollout/src/recorder.rs","startLine":1488,"endLine":1490},
+  "write-jsonl": {"file":"codex-rs/rollout/src/recorder.rs","startLine":1720,"endLine":1742},
+  "force-materialize": {"file":"codex-rs/rollout/src/recorder.rs","startLine":1501,"endLine":1517},
+  "keep-deferred": {"file":"codex-rs/rollout/src/recorder.rs","startLine":1546,"endLine":1548},
+  "write-meta": {"file":"codex-rs/rollout/src/recorder.rs","startLine":1583,"endLine":1590},
+  "write-ok": {"file":"codex-rs/rollout/src/recorder.rs","startLine":1519,"endLine":1544},
+  "recovery-mode": {"file":"codex-rs/rollout/src/recorder.rs","startLine":1550,"endLine":1563},
+  "update-index": {"file":"codex-rs/state/src/runtime/threads.rs","startLine":870,"endLine":914},
+  "retry-open": {"file":"codex-rs/rollout/src/recorder.rs","startLine":1565,"endLine":1581},
+  "derived-state": {"file":"codex-rs/agent-graph-store/src/local.rs","startLine":31,"endLine":92},
+  "searchable": {"file":"codex-rs/state/src/runtime/threads.rs","startLine":399,"endLine":450}
+};
+</script>
+<aside id="source-panel"><div id="source-header"></div><div id="monaco-container"></div></aside><script src="assets/codeindex-runtime.js"></script><script src="assets/codeindex.js"></script></body></html>

@@ -1,0 +1,107 @@
+<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>支撑服务：把配置与扩展变成可控、可通信、可观测的代理能力</title><link rel="stylesheet" href="assets/codeindex.css"></head><body><p><a href="index.html">← 返回总览</a></p><h1>支撑服务：把配置与扩展变成可控、可通信、可观测的代理能力</h1>
+
+<p>这一组 crate 不直接决定代理如何推理，而是把本地配置、插件市场、技能、Hook、MCP、网络访问、云端任务和遥测接到代理运行时。对用户而言，触发点通常是启用插件、添加市场、启动一次任务、允许一次联网，或配置观测出口；系统随后完成发现、校验、物化、注册、执行和回传。</p>
+
+<dl>
+  <dt>输入</dt>
+  <dd>分层配置、插件或技能声明、Hook 事件、MCP 调用、模型 API 请求、网络策略与云任务命令</dd>
+  <dt>输出</dt>
+  <dd>已注册的代理能力、受策略约束的外部通信、可恢复的云端任务结果，以及日志、指标和分析事件</dd>
+</dl>
+
+<p>插件数据流从配置层与远端已安装状态汇合开始。加载器按插件逐个读取 manifest，并把技能、MCP server、App connector 和 Hook 组合为统一结果；管理器串行化刷新、缓存和安装，安装时先物化来源，再原子写入插件仓库和用户配置。产品限制在“准入”阶段执行，运行期只消费已经准入的内容。</p>
+
+<pre class="mermaid">
+graph TD
+  plugin-entry["调用插件公共入口"] --> manager-create["创建插件管理器并绑定 CODEX_HOME"]
+  manager-create --> load-stack["合并分层配置与远端安装状态"]
+  load-stack --> load-scope{"只加载 Hook，还是全部能力？"}
+  load-scope -->|全部| capability-load["装载技能、MCP、App 与 Hook"]
+  load-scope -->|Hook| hook-only["只解析启用插件的 Hook"]
+  plugin-entry --> install-request["用户请求安装插件"]
+  install-request --> remote-sync{"是否需要同步远端安装状态？"}
+  remote-sync -->|是| remote-enable["先通知远端启用插件"]
+  remote-sync -->|否| materialize["物化本地或 Git 来源"]
+  remote-enable --> materialize
+  materialize --> persist-enable["写入版本仓库并启用用户配置"]
+  persist-enable --> analytics-install["记录安装分析事件"]
+</pre>
+
+<p>扩展 API 把不同能力收束为类型化 contributor 注册表：配置、上下文、工具、MCP、审批、线程和回合生命周期都有独立插槽。Hook 是另一条显式生命周期边界；它把事件序列化后交给已发现的命令，按匹配规则执行，并允许前置 Hook 拒绝工具或修改输入。权限请求因此既能由内建策略决定，也能被外部 Hook 审阅。</p>
+
+<pre class="mermaid">
+graph TD
+  extension-registry["宿主创建扩展注册表"] --> register-slots["按能力注册贡献者"]
+  register-slots --> runtime-contribution{"运行时需要哪类贡献？"}
+  runtime-contribution -->|上下文与工具| prompt-tools["向回合注入提示、工具和 MCP"]
+  runtime-contribution -->|生命周期| hook-build["从配置与插件声明构建 Hook 引擎"]
+  hook-build --> dispatch-hook["事件到来后按顺序执行 Hook"]
+  dispatch-hook --> abort-check{"Hook 是否要求中止？"}
+  abort-check -->|是| deny-operation["停止后续处理并返回拒绝"]
+  abort-check -->|否| continue-operation["继续工具、回合或压缩流程"]
+</pre>
+
+<p>通信侧分成三层：codex-api 负责把内部请求编码为 Responses、WebSocket、搜索、图片等 HTTP 协议并解析流；rmcp-client 负责 stdio、进程内或 streamable HTTP 的 MCP 会话及 OAuth；network-proxy 在真正出网前统一应用域名、Unix socket、MITM 和动态审批策略。网络拒绝会被观察者记录，而不是静默失败。</p>
+
+<pre class="mermaid">
+graph TD
+  api-client["代理生成模型或工具请求"] --> encode-response["编码请求并补充会话追踪头"]
+  encode-response --> transport-choice{"目标通信协议？"}
+  transport-choice -->|OpenAI API| stream-api["发送 HTTP 请求并解析 SSE 流"]
+  transport-choice -->|MCP| mcp-connect["建立进程内、stdio 或 HTTP 会话"]
+  mcp-connect --> oauth-check{"远端是否要求 OAuth？"}
+  oauth-check -->|是| oauth-login["发现授权端点并保存令牌"]
+  oauth-check -->|否| proxy-policy["进入统一网络代理策略"]
+  oauth-login --> proxy-policy
+  stream-api --> proxy-policy
+  proxy-policy --> network-decision{"域名与协议是否获准？"}
+  network-decision -->|拒绝| blocked-observer["回报被阻止请求及原因"]
+  network-decision -->|允许| upstream["连接上游并回传流式结果"]
+</pre>
+
+<p>其余支撑链条各自承担明确边界：config 将系统、用户、项目、云端要求与运行时覆盖合并，并保留来源和诊断；core-skills 发现、筛选、渲染并按提及注入技能；connectors 合并目录与缓存中的 App 元数据；cloud-tasks 提供云任务创建、环境检测、轮询和差异展示；external-agent 模块迁移其他代理的 MCP、Hook、命令与会话；analytics 把原始事实归并成产品事件；otel 安装日志、Trace 与指标 exporter，并在关闭时 flush。utils 下的小 crate 提供路径、PTY、流式文本解析、图片、模板、缓存、休眠抑制等无业务状态的基础能力。</p>
+
+<ul>
+  <li>配置是权限与生命周期的共同根：插件准入、技能禁用、Hook 信任和网络约束都从可追踪的配置层派生。</li>
+  <li>远端插件、MCP OAuth、模型 API、云任务和 OTLP exporter 都是外部通信边界，失败会转成领域错误或诊断信息。</li>
+  <li>插件缓存与远端刷新使用串行化状态，避免并发刷新覆盖；遥测和分析事件通过队列与去重限制控制容量。</li>
+  <li>测试、生成 schema/protobuf 和固定模板未作为运行时实现展开；小型工具 crate 已按公开 API 和归属完成映射。</li>
+</ul>
+
+<script>
+window.__sourceMap = {
+  "plugin-entry": {"file":"codex-rs/core-plugins/src/lib.rs","startLine":1,"endLine":59},
+  "manager-create": {"file":"codex-rs/core-plugins/src/manager.rs","startLine":388,"endLine":423},
+  "load-stack": {"file":"codex-rs/core-plugins/src/loader.rs","startLine":132,"endLine":169},
+  "load-scope": {"file":"codex-rs/core-plugins/src/loader.rs","startLine":70,"endLine":77},
+  "capability-load": {"file":"codex-rs/core-plugins/src/loader.rs","startLine":111,"endLine":130},
+  "hook-only": {"file":"codex-rs/core-plugins/src/loader.rs","startLine":171,"endLine":197},
+  "install-request": {"file":"codex-rs/core-plugins/src/manager.rs","startLine":1078,"endLine":1088},
+  "remote-sync": {"file":"codex-rs/core-plugins/src/manager.rs","startLine":1090,"endLine":1111},
+  "remote-enable": {"file":"codex-rs/core-plugins/src/manager.rs","startLine":1090,"endLine":1111},
+  "materialize": {"file":"codex-rs/core-plugins/src/manager.rs","startLine":1113,"endLine":1171},
+  "persist-enable": {"file":"codex-rs/core-plugins/src/manager.rs","startLine":1113,"endLine":1171},
+  "analytics-install": {"file":"codex-rs/core-plugins/src/manager.rs","startLine":1113,"endLine":1171},
+  "extension-registry": {"file":"codex-rs/ext/extension-api/src/registry.rs","startLine":35,"endLine":80},
+  "register-slots": {"file":"codex-rs/ext/extension-api/src/registry.rs","startLine":82,"endLine":158},
+  "runtime-contribution": {"file":"codex-rs/ext/extension-api/src/registry.rs","startLine":160,"endLine":177},
+  "prompt-tools": {"file":"codex-rs/ext/extension-api/src/registry.rs","startLine":179,"endLine":241},
+  "hook-build": {"file":"codex-rs/hooks/src/registry.rs","startLine":60,"endLine":82},
+  "dispatch-hook": {"file":"codex-rs/hooks/src/registry.rs","startLine":94,"endLine":107},
+  "abort-check": {"file":"codex-rs/hooks/src/registry.rs","startLine":94,"endLine":107},
+  "deny-operation": {"file":"codex-rs/hooks/src/registry.rs","startLine":94,"endLine":107},
+  "continue-operation": {"file":"codex-rs/hooks/src/registry.rs","startLine":94,"endLine":107},
+  "api-client": {"file":"codex-rs/codex-api/src/lib.rs","startLine":1,"endLine":109},
+  "encode-response": {"file":"codex-rs/codex-api/src/endpoint/responses.rs","startLine":71,"endLine":107},
+  "transport-choice": {"file":"codex-rs/rmcp-client/src/lib.rs","startLine":1,"endLine":39},
+  "stream-api": {"file":"codex-rs/codex-api/src/endpoint/responses.rs","startLine":137,"endLine":172},
+  "mcp-connect": {"file":"codex-rs/rmcp-client/src/rmcp_client.rs","startLine":314,"endLine":332},
+  "oauth-check": {"file":"codex-rs/rmcp-client/src/auth_status.rs","startLine":46,"endLine":112},
+  "oauth-login": {"file":"codex-rs/rmcp-client/src/perform_oauth_login.rs","startLine":164,"endLine":229},
+  "proxy-policy": {"file":"codex-rs/network-proxy/src/proxy.rs","startLine":167,"endLine":287},
+  "network-decision": {"file":"codex-rs/network-proxy/src/network_policy.rs","startLine":335,"endLine":398},
+  "blocked-observer": {"file":"codex-rs/network-proxy/src/runtime.rs","startLine":124,"endLine":155},
+  "upstream": {"file":"codex-rs/network-proxy/src/proxy.rs","startLine":697,"endLine":770}
+};
+</script>
+<aside id="source-panel"><div id="source-header"></div><div id="monaco-container"></div></aside><script src="assets/codeindex-runtime.js"></script><script src="assets/codeindex.js"></script></body></html>

@@ -1,0 +1,128 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>App Server and CLI Management Surface</title><link rel="stylesheet" href="assets/codeindex.css"></head><body><p><a href="index.html">← Back to Overview</a></p><h1>App Server and CLI Management Surface</h1>
+
+<p>This module describes how desktops, IDEs, scripts, or administrators control sessions, turns, accounts, plugins, MCP, remote control, and isolated execution through Codex's public JSON-RPC API and command line. External input is first restored into typed requests by the protocol layer, then passes through connection initialization, experimental capabilities, and permission boundaries, and is finally serialized by resource scope and delivered to the corresponding processor; results and ongoing events are returned along the original connection.</p>
+
+<dl>
+  <dt>Input</dt>
+  <dd>CLI subcommands, or JSON-RPC requests and notifications from stdio, WebSocket, Unix socket, or remote control channels</dd>
+  <dt>Output</dt>
+  <dd>Typed responses, errors, and ongoing notifications; or a remote execution environment constrained by session and filesystem boundaries</dd>
+</dl>
+
+<p>The backbone of the public API is not a set of independent handlers. Protocol macros first bind parameters, responses, experimental flags, and serialization scope to each method; the message processor then performs connection-level checks and dispatches calls to thread, turn, account, plugin, MCP, filesystem, or process processors. This ensures that write operations on the same thread or process do not cross each other, while unrelated resources can still be processed concurrently.</p>
+
+<pre class="mermaid">
+graph TD
+  api-catalog["Declare public methods, parameters, responses, and resource scopes"] --> decode-request["Restore JSON-RPC into typed request"]
+  decode-request --> initialized-check{"Is the connection initialized"}
+  initialized-check -->|no and not initialize| init-error["Return not-initialized error"]
+  initialized-check -->|initialize request| initialize-connection["Record client capabilities and establish connection session"]
+  initialized-check -->|yes| experimental-check{"Does the experimental method have client declaration"}
+  experimental-check -->|no| experimental-error["Reject unnegotiated experimental API"]
+  experimental-check -->|yes| permission-check{"Does the request pass the connection permission gate"}
+  permission-check -->|no| permission-error["Return permission error"]
+  permission-check -->|yes| serialize-scope["Queue by thread, process, watch, or global resource"]
+  serialize-scope --> dispatch-domain["Dispatch to corresponding business processor"]
+  dispatch-domain --> processor-result{"Processor result"}
+  processor-result -->|success with response| typed-response["Encode typed success response"]
+  processor-result -->|async operation taken over| async-events["Subsequently returned via notifications"]
+  processor-result -->|failure| typed-error["Encode JSON-RPC error"]
+</pre>
+
+<p>The communication layer places the same message semantics on different carriers: local CLI commonly uses stdio, desktop applications and daemons can use Unix socket or WebSocket, and remote control forwards connections after authentication, pairing, and desired state synchronization. The transport layer is only responsible for connection, framing, and outbound backpressure; request semantics remain under the unified message processor.</p>
+
+<pre class="mermaid">
+graph TD
+  choose-transport["Select stdio, WebSocket, Unix socket, or remote control"] --> start-app-server["Start App Server and establish shared service state"]
+  start-app-server --> accept-connection["Accept connection and create connection-level session"]
+  accept-connection --> auth-boundary{"Does this transport require authentication or pairing"}
+  auth-boundary -->|failure| close-connection["Reject and close connection"]
+  auth-boundary -->|passed or locally trusted| read-message["Read JSON-RPC message"]
+  read-message --> route-message{"Message type"}
+  route-message -->|request| process-api["Enter public API check and dispatch"]
+  route-message -->|notification| process-notification["Process client events that don't require response"]
+  route-message -->|response| resolve-server-call["Complete server-initiated reverse call"]
+  process-api --> outbound-queue["Push response or notification into bounded outbound queue"]
+  process-notification --> outbound-queue
+  resolve-server-call --> outbound-queue
+  outbound-queue --> write-frame["Write back to original connection"]
+</pre>
+
+<p>The CLI management surface can both directly start an interactive Codex session and manage a long-running App Server. The `app-server` subcommand handles the service lifecycle, remote control toggle, proxy, and protocol artifacts; the independent `exec-server` is designed for executors, wrapping processes, filesystems, and HTTP requests into JSON-RPC, and constraining resources with initialization sessions, process registration tables, and sandbox context.</p>
+
+<pre class="mermaid">
+graph TD
+  parse-cli["Parse top-level CLI and configuration overrides"] --> choose-command{"Which type of operation does the user select"}
+  choose-command -->|interactive, exec, resume, review| run-product["Enter interactive or batch product flow"]
+  choose-command -->|app-server| appserver-command{"Select service management operation"}
+  appserver-command -->|direct run| run-appserver-cli["Start App Server with foreground transport"]
+  appserver-command -->|start, stop, restart, status| daemon-lifecycle["Daemon manages PID, version, and updates"]
+  appserver-command -->|remote control| remote-control["Enable/disable and probe remote control connection status"]
+  appserver-command -->|proxy| proxy-server["Proxy to an already running local service"]
+  appserver-command -->|export protocol artifacts| export-schema["Export TypeScript or JSON Schema"]
+  choose-command -->|exec-server| run-execserver["Start isolated execution JSON-RPC service"]
+  run-execserver --> exec-transport{"Select stdio or local WebSocket"}
+  exec-transport --> exec-processor["Establish RPC processing loop for connection"]
+  exec-processor --> exec-router{"Route by method"}
+  exec-router -->|process| process-handler["Start, read/write, signal, or terminate process"]
+  exec-router -->|filesystem| filesystem-handler["Read, write, and traverse files within sandbox context"]
+  exec-router -->|HTTP| http-handler["Proxy requests and stream response body"]
+  exec-router -->|unknown or uninitialized| exec-error["Return protocol error"]
+</pre>
+
+<ul>
+  <li>Type boundary: v2 request fields use camelCase on the wire, with the exception of configure RPC which keeps snake_case consistent with config.toml; method parameters, responses, and notifications can jointly generate TypeScript and JSON Schema.</li>
+  <li>Permission boundary: Initialization capabilities determine whether experimental APIs are visible; the connection permission gate restricts high-risk methods; exec-server additionally checks initialization order, session ownership, and filesystem sandbox context.</li>
+  <li>Compatibility boundary: The protocol still retains v1 mapping, but new APIs are concentrated in v2; clients can either embed the in-process service or connect to a remote one via Unix socket or WebSocket.</li>
+  <li>Execution results may not be one-shot responses: long command output, turn items, approval requests, account status, and remote control status can all be pushed via server notifications.</li>
+</ul>
+
+<script>
+window.__sourceMap = {
+  "api-catalog": {"file":"codex-rs/app-server-protocol/src/protocol/common.rs","startLine":466,"endLine":1412},
+  "decode-request": {"file":"codex-rs/app-server/src/message_processor.rs","startLine":98,"endLine":112},
+  "initialized-check": {"file":"codex-rs/app-server/src/message_processor.rs","startLine":807,"endLine":850},
+  "init-error": {"file":"codex-rs/app-server/src/message_processor.rs","startLine":807,"endLine":850},
+  "initialize-connection": {"file":"codex-rs/app-server/src/message_processor.rs","startLine":704,"endLine":711},
+  "experimental-check": {"file":"codex-rs/app-server/src/message_processor.rs","startLine":852,"endLine":913},
+  "experimental-error": {"file":"codex-rs/app-server/src/message_processor.rs","startLine":852,"endLine":913},
+  "permission-check": {"file":"codex-rs/app-server/src/message_processor.rs","startLine":915,"endLine":1486},
+  "permission-error": {"file":"codex-rs/app-server/src/message_processor.rs","startLine":915,"endLine":1486},
+  "serialize-scope": {"file":"codex-rs/app-server/src/message_processor.rs","startLine":687,"endLine":702},
+  "dispatch-domain": {"file":"codex-rs/app-server/src/message_processor.rs","startLine":915,"endLine":1486},
+  "processor-result": {"file":"codex-rs/app-server/src/message_processor.rs","startLine":915,"endLine":1486},
+  "typed-response": {"file":"codex-rs/app-server/src/message_processor.rs","startLine":915,"endLine":1486},
+  "async-events": {"file":"codex-rs/app-server/src/message_processor.rs","startLine":915,"endLine":1486},
+  "typed-error": {"file":"codex-rs/app-server/src/message_processor.rs","startLine":915,"endLine":1486},
+  "choose-transport": {"file":"codex-rs/app-server-transport/src/transport/mod.rs","startLine":73,"endLine":79},
+  "start-app-server": {"file":"codex-rs/app-server/src/lib.rs","startLine":388,"endLine":431},
+  "accept-connection": {"file":"codex-rs/app-server/src/lib.rs","startLine":433,"endLine":675},
+  "auth-boundary": {"file":"codex-rs/app-server-transport/src/transport/auth.rs","startLine":21,"endLine":91},
+  "close-connection": {"file":"codex-rs/app-server-transport/src/transport/auth.rs","startLine":21,"endLine":91},
+  "read-message": {"file":"codex-rs/app-server/src/message_processor.rs","startLine":572,"endLine":628},
+  "route-message": {"file":"codex-rs/app-server/src/message_processor.rs","startLine":572,"endLine":628},
+  "process-api": {"file":"codex-rs/app-server/src/message_processor.rs","startLine":630,"endLine":672},
+  "process-notification": {"file":"codex-rs/app-server/src/message_processor.rs","startLine":674,"endLine":685},
+  "resolve-server-call": {"file":"codex-rs/app-server/src/message_processor.rs","startLine":795,"endLine":805},
+  "outbound-queue": {"file":"codex-rs/app-server-transport/src/outgoing_message.rs","startLine":13,"endLine":47},
+  "write-frame": {"file":"codex-rs/app-server-transport/src/transport/websocket.rs","startLine":91,"endLine":190},
+  "parse-cli": {"file":"codex-rs/cli/src/main.rs","startLine":963,"endLine":1647},
+  "choose-command": {"file":"codex-rs/cli/src/main.rs","startLine":123,"endLine":212},
+  "run-product": {"file":"codex-rs/cli/src/main.rs","startLine":963,"endLine":1647},
+  "appserver-command": {"file":"codex-rs/cli/src/main.rs","startLine":591,"endLine":608},
+  "run-appserver-cli": {"file":"codex-rs/app-server/src/lib.rs","startLine":388,"endLine":431},
+  "daemon-lifecycle": {"file":"codex-rs/app-server-daemon/src/lib.rs","startLine":190,"endLine":193},
+  "remote-control": {"file":"codex-rs/app-server-daemon/src/lib.rs","startLine":228,"endLine":231},
+  "proxy-server": {"file":"codex-rs/cli/src/main.rs","startLine":963,"endLine":1647},
+  "export-schema": {"file":"codex-rs/app-server-protocol/src/export.rs","startLine":106,"endLine":185},
+  "run-execserver": {"file":"codex-rs/cli/src/main.rs","startLine":1676,"endLine":1723},
+  "exec-transport": {"file":"codex-rs/exec-server/src/server/transport.rs","startLine":80,"endLine":90},
+  "exec-processor": {"file":"codex-rs/exec-server/src/server/processor.rs","startLine":44,"endLine":186},
+  "exec-router": {"file":"codex-rs/exec-server/src/server/registry.rs","startLine":44,"endLine":161},
+  "process-handler": {"file":"codex-rs/exec-server/src/server/process_handler.rs","startLine":21,"endLine":66},
+  "filesystem-handler": {"file":"codex-rs/exec-server/src/server/file_system_handler.rs","startLine":50,"endLine":235},
+  "http-handler": {"file":"codex-rs/exec-server/src/server/handler.rs","startLine":73,"endLine":402},
+  "exec-error": {"file":"codex-rs/exec-server/src/server/processor.rs","startLine":44,"endLine":186}
+};
+</script>
+<aside id="source-panel"><div id="source-header"></div><div id="monaco-container"></div></aside><script src="assets/codeindex-runtime.js"></script><script src="assets/codeindex.js"></script></body></html>

@@ -1,0 +1,174 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Desktop or IDE manages threads and runs agent turns via App Server</title><link rel="stylesheet" href="assets/codeindex.css"></head><body><p><a href="index.html">← Back to Overview</a></p><h1>Desktop or IDE manages threads and runs agent turns via App Server</h1>
+<p>The desktop or IDE encodes thread management and agent operations as JSON-RPC requests, delivered to the App Server via stdin/stdout, WebSocket, or other configured transports. The server completes connection initialization, capability and permission checks, thread and turn routing, and then returns lifecycle events and errors as notifications to the client.</p>
+<dl>
+  <dt>Input</dt>
+  <dd>Client connection parameters, and JSON-RPC requests such as thread/start, thread/resume, turn/start, turn/steer, turn/interrupt.</dd>
+  <dt>Output</dt>
+  <dd>Corresponding JSON-RPC responses, and continuously returned thread, turn, approval, error, and completion notifications to the client.</dd>
+</dl>
+<p>The first data flow is process startup and connection handling. The command line first determines the transport, session source, authentication, and remote control policy; the runtime loads configuration and state libraries, then establishes connections via stdio, Unix Socket, WebSocket, or remote control. Each connection has its own initialization state, experimental capabilities, notification subscription set, and serialization gate.</p>
+<pre class="mermaid">
+graph TD
+  cli-entry["Client starts App Server and selects transport"] --> runtime-bootstrap["Load configuration, state libraries, and runtime dependencies"]
+  runtime-bootstrap --> transport-choice{"Which local transport to select"}
+  transport-choice -->|stdio| stdio-open["Establish single-client stdin/stdout connection"]
+  transport-choice -->|Unix Socket| unix-open["Listen on local control socket"]
+  transport-choice -->|WebSocket| ws-open["Validate auth config and listen on network connection"]
+  transport-choice -->|off| no-local["Do not establish local connection"]
+  runtime-bootstrap --> bootstrap-error["Configuration, state library, or listen failure: process returns error"]
+  stdio-open --> connection-loop["Register connection and its independent session state"]
+  unix-open --> connection-loop
+  ws-open --> connection-loop
+  no-local --> remote-boundary["External boundary: accessible via remote control channel"]
+  remote-boundary --> connection-loop
+</pre>
+<p>The second stage is JSON-RPC decoding and connection handshake. Requests are first deserialized by protocol method; initialize is the only request allowed in the uninitialized state. It validates the client name, saves experimental capabilities and notification preferences, and returns platform information. Subsequent requests that are uninitialized, re-initialized, or use unenabled experimental fields receive JSON-RPC errors.</p>
+<pre class="mermaid">
+graph TD
+  incoming["Received a JSON-RPC message"] --> message-kind{"Message type"}
+  message-kind -->|request| decode["Decode by protocol method and parameters"]
+  message-kind -->|response or error| peer-response["Hand off to waiting server request"]
+  message-kind -->|notification| client-note["Currently only logs client notifications"]
+  decode --> decode-ok{"Decode successful"}
+  decode-ok -->|no| rpc-error["Return parameter or method error"]
+  decode-ok -->|yes| init-check{"Is it initialize"}
+  init-check -->|yes| initialize["Validate client identity and solidify connection capabilities"]
+  initialize --> init-valid{"Previously initialized or invalid name"}
+  init-valid -->|yes| rpc-error
+  init-valid -->|no| init-response["Return platform, user agent, and Codex directory"]
+  init-check -->|no| ready-check{"Is the connection initialized"}
+  ready-check -->|no| rpc-error
+  ready-check -->|yes| experiment-check{"Request requires unenabled experimental capability"}
+  experiment-check -->|yes| rpc-error
+  experiment-check -->|no| serialize["Serialize queue by scope or execute concurrently"]
+  serialize --> dispatch["Route to thread or turn processor"]
+</pre>
+<p>The third stage manages threads. thread/start loads and merges configuration in the background, checks that sandbox and permissions are not provided simultaneously, validates dynamic tools, and then passes the thread creation request to core. thread/resume preferentially reuses a still-running thread, otherwise rebuilds from explicit history, state library records, or rollout files; after success, it automatically attaches the current connection's event listener. The core's model and tool loop is the lower boundary; only the effective configuration, history, input, dynamic tools, and tracing context are handed over here.</p>
+<pre class="mermaid">
+graph TD
+  thread-route{"Thread request type"} -->|thread/start| start-validate["Check permission parameters and parse environment"]
+  start-validate --> start-valid{"Are parameters and dynamic tools valid"}
+  start-valid -->|no| thread-error["Return thread request error"]
+  start-valid -->|yes| start-core["External lower boundary: create core thread with configuration and context"]
+  start-core --> start-result{"Creation successful"}
+  start-result -->|no| thread-error
+  start-result -->|yes| attach-listener["Save thread state and attach event listener"]
+  attach-listener --> thread-response["Return thread/start or thread/resume response"]
+  thread-route -->|thread/resume| resume-probe["Check if thread is shutting down or still running"]
+  resume-probe --> resume-source{"Resume source"}
+  resume-source -->|running| attach-listener
+  resume-source -->|self-provided history| resume-core["External lower boundary: resume core thread by history"]
+  resume-source -->|persistent record or rollout| resume-core
+  resume-core --> resume-ok{"Are history, configuration, and rollout valid"}
+  resume-ok -->|no| thread-error
+  resume-ok -->|yes| attach-listener
+</pre>
+<p>The fourth stage runs turns. turn/start converts client input, additional context, and current turn settings into a core UserInput operation and immediately returns the in-progress turn; turn/steer only allows directing to the currently steerable turn; turn/interrupt validates the target turn, with normal interrupts waiting for the TurnAborted event before responding, while startup interrupts respond immediately after submission succeeds.</p>
+<pre class="mermaid">
+graph TD
+  turn-route{"Turn request type"} -->|turn/start| turn-start["Load thread, validate input, and construct turn settings"]
+  turn-start --> turn-submit["External lower boundary: submit UserInput to core"]
+  turn-submit --> turn-submit-ok{"Submission successful"}
+  turn-submit-ok -->|no| turn-error["Return turn error"]
+  turn-submit-ok -->|yes| turn-running["Return turn with status in-progress"]
+  turn-route -->|turn/steer| steer-check["Verify current turn ID, input limit, and steerable state"]
+  steer-check --> steer-ok{"Is there a matching and steerable active turn"}
+  steer-ok -->|no| turn-error
+  steer-ok -->|yes| steer-core["External lower boundary: append steer input"]
+  steer-core --> turn-running
+  turn-route -->|turn/interrupt| interrupt-check["Verify target turn and register pending interrupt"]
+  interrupt-check --> interrupt-ok{"Is target still active and ID matching"}
+  interrupt-ok -->|no| turn-error
+  interrupt-ok -->|yes| interrupt-core["External lower boundary: submit Interrupt"]
+  interrupt-core --> interrupt-kind{"Startup interrupt"}
+  interrupt-kind -->|yes| interrupt-response["Confirm interrupt immediately"]
+  interrupt-kind -->|no| await-aborted["Wait for TurnAborted event then confirm"]
+</pre>
+<p>Finally, the thread listener converts core lifecycle events into App Server notifications or deferred responses. After notifications enter the outbound envelope, directed messages are only sent to the corresponding connection, broadcasts only to connections that are initialized and have not unsubscribed from that method; experimental fields are filtered by connection capability. When a slow WebSocket queue fills up, the connection is proactively disconnected; on disconnection, the RPC gate is closed, thread listeners are unbound, and command process resources are cleaned up; normal shutdown also waits for background tasks and closes threads within bounds.</p>
+<pre class="mermaid">
+graph TD
+  core-event["Core thread produces lifecycle event"] --> lifecycle-map["Convert to thread, turn, item, or error notification"]
+  lifecycle-map --> interrupt-complete["TurnAborted also completes pending interrupts"]
+  lifecycle-map --> envelope{"Directed response or broadcast notification"}
+  envelope -->|directed| outbound-filter["Filter by connection experimental capabilities and unsubscriptions"]
+  envelope -->|broadcast| initialized-only["Select only initialized and non-unsubscribed connections"]
+  initialized-only --> outbound-filter
+  outbound-filter --> queue-send{"Write to connection queue successful"}
+  queue-send -->|yes| client-output["Encoded as JSON-RPC back to client via original transport"]
+  queue-send -->|queue full or closed| disconnect["Disconnect slow connection"]
+  disconnect --> cleanup["Close RPC gate, unbind listeners, and clean up connection resources"]
+  client-close["Client proactive disconnect or process shutdown"] --> cleanup
+</pre>
+<ul>
+  <li>Communication boundary: stdio, Unix Socket, WebSocket, and remote control only convert messages into unified TransportEvent; business routing does not depend on a specific transport.</li>
+  <li>State machine boundary: Connections transition one-way from "uninitialized" to "initialized"; after disconnection, the RPC gate closes; turns progress from InProgress after submission, driven by core events.</li>
+  <li>Cancellation semantics: The success response for a normal turn/interrupt is bound to the TurnAborted event, avoiding "interrupt submitted" being mistaken for "turn already terminated."</li>
+</ul>
+<script>
+window.__sourceMap = {
+  "cli-entry":{"file":"codex-rs/app-server/src/main.rs","startLine":61,"endLine":102},
+  "runtime-bootstrap":{"file":"codex-rs/app-server/src/lib.rs","startLine":433,"endLine":1267},
+  "transport-choice":{"file":"codex-rs/app-server/src/lib.rs","startLine":433,"endLine":1267},
+  "stdio-open":{"file":"codex-rs/app-server/src/lib.rs","startLine":433,"endLine":1267},
+  "unix-open":{"file":"codex-rs/app-server/src/lib.rs","startLine":433,"endLine":1267},
+  "ws-open":{"file":"codex-rs/app-server/src/lib.rs","startLine":433,"endLine":1267},
+  "no-local":{"file":"codex-rs/app-server/src/lib.rs","startLine":433,"endLine":1267},
+  "remote-boundary":{"file":"codex-rs/app-server/src/lib.rs","startLine":433,"endLine":1267},
+  "bootstrap-error":{"file":"codex-rs/app-server/src/lib.rs","startLine":433,"endLine":1267},
+  "connection-loop":{"file":"codex-rs/app-server/src/lib.rs","startLine":433,"endLine":1267},
+  "incoming":{"file":"codex-rs/app-server/src/message_processor.rs","startLine":572,"endLine":627},
+  "message-kind":{"file":"codex-rs/app-server/src/lib.rs","startLine":433,"endLine":1267},
+  "decode":{"file":"codex-rs/app-server/src/message_processor.rs","startLine":572,"endLine":627},
+  "peer-response":{"file":"codex-rs/app-server/src/message_processor.rs","startLine":770,"endLine":786},
+  "client-note":{"file":"codex-rs/app-server/src/message_processor.rs","startLine":674,"endLine":678},
+  "decode-ok":{"file":"codex-rs/app-server/src/message_processor.rs","startLine":572,"endLine":627},
+  "rpc-error":{"file":"codex-rs/app-server/src/outgoing_message.rs","startLine":616,"endLine":625},
+  "init-check":{"file":"codex-rs/app-server/src/message_processor.rs","startLine":807,"endLine":850},
+  "initialize":{"file":"codex-rs/app-server/src/request_processors/initialize_processor.rs","startLine":44,"endLine":158},
+  "init-valid":{"file":"codex-rs/app-server/src/request_processors/initialize_processor.rs","startLine":44,"endLine":158},
+  "init-response":{"file":"codex-rs/app-server/src/request_processors/initialize_processor.rs","startLine":44,"endLine":158},
+  "ready-check":{"file":"codex-rs/app-server/src/message_processor.rs","startLine":852,"endLine":913},
+  "experiment-check":{"file":"codex-rs/app-server/src/message_processor.rs","startLine":852,"endLine":913},
+  "serialize":{"file":"codex-rs/app-server/src/message_processor.rs","startLine":852,"endLine":913},
+  "dispatch":{"file":"codex-rs/app-server/src/message_processor.rs","startLine":915,"endLine":1490},
+  "thread-route":{"file":"codex-rs/app-server/src/message_processor.rs","startLine":915,"endLine":1490},
+  "start-validate":{"file":"codex-rs/app-server/src/request_processors/thread_processor.rs","startLine":871,"endLine":967},
+  "start-valid":{"file":"codex-rs/app-server/src/request_processors/thread_processor.rs","startLine":1015,"endLine":1312},
+  "thread-error":{"file":"codex-rs/app-server/src/request_processors/thread_processor.rs","startLine":871,"endLine":967},
+  "start-core":{"file":"codex-rs/app-server/src/request_processors/thread_processor.rs","startLine":1015,"endLine":1312},
+  "start-result":{"file":"codex-rs/app-server/src/request_processors/thread_processor.rs","startLine":1015,"endLine":1312},
+  "attach-listener":{"file":"codex-rs/app-server/src/request_processors/thread_lifecycle.rs","startLine":212,"endLine":396},
+  "thread-response":{"file":"codex-rs/app-server/src/request_processors/thread_processor.rs","startLine":1015,"endLine":1312},
+  "resume-probe":{"file":"codex-rs/app-server/src/request_processors/thread_processor.rs","startLine":2497,"endLine":2827},
+  "resume-source":{"file":"codex-rs/app-server/src/request_processors/thread_processor.rs","startLine":2497,"endLine":2827},
+  "resume-core":{"file":"codex-rs/app-server/src/request_processors/thread_processor.rs","startLine":2497,"endLine":2827},
+  "resume-ok":{"file":"codex-rs/app-server/src/request_processors/thread_processor.rs","startLine":2497,"endLine":2827},
+  "turn-route":{"file":"codex-rs/app-server/src/message_processor.rs","startLine":915,"endLine":1490},
+  "turn-start":{"file":"codex-rs/app-server/src/request_processors/turn_processor.rs","startLine":381,"endLine":499},
+  "turn-submit":{"file":"codex-rs/app-server/src/request_processors/turn_processor.rs","startLine":381,"endLine":499},
+  "turn-submit-ok":{"file":"codex-rs/app-server/src/request_processors/turn_processor.rs","startLine":381,"endLine":499},
+  "turn-error":{"file":"codex-rs/app-server/src/request_processors/turn_processor.rs","startLine":381,"endLine":499},
+  "turn-running":{"file":"codex-rs/app-server/src/request_processors/turn_processor.rs","startLine":381,"endLine":499},
+  "steer-check":{"file":"codex-rs/app-server/src/request_processors/turn_processor.rs","startLine":778,"endLine":885},
+  "steer-ok":{"file":"codex-rs/app-server/src/request_processors/turn_processor.rs","startLine":778,"endLine":885},
+  "steer-core":{"file":"codex-rs/app-server/src/request_processors/turn_processor.rs","startLine":778,"endLine":885},
+  "interrupt-check":{"file":"codex-rs/app-server/src/request_processors/turn_processor.rs","startLine":1270,"endLine":1347},
+  "interrupt-ok":{"file":"codex-rs/app-server/src/request_processors/turn_processor.rs","startLine":1270,"endLine":1347},
+  "interrupt-core":{"file":"codex-rs/app-server/src/request_processors/turn_processor.rs","startLine":1270,"endLine":1347},
+  "interrupt-kind":{"file":"codex-rs/app-server/src/request_processors/turn_processor.rs","startLine":1270,"endLine":1347},
+  "interrupt-response":{"file":"codex-rs/app-server/src/request_processors/turn_processor.rs","startLine":1270,"endLine":1347},
+  "await-aborted":{"file":"codex-rs/app-server/src/request_processors/turn_processor.rs","startLine":1270,"endLine":1347},
+  "core-event":{"file":"codex-rs/app-server/src/bespoke_event_handling.rs","startLine":137,"endLine":1277},
+  "lifecycle-map":{"file":"codex-rs/app-server/src/bespoke_event_handling.rs","startLine":137,"endLine":1277},
+  "interrupt-complete":{"file":"codex-rs/app-server/src/bespoke_event_handling.rs","startLine":1592,"endLine":1606},
+  "envelope":{"file":"codex-rs/app-server/src/outgoing_message.rs","startLine":558,"endLine":591},
+  "outbound-filter":{"file":"codex-rs/app-server/src/transport.rs","startLine":134,"endLine":172},
+  "initialized-only":{"file":"codex-rs/app-server/src/transport.rs","startLine":198,"endLine":234},
+  "queue-send":{"file":"codex-rs/app-server/src/transport.rs","startLine":134,"endLine":172},
+  "client-output":{"file":"codex-rs/app-server/src/transport.rs","startLine":134,"endLine":172},
+  "disconnect":{"file":"codex-rs/app-server/src/transport.rs","startLine":134,"endLine":172},
+  "cleanup":{"file":"codex-rs/app-server/src/lib.rs","startLine":433,"endLine":1267},
+  "client-close":{"file":"codex-rs/app-server/src/lib.rs","startLine":433,"endLine":1267}
+};
+</script>
+<aside id="source-panel"><div id="source-header"></div><div id="monaco-container"></div></aside><script src="assets/codeindex-runtime.js"></script><script src="assets/codeindex.js"></script></body></html>

@@ -1,0 +1,106 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>A user initiates and completes an agent turn from the CLI</title><link rel="stylesheet" href="assets/codeindex.css"></head><body><p><a href="index.html">← Back to Overview</a></p><h1>A user initiates and completes an agent turn from the CLI</h1>
+<p>After the user enters a task on the command line, Codex first interprets the startup parameters and selects an interactive interface or one-shot execution path; it then creates or resumes a session, feeds the user input into the agent turn, continuously receives model events, executes approved tools, and streams progress and final results back to the terminal. This page traces this data flow along the real implementation and marks the boundaries between the process, model service, tools, and sandbox.</p>
+<dl>
+  <dt>Input</dt>
+  <dd>The user's command-line arguments, text or image prompts, working directory, and options for model, approval, sandbox, and session resumption.</dd>
+  <dt>Output</dt>
+  <dd>Continuously refreshed agent explanations, tool execution progress, and final responses in the terminal; session history and turn state are saved according to configuration for later resumption.</dd>
+</dl>
+<p>The first data flow determines "how to start." Without a subcommand, it enters the TUI; with exec, it launches a non-interactive client; resume merges session targeting conditions into the TUI configuration. The TUI also decides whether to connect to an embedded app-server, a local daemon, or an explicit remote service. Startup or configuration failures terminate before submitting any user input.</p>
+<pre class="mermaid">
+graph TD
+  cli-entry["User runs codex and enters a prompt"] --> parse-route{"Parse arguments and select run path"}
+  parse-route -->|no subcommand| tui-prepare["Prepare interaction parameters and check terminal"]
+  parse-route -->|exec| exec-prepare["Load configuration, login state, and permission policy"]
+  parse-route -->|resume| resume-prepare["Merge session targeting conditions"]
+  resume-prepare --> tui-prepare
+  tui-prepare --> terminal-ok{"Is the terminal and remote address available"}
+  terminal-ok -->|no| startup-fail["Show startup error and exit"]
+  terminal-ok -->|yes| choose-server{"Select agent service location"}
+  choose-server -->|embedded process| tui-app["Start terminal interface with embedded service"]
+  choose-server -->|local or remote| tui-app
+  exec-prepare --> exec-session["Start in-process service client"]
+  exec-prepare -->|config or login failure| startup-fail
+  tui-app --> thread-choice{"Create new or resume session"}
+  exec-session --> thread-choice
+  thread-choice -->|new| start-thread["Create thread and return valid configuration"]
+  thread-choice -->|resume| resume-thread["Locate records and restore thread history"]
+  start-thread --> ready-turn["Thread is ready to accept the current input"]
+  resume-thread --> ready-turn
+</pre>
+<p>The second data flow is the agent turn itself. The app-server converts API input into core input and delivers it to the thread; the core first injects permissions, skills, plugins, environment, and history, then initiates a streaming request to the model service. If the model requests a tool, the router dispatches according to parallel capability; command tools also go through approval policy and sandbox permission checks. Tool results are written back to the context and trigger the next model request, until the model gives an answer requiring no further action, or an interruption or non-retryable error occurs.</p>
+<pre class="mermaid">
+graph TD
+  ready-input["Submit text, images, and current turn settings"] --> validate-input{"Does the thread exist and is the input valid"}
+  validate-input -->|no| turn-reject["Return request error"]
+  validate-input -->|yes| submit-turn["Post input to the thread queue"]
+  submit-turn --> build-context["Merge history, permissions, skills, plugins, and environment"]
+  build-context --> context-limit{"Does context need compression"}
+  context-limit -->|yes| compact-context["Compress history and continue"]
+  context-limit -->|no| model-stream["Send streaming request to model service"]
+  compact-context --> model-stream
+  model-stream --> stream-event{"What type of stream event was received"}
+  stream-event -->|stream error or cancel| turn-error["Publish failure or interruption event"]
+  stream-event -->|tool call| dispatch-tool["Dispatch serially or in parallel per tool capability"]
+  dispatch-tool --> approval-check{"Does the command permission and approval allow"}
+  approval-check -->|no| tool-denied["Return rejection reason as tool result"]
+  approval-check -->|yes| sandbox-run["Execute command in selected sandbox"]
+  sandbox-run -->|sandbox reject or failure| tool-failed["Return controlled failure result"]
+  sandbox-run -->|success| tool-output["Record tool output and file changes"]
+  tool-denied --> record-output["Write back to session context"]
+  tool-failed --> record-output
+  tool-output --> record-output
+  record-output --> model-stream
+  stream-event -->|assistant text| emit-output["Continuously publish text and usage events"]
+  emit-output --> follow-up{"Still need tool, follow-up, or compression"}
+  follow-up -->|yes| model-stream
+  follow-up -->|no| turn-complete["Complete turn and output final response"]
+  turn-error --> cli-finish["Terminal displays status and sets exit result"]
+  turn-complete --> cli-finish
+</pre>
+<ul>
+  <li>Communication boundary: The CLI and app-server exchange thread/turn requests through in-process channels or remote connections; the core communicates with the model provider via Responses streaming; MCP, dynamic tools, and system processes are further external boundaries.</li>
+  <li>State machine: A turn cycles through "prepare context — model sampling — tool execution — result feedback" and only exits the loop when no further action is needed, the user interrupts, or a fatal error occurs.</li>
+  <li>Non-interactive exec cannot pop up approval prompts or collect user input by default; such server-side requests are rejected. The interactive TUI can present approval requests to the user.</li>
+  <li>The resume path locates records through the thread/list and thread/resume APIs, rather than the exec reading rollout files directly.</li>
+</ul>
+<script>
+window.__sourceMap = {
+  "cli-entry": {"file":"codex-rs/cli/src/main.rs","startLine":955,"endLine":961},
+  "parse-route": {"file":"codex-rs/cli/src/main.rs","startLine":963,"endLine":1647},
+  "tui-prepare": {"file":"codex-rs/cli/src/main.rs","startLine":2221,"endLine":2298},
+  "exec-prepare": {"file":"codex-rs/exec/src/lib.rs","startLine":238,"endLine":580},
+  "resume-prepare": {"file":"codex-rs/cli/src/main.rs","startLine":963,"endLine":1647},
+  "terminal-ok": {"file":"codex-rs/cli/src/main.rs","startLine":2221,"endLine":2298},
+  "startup-fail": {"file":"codex-rs/cli/src/main.rs","startLine":2221,"endLine":2298},
+  "choose-server": {"file":"codex-rs/tui/src/lib.rs","startLine":844,"endLine":1262},
+  "tui-app": {"file":"codex-rs/tui/src/lib.rs","startLine":1264,"endLine":1863},
+  "exec-session": {"file":"codex-rs/exec/src/lib.rs","startLine":657,"endLine":1039},
+  "thread-choice": {"file":"codex-rs/exec/src/lib.rs","startLine":657,"endLine":1039},
+  "start-thread": {"file":"codex-rs/app-server/src/request_processors/thread_processor.rs","startLine":871,"endLine":967},
+  "resume-thread": {"file":"codex-rs/exec/src/lib.rs","startLine":657,"endLine":1039},
+  "ready-turn": {"file":"codex-rs/app-server/src/request_processors/thread_processor.rs","startLine":1014,"endLine":1276},
+  "ready-input": {"file":"codex-rs/app-server/src/request_processors/turn_processor.rs","startLine":381,"endLine":480},
+  "validate-input": {"file":"codex-rs/app-server/src/request_processors/turn_processor.rs","startLine":381,"endLine":480},
+  "turn-reject": {"file":"codex-rs/app-server/src/request_processors/turn_processor.rs","startLine":381,"endLine":480},
+  "submit-turn": {"file":"codex-rs/app-server/src/request_processors/turn_processor.rs","startLine":381,"endLine":480},
+  "build-context": {"file":"codex-rs/core/src/session/mod.rs","startLine":2845,"endLine":3102},
+  "context-limit": {"file":"codex-rs/core/src/session/turn.rs","startLine":140,"endLine":415},
+  "compact-context": {"file":"codex-rs/core/src/session/turn.rs","startLine":907,"endLine":1044},
+  "model-stream": {"file":"codex-rs/core/src/session/turn.rs","startLine":1849,"endLine":2269},
+  "stream-event": {"file":"codex-rs/core/src/session/turn.rs","startLine":1849,"endLine":2269},
+  "turn-error": {"file":"codex-rs/core/src/session/turn.rs","startLine":1849,"endLine":2269},
+  "dispatch-tool": {"file":"codex-rs/core/src/tools/parallel.rs","startLine":39,"endLine":179},
+  "approval-check": {"file":"codex-rs/core/src/tools/handlers/unified_exec/exec_command.rs","startLine":69,"endLine":335},
+  "tool-denied": {"file":"codex-rs/core/src/tools/handlers/unified_exec/exec_command.rs","startLine":69,"endLine":335},
+  "sandbox-run": {"file":"codex-rs/core/src/tools/handlers/unified_exec/exec_command.rs","startLine":69,"endLine":335},
+  "tool-failed": {"file":"codex-rs/core/src/tools/handlers/unified_exec/exec_command.rs","startLine":69,"endLine":335},
+  "tool-output": {"file":"codex-rs/core/src/tools/handlers/unified_exec/exec_command.rs","startLine":69,"endLine":335},
+  "record-output": {"file":"codex-rs/core/src/tools/parallel.rs","startLine":39,"endLine":179},
+  "emit-output": {"file":"codex-rs/core/src/session/turn.rs","startLine":1849,"endLine":2269},
+  "follow-up": {"file":"codex-rs/core/src/session/turn.rs","startLine":140,"endLine":415},
+  "turn-complete": {"file":"codex-rs/core/src/session/turn.rs","startLine":140,"endLine":415},
+  "cli-finish": {"file":"codex-rs/exec/src/lib.rs","startLine":657,"endLine":1039}
+};
+</script>
+<aside id="source-panel"><div id="source-header"></div><div id="monaco-container"></div></aside><script src="assets/codeindex-runtime.js"></script><script src="assets/codeindex.js"></script></body></html>

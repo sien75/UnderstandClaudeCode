@@ -1,0 +1,106 @@
+<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>用户从 CLI 发起并完成一次代理回合</title><link rel="stylesheet" href="assets/codeindex.css"></head><body><p><a href="index.html">← 返回总览</a></p><h1>用户从 CLI 发起并完成一次代理回合</h1>
+<p>用户在命令行输入任务后，Codex 会先解释启动参数并选择交互式界面或一次性执行路径；随后创建或恢复会话，把用户输入送入代理回合，持续接收模型事件、执行获批工具，并把进度与最终结果流式返回终端。本页沿真实实现追踪这条数据流，并标出进程、模型服务、工具与沙箱之间的边界。</p>
+<dl>
+  <dt>输入</dt>
+  <dd>用户的命令行参数、文字或图片提示、工作目录，以及模型、审批、沙箱和恢复会话等选项。</dd>
+  <dt>输出</dt>
+  <dd>终端中持续刷新的代理解释、工具执行进度和最终答复；会话历史与回合状态按配置保存，以便后续恢复。</dd>
+</dl>
+<p>第一段数据流决定“以什么方式开始”。不带子命令时进入 TUI；使用 exec 时启动无交互客户端；resume 则把会话定位条件合并进 TUI 配置。TUI 还会判断连接嵌入式 app-server、本机 daemon 或显式远端服务。启动或配置失败会在真正提交用户输入前终止。</p>
+<pre class="mermaid">
+graph TD
+  cli-entry["用户运行 codex 并输入提示"] --> parse-route{"解析参数并选择运行路径"}
+  parse-route -->|无子命令| tui-prepare["整理交互参数并检查终端"]
+  parse-route -->|exec| exec-prepare["加载配置、登录状态与权限策略"]
+  parse-route -->|resume| resume-prepare["合并会话定位条件"]
+  resume-prepare --> tui-prepare
+  tui-prepare --> terminal-ok{"终端与远端地址可用吗"}
+  terminal-ok -->|否| startup-fail["显示启动错误并退出"]
+  terminal-ok -->|是| choose-server{"选择代理服务位置"}
+  choose-server -->|嵌入进程| tui-app["启动终端界面与内嵌服务"]
+  choose-server -->|本机或远端| tui-app
+  exec-prepare --> exec-session["启动进程内服务客户端"]
+  exec-prepare -->|配置或登录失败| startup-fail
+  tui-app --> thread-choice{"新建还是恢复会话"}
+  exec-session --> thread-choice
+  thread-choice -->|新建| start-thread["创建线程并返回有效配置"]
+  thread-choice -->|恢复| resume-thread["定位记录并恢复线程历史"]
+  start-thread --> ready-turn["线程可接收本轮输入"]
+  resume-thread --> ready-turn
+</pre>
+<p>第二段数据流是代理回合本身。app-server 把 API 输入转换成核心输入并投递给线程；核心先注入权限、技能、插件、环境和历史，再向模型服务发起流式请求。模型若请求工具，路由器按并行能力分派；命令工具还要经过审批策略和沙箱权限校验。工具结果会写回上下文并触发下一次模型请求，直到模型给出不再需要后续动作的答复，或发生中断、不可重试错误。</p>
+<pre class="mermaid">
+graph TD
+  ready-input["提交文字、图片与本轮设置"] --> validate-input{"线程存在且输入合规吗"}
+  validate-input -->|否| turn-reject["返回请求错误"]
+  validate-input -->|是| submit-turn["把输入投递到线程队列"]
+  submit-turn --> build-context["合并历史、权限、技能、插件和环境"]
+  build-context --> context-limit{"上下文是否需要压缩"}
+  context-limit -->|是| compact-context["压缩历史后继续"]
+  context-limit -->|否| model-stream["向模型服务发送流式请求"]
+  compact-context --> model-stream
+  model-stream --> stream-event{"收到哪类流事件"}
+  stream-event -->|流错误或取消| turn-error["发布失败或中断事件"]
+  stream-event -->|工具调用| dispatch-tool["按工具能力串行或并行分派"]
+  dispatch-tool --> approval-check{"命令权限与审批允许吗"}
+  approval-check -->|否| tool-denied["把拒绝原因作为工具结果"]
+  approval-check -->|是| sandbox-run["在选定沙箱中执行命令"]
+  sandbox-run -->|沙箱拒绝或失败| tool-failed["返回受控失败结果"]
+  sandbox-run -->|成功| tool-output["记录工具输出与文件变化"]
+  tool-denied --> record-output["写回会话上下文"]
+  tool-failed --> record-output
+  tool-output --> record-output
+  record-output --> model-stream
+  stream-event -->|助手文本| emit-output["持续发布文本与用量事件"]
+  emit-output --> follow-up{"仍需工具、追问或压缩吗"}
+  follow-up -->|是| model-stream
+  follow-up -->|否| turn-complete["完成回合并输出最终答复"]
+  turn-error --> cli-finish["终端显示状态并设置退出结果"]
+  turn-complete --> cli-finish
+</pre>
+<ul>
+  <li>通信边界：CLI 与 app-server 通过进程内通道或远端连接交换 thread/turn 请求；核心与模型供应商通过 Responses 流通信；MCP、动态工具与系统进程属于进一步的外部边界。</li>
+  <li>状态机：一个回合在“准备上下文—模型采样—工具执行—结果回填”之间循环，只有无需后续动作、用户中断或致命错误才离开循环。</li>
+  <li>非交互 exec 默认不能弹出审批或收集用户输入；收到这类服务端请求会拒绝。交互 TUI 则能把审批请求呈现给用户。</li>
+  <li>恢复路径通过 thread/list 与 thread/resume API 定位记录，而不是由 exec 直接读取 rollout 文件。</li>
+</ul>
+<script>
+window.__sourceMap = {
+  "cli-entry": {"file":"codex-rs/cli/src/main.rs","startLine":955,"endLine":961},
+  "parse-route": {"file":"codex-rs/cli/src/main.rs","startLine":963,"endLine":1647},
+  "tui-prepare": {"file":"codex-rs/cli/src/main.rs","startLine":2221,"endLine":2298},
+  "exec-prepare": {"file":"codex-rs/exec/src/lib.rs","startLine":238,"endLine":580},
+  "resume-prepare": {"file":"codex-rs/cli/src/main.rs","startLine":963,"endLine":1647},
+  "terminal-ok": {"file":"codex-rs/cli/src/main.rs","startLine":2221,"endLine":2298},
+  "startup-fail": {"file":"codex-rs/cli/src/main.rs","startLine":2221,"endLine":2298},
+  "choose-server": {"file":"codex-rs/tui/src/lib.rs","startLine":844,"endLine":1262},
+  "tui-app": {"file":"codex-rs/tui/src/lib.rs","startLine":1264,"endLine":1863},
+  "exec-session": {"file":"codex-rs/exec/src/lib.rs","startLine":657,"endLine":1039},
+  "thread-choice": {"file":"codex-rs/exec/src/lib.rs","startLine":657,"endLine":1039},
+  "start-thread": {"file":"codex-rs/app-server/src/request_processors/thread_processor.rs","startLine":871,"endLine":967},
+  "resume-thread": {"file":"codex-rs/exec/src/lib.rs","startLine":657,"endLine":1039},
+  "ready-turn": {"file":"codex-rs/app-server/src/request_processors/thread_processor.rs","startLine":1014,"endLine":1276},
+  "ready-input": {"file":"codex-rs/app-server/src/request_processors/turn_processor.rs","startLine":381,"endLine":480},
+  "validate-input": {"file":"codex-rs/app-server/src/request_processors/turn_processor.rs","startLine":381,"endLine":480},
+  "turn-reject": {"file":"codex-rs/app-server/src/request_processors/turn_processor.rs","startLine":381,"endLine":480},
+  "submit-turn": {"file":"codex-rs/app-server/src/request_processors/turn_processor.rs","startLine":381,"endLine":480},
+  "build-context": {"file":"codex-rs/core/src/session/mod.rs","startLine":2845,"endLine":3102},
+  "context-limit": {"file":"codex-rs/core/src/session/turn.rs","startLine":140,"endLine":415},
+  "compact-context": {"file":"codex-rs/core/src/session/turn.rs","startLine":907,"endLine":1044},
+  "model-stream": {"file":"codex-rs/core/src/session/turn.rs","startLine":1849,"endLine":2269},
+  "stream-event": {"file":"codex-rs/core/src/session/turn.rs","startLine":1849,"endLine":2269},
+  "turn-error": {"file":"codex-rs/core/src/session/turn.rs","startLine":1849,"endLine":2269},
+  "dispatch-tool": {"file":"codex-rs/core/src/tools/parallel.rs","startLine":39,"endLine":179},
+  "approval-check": {"file":"codex-rs/core/src/tools/handlers/unified_exec/exec_command.rs","startLine":69,"endLine":335},
+  "tool-denied": {"file":"codex-rs/core/src/tools/handlers/unified_exec/exec_command.rs","startLine":69,"endLine":335},
+  "sandbox-run": {"file":"codex-rs/core/src/tools/handlers/unified_exec/exec_command.rs","startLine":69,"endLine":335},
+  "tool-failed": {"file":"codex-rs/core/src/tools/handlers/unified_exec/exec_command.rs","startLine":69,"endLine":335},
+  "tool-output": {"file":"codex-rs/core/src/tools/handlers/unified_exec/exec_command.rs","startLine":69,"endLine":335},
+  "record-output": {"file":"codex-rs/core/src/tools/parallel.rs","startLine":39,"endLine":179},
+  "emit-output": {"file":"codex-rs/core/src/session/turn.rs","startLine":1849,"endLine":2269},
+  "follow-up": {"file":"codex-rs/core/src/session/turn.rs","startLine":140,"endLine":415},
+  "turn-complete": {"file":"codex-rs/core/src/session/turn.rs","startLine":140,"endLine":415},
+  "cli-finish": {"file":"codex-rs/exec/src/lib.rs","startLine":657,"endLine":1039}
+};
+</script>
+<aside id="source-panel"><div id="source-header"></div><div id="monaco-container"></div></aside><script src="assets/codeindex-runtime.js"></script><script src="assets/codeindex.js"></script></body></html>

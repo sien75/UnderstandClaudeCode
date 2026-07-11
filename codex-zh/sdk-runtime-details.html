@@ -1,0 +1,81 @@
+<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>SDK 公共能力与本地运行时打包</title><link rel="stylesheet" href="assets/codeindex.css"></head><body><p><a href="index.html">← 返回总览</a></p><h1>SDK 公共能力与本地运行时打包</h1>
+<p>SDK 使用者从稳定的 TypeScript 导出或 Python 顶层对象进入 Codex。两种实现最终都要找到与当前平台匹配的 Codex 可执行文件，但 TypeScript 随 npm 可选依赖解析二进制并按回合启动进程，Python 则优先使用独立的 wheel 运行时包，并让一个 App Server 连接承载账户、线程、回合和目标操作。</p>
+<dl><dt>输入</dt><dd>SDK 配置、账户与线程操作、用户输入、目标预算，以及当前操作系统和 CPU 架构。</dd><dt>输出</dt><dd>类型化的同步/异步 SDK 结果；或一个包含正确平台 Codex CLI 的可安装 wheel，供 SDK 在运行时启动。</dd></dl>
+<p>TypeScript 的入口只导出经过选择的公共类型与类。客户端构造时解析 npm 平台包；运行时把嵌套配置转成 CLI 可理解的 TOML 覆盖项，并在 PATH 前置随包工具目录。</p>
+<pre class="mermaid">
+graph TD
+  ts-entry["应用从 SDK 入口选择公共能力"] --> ts-client["创建客户端并保留全局配置"]
+  ts-client --> ts-platform{"识别操作系统与 CPU"}
+  ts-platform -->|不支持| ts-platform-error["报告平台不受支持"]
+  ts-platform -->|支持| ts-package["从 npm 可选依赖定位平台包"]
+  ts-package --> ts-layout{"包采用新布局还是旧布局？"}
+  ts-layout -->|新布局| ts-native["校验元数据并选择 bin/codex"]
+  ts-layout -->|旧布局| ts-legacy["兼容选择 codex/codex"]
+  ts-layout -->|均不存在| ts-missing["提示重新安装平台依赖"]
+  ts-native --> ts-path["把随包工具目录前置到 PATH"]
+  ts-legacy --> ts-path
+  ts-path --> ts-thread{"调用方新建还是恢复线程？"}
+  ts-thread --> ts-input["把文本与本地图片拆成 CLI 输入"]
+  ts-input --> ts-config["把嵌套配置展平并编码为 TOML"]
+  ts-config --> ts-exec["启动 codex exec 并读取 JSONL"]
+  ts-exec --> ts-event{"事件属于开始、项目、完成或错误？"}
+  ts-event --> ts-stream["流式逐条交付"]
+  ts-event --> ts-result["汇总最终回答、项目和用量"]
+</pre>
+<p>Python 的公开层同时提供同步和异步门面；异步版本把阻塞客户端工作放入线程。除普通回合外，目标操作会把多个物理回合折叠成一个逻辑流：目标暂停、阻塞、达限或完成后才真正结束，并在中断及回合滚动竞态中维护一致的逻辑回合编号。</p>
+<pre class="mermaid">
+graph TD
+  py-api["应用选择同步或异步公共门面"] --> py-start["启动并初始化 App Server"]
+  py-start --> py-actions{"选择账户、线程、回合或模型操作"}
+  py-actions --> py-login["登录启动、取消并等待结果"]
+  py-actions --> py-thread["新建、恢复、列表、读取、分叉、归档或压缩线程"]
+  py-actions --> py-turn["开始、追加或中断普通回合"]
+  py-actions --> py-goal["创建带预算的持续目标"]
+  py-goal --> py-reserve{"该线程已有目标操作？"}
+  py-reserve -->|是| py-busy["拒绝重复目标操作"]
+  py-reserve -->|否| py-clear["必要时清除遗留目标并激活路由"]
+  py-clear --> py-physical["接收一个或多个物理回合事件"]
+  py-physical --> py-state{"目标状态如何变化？"}
+  py-state -->|仍活动| py-roll["等待下一物理回合并保持逻辑编号"]
+  py-roll --> py-physical
+  py-state -->|暂停、阻塞、达限或完成| py-complete["合成为一个逻辑完成事件"]
+  py-state -->|调用方取消| py-interrupt["解析当前回合并请求中断"]
+  py-interrupt --> py-complete
+  py-actions --> py-router["JSON-RPC 路由器按请求、登录、回合和目标分流"]
+  py-router --> py-errors{"服务端返回哪类错误？"}
+  py-errors --> py-typed["映射为可识别的 SDK 异常"]
+  py-typed --> py-retry{"是否为临时过载且调用方选择重试？"}
+  py-retry -->|是| py-backoff["指数退避并加入抖动"]
+  py-backoff --> py-actions
+  py-retry -->|否| py-fail["把异常交还调用方"]
+</pre>
+<p>Python 的 CLI 二进制独立发布为平台 wheel。构建钩子禁止源码包并固定非纯 Python 平台标签；开发/发布辅助链路从 SDK 的精确依赖 pin 推导版本，下载对应 GitHub Release 资产、暂存运行时包并强制安装，最后再次验证版本和二进制可用性。</p>
+<pre class="mermaid">
+graph TD
+  rt-pin["读取 SDK 对运行时包的精确版本 pin"] --> rt-installed{"目标 Python 已有同版本可用二进制？"}
+  rt-installed -->|是| rt-reuse["直接复用现有运行时"]
+  rt-installed -->|否| rt-platform["把系统与架构映射为发布资产"]
+  rt-platform -->|不支持| rt-unsupported["报告没有可用平台构建"]
+  rt-platform -->|支持| rt-download["优先从 Release URL 下载压缩包"]
+  rt-download --> rt-fallback{"直接下载失败？"}
+  rt-fallback -->|是| rt-api["查询 Release API，必要时使用令牌或 gh"]
+  rt-fallback -->|否| rt-stage["调用打包脚本暂存 wheel 内容"]
+  rt-api --> rt-stage
+  rt-stage --> rt-install["用 pip 强制安装且不解析额外依赖"]
+  rt-install --> rt-check{"安装后版本和二进制都正确？"}
+  rt-check -->|否| rt-error["报告运行时安装不完整"]
+  rt-check -->|是| rt-ready["SDK 可取得 bundled_codex_path"]
+  rt-wheel["构建平台 wheel"] --> rt-sdist{"目标是源码包？"}
+  rt-sdist -->|是| rt-wheel-error["拒绝发布源码包"]
+  rt-sdist -->|否| rt-tag["写入 py3-none-平台标签"]
+  rt-tag --> rt-ready
+</pre>
+<ul><li>TypeScript 的类型 schema 明确了事件与线程项目的判别联合；Python 的协议模型主要由生成代码提供，本报告将生成文件标为忽略，只深入手写的适配、校验和生命周期逻辑。</li><li>Python 的批准模式会同时配置 sandbox 与 approval policy，避免把危险的组合分散给调用方；初始化元数据和版本解析保证服务端能识别 SDK 来源。</li><li>运行时下载包含多级回退：匿名直链、带令牌的 GitHub API、最后使用已认证的 gh。任何一步失败都会保留可诊断的上下文，而不会静默选择错误平台。</li></ul>
+<script>
+window.__sourceMap = {
+"ts-entry":{"file":"sdk/typescript/src/index.ts","startLine":1,"endLine":40},"ts-client":{"file":"sdk/typescript/src/codex.ts","startLine":11,"endLine":39},"ts-platform":{"file":"sdk/typescript/src/exec.ts","startLine":334,"endLine":410},"ts-platform-error":{"file":"sdk/typescript/src/exec.ts","startLine":334,"endLine":410},"ts-package":{"file":"sdk/typescript/src/exec.ts","startLine":334,"endLine":410},"ts-layout":{"file":"sdk/typescript/src/exec.ts","startLine":412,"endLine":435},"ts-native":{"file":"sdk/typescript/src/exec.ts","startLine":412,"endLine":435},"ts-legacy":{"file":"sdk/typescript/src/exec.ts","startLine":412,"endLine":435},"ts-missing":{"file":"sdk/typescript/src/exec.ts","startLine":334,"endLine":410},"ts-path":{"file":"sdk/typescript/src/exec.ts","startLine":441,"endLine":459},"ts-thread":{"file":"sdk/typescript/src/codex.ts","startLine":11,"endLine":39},"ts-input":{"file":"sdk/typescript/src/thread.ts","startLine":141,"endLine":155},"ts-config":{"file":"sdk/typescript/src/exec.ts","startLine":252,"endLine":290},"ts-exec":{"file":"sdk/typescript/src/exec.ts","startLine":63,"endLine":244},"ts-event":{"file":"sdk/typescript/src/thread.ts","startLine":41,"endLine":139},"ts-stream":{"file":"sdk/typescript/src/thread.ts","startLine":41,"endLine":139},"ts-result":{"file":"sdk/typescript/src/thread.ts","startLine":41,"endLine":139},
+"py-api":{"file":"sdk/python/src/openai_codex/api.py","startLine":75,"endLine":286},"py-start":{"file":"sdk/python/src/openai_codex/client.py","startLine":212,"endLine":864},"py-actions":{"file":"sdk/python/src/openai_codex/client.py","startLine":212,"endLine":864},"py-login":{"file":"sdk/python/src/openai_codex/_login.py","startLine":15,"endLine":172},"py-thread":{"file":"sdk/python/src/openai_codex/api.py","startLine":293,"endLine":620},"py-turn":{"file":"sdk/python/src/openai_codex/api.py","startLine":622,"endLine":760},"py-goal":{"file":"sdk/python/src/openai_codex/_goal.py","startLine":36,"endLine":193},"py-reserve":{"file":"sdk/python/src/openai_codex/_message_router.py","startLine":121,"endLine":149},"py-busy":{"file":"sdk/python/src/openai_codex/_message_router.py","startLine":121,"endLine":149},"py-clear":{"file":"sdk/python/src/openai_codex/client.py","startLine":551,"endLine":600},"py-physical":{"file":"sdk/python/src/openai_codex/_goal.py","startLine":248,"endLine":345},"py-state":{"file":"sdk/python/src/openai_codex/_goal.py","startLine":248,"endLine":345},"py-roll":{"file":"sdk/python/src/openai_codex/_goal.py","startLine":248,"endLine":345},"py-complete":{"file":"sdk/python/src/openai_codex/_goal.py","startLine":225,"endLine":245},"py-interrupt":{"file":"sdk/python/src/openai_codex/client.py","startLine":524,"endLine":549},"py-router":{"file":"sdk/python/src/openai_codex/_message_router.py","startLine":17,"endLine":278},"py-errors":{"file":"sdk/python/src/openai_codex/errors.py","startLine":86,"endLine":109},"py-typed":{"file":"sdk/python/src/openai_codex/errors.py","startLine":86,"endLine":109},"py-retry":{"file":"sdk/python/src/openai_codex/retry.py","startLine":12,"endLine":41},"py-backoff":{"file":"sdk/python/src/openai_codex/retry.py","startLine":12,"endLine":41},"py-fail":{"file":"sdk/python/src/openai_codex/retry.py","startLine":12,"endLine":41},
+"rt-pin":{"file":"sdk/python/_runtime_setup.py","startLine":25,"endLine":41},"rt-installed":{"file":"sdk/python/_runtime_setup.py","startLine":44,"endLine":87},"rt-reuse":{"file":"sdk/python/_runtime_setup.py","startLine":44,"endLine":87},"rt-platform":{"file":"sdk/python/_runtime_setup.py","startLine":90,"endLine":113},"rt-unsupported":{"file":"sdk/python/_runtime_setup.py","startLine":90,"endLine":113},"rt-download":{"file":"sdk/python/_runtime_setup.py","startLine":169,"endLine":251},"rt-fallback":{"file":"sdk/python/_runtime_setup.py","startLine":169,"endLine":251},"rt-api":{"file":"sdk/python/_runtime_setup.py","startLine":137,"endLine":166},"rt-stage":{"file":"sdk/python/_runtime_setup.py","startLine":254,"endLine":265},"rt-install":{"file":"sdk/python/_runtime_setup.py","startLine":268,"endLine":296},"rt-check":{"file":"sdk/python/_runtime_setup.py","startLine":44,"endLine":87},"rt-error":{"file":"sdk/python/_runtime_setup.py","startLine":44,"endLine":87},"rt-ready":{"file":"sdk/python-runtime/src/codex_cli_bin/__init__.py","startLine":18,"endLine":25},"rt-wheel":{"file":"sdk/python-runtime/hatch_build.py","startLine":14,"endLine":30},"rt-sdist":{"file":"sdk/python-runtime/hatch_build.py","startLine":14,"endLine":30},"rt-wheel-error":{"file":"sdk/python-runtime/hatch_build.py","startLine":14,"endLine":30},"rt-tag":{"file":"sdk/python-runtime/hatch_build.py","startLine":14,"endLine":30}
+};
+</script>
+<aside id="source-panel"><div id="source-header"></div><div id="monaco-container"></div></aside><script src="assets/codeindex-runtime.js"></script><script src="assets/codeindex.js"></script></body></html>

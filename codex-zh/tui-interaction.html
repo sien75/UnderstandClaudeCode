@@ -1,0 +1,163 @@
+<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>终端交互：把用户输入变成持续更新、可审批的对话</title><link rel="stylesheet" href="assets/codeindex.css"></head><body><p><a href="index.html">← 返回总览</a></p><h1>终端交互：把用户输入变成持续更新、可审批的对话</h1>
+
+<p>用户启动 Codex 后，可以恢复旧任务或开始新任务，在底部编辑器输入文字、图片、提及与斜杠命令；运行期间，模型的回答、推理、计划和工具执行会逐步出现在对话区。遇到命令、文件修改、权限或 MCP 请求时，普通输入会暂时让位给审批视图，用户决定后结果再送回正在运行的任务。</p>
+
+<dl>
+  <dt>输入</dt>
+  <dd>启动参数、要恢复的任务、键盘和粘贴事件、用户消息，以及 app-server 持续发来的任务事件和审批请求。</dd>
+  <dt>输出</dt>
+  <dd>按时间顺序更新的终端对话、当前运行状态、需要用户处理的审批界面，以及提交给 app-server 的消息、打断和审批决定。</dd>
+</dl>
+
+<p>启动与事件汇合：TUI 先完成配置、终端和 app-server 初始化；会话选择器按页加载任务并可异步预览历史。进入聊天后，所有输入源汇合到同一个事件循环，因此绘制、网络通知和用户按键不会各自直接修改终端。</p>
+
+<pre class="mermaid">
+graph TD
+  launch-tui["启动 TUI 并解析安全与配置选项"] --> init-terminal["初始化终端并连接 app-server"]
+  init-terminal --> choose-session{"恢复旧任务还是开始新任务"}
+  choose-session -->|恢复| load-session-page["分页加载可恢复任务"]
+  load-session-page --> filter-session["搜索、排序并选择任务"]
+  filter-session --> preview-transcript["异步加载历史预览"]
+  preview-transcript --> start-app["用选中任务创建聊天界面"]
+  choose-session -->|新建| start-app
+  start-app --> event-loop["并发等待四类事件"]
+  event-loop --> internal-event["处理内部 AppEvent"]
+  event-loop --> terminal-event["处理按键、粘贴、重绘和尺寸变化"]
+  event-loop --> thread-event["处理当前任务通知"]
+  event-loop --> server-event["处理 app-server 全局事件"]
+  terminal-event --> draw-frame["合成对话、活动单元与底部输入区"]
+  internal-event --> event-loop
+  thread-event --> event-loop
+  server-event --> event-loop
+  draw-frame --> event-loop
+</pre>
+
+<p>输入数据流：按键先交给当前模态视图；没有模态时才进入编辑器。提交时会检查图片能力、解析 shell 转义和斜杠命令、编码提及并附上当前模型、权限与协作模式。空消息或无法提交的消息留在本地；任务空闲时创建新 turn，任务运行中则作为 steer 排队。</p>
+
+<pre class="mermaid">
+graph TD
+  key-input["用户按键或粘贴内容"] --> route-key{"当前是否有模态视图"}
+  route-key -->|有| active-view["交给审批、选择器或提问视图"]
+  route-key -->|无| composer["编辑器更新文字、图片与提及"]
+  composer --> submit-result{"编辑器是否提交"}
+  submit-result -->|否| redraw-input["请求下一帧显示草稿"]
+  submit-result -->|是| classify-input{"是 shell、斜杠命令还是普通消息"}
+  classify-input -->|shell| shell-command["提交本地 shell 命令并记录历史"]
+  classify-input -->|斜杠命令| slash-command["分派本地动作或转换为消息"]
+  classify-input -->|普通消息| validate-message["校验图片并组装完整用户内容"]
+  validate-message --> submission-ready{"会话已配置且内容有效"}
+  submission-ready -->|否| restore-draft["保留草稿并显示原因"]
+  submission-ready -->|是| running-turn{"当前任务是否仍在运行"}
+  running-turn -->|否| start-turn["提交新 turn 并立即显示用户消息"]
+  running-turn -->|是| queue-steer["提交 steer 并加入待发送预览"]
+  start-turn --> persist-history["编码提及并写入跨会话输入历史"]
+  queue-steer --> persist-history
+</pre>
+
+<p>输出与生命周期：app-server 通知先按任务过滤，再根据事件类型更新 turn 状态、工具单元或流控制器。文本增量不会直接逐字符写入滚屏，而是先积累源码、只提交已经稳定的完整行，并保留可变化的尾部；结束时再从完整 Markdown 生成规范历史单元。这样调整终端宽度时，已提交滚屏与活动尾部仍保持顺序。</p>
+
+<pre class="mermaid">
+graph TD
+  receive-notification["收到当前任务通知"] --> notification-kind{"通知属于哪一类"}
+  notification-kind -->|turn 开始| mark-running["进入运行态并清理旧错误"]
+  notification-kind -->|文本增量| collect-delta["收集回答、计划或推理增量"]
+  collect-delta --> stable-line{"是否出现完整且结构稳定的行"}
+  stable-line -->|否| live-tail["只更新可变的屏幕尾部"]
+  stable-line -->|是| commit-lines["按节奏提交稳定行到滚屏"]
+  commit-lines --> live-tail
+  notification-kind -->|工具开始或输出| tool-cell["创建或更新活动工具单元"]
+  notification-kind -->|项目完成| finalize-item["把活动单元固化进历史"]
+  notification-kind -->|turn 完成| turn-status{"完成、中断还是失败"}
+  turn-status -->|完成| finalize-stream["从完整 Markdown 固化最终回答"]
+  turn-status -->|中断| interrupted["停止动画并保留可恢复输入"]
+  turn-status -->|失败| show-error["显示错误或等待自动重试"]
+  finalize-stream --> idle-state["回到空闲态并发送下一条排队输入"]
+  interrupted --> idle-state
+  show-error --> idle-state
+</pre>
+
+<p>审批状态机：请求到达时先结束回答的活动尾部，避免审批框插入半段文字。若用户正在输入，审批可短暂延迟；随后请求进入统一队列。用户选择一次允许、会话允许、拒绝或取消后，视图把决定包装成指定任务的操作，经 AppEvent 回到 app-server，再显示队列中的下一项。</p>
+
+<pre class="mermaid">
+graph TD
+  approval-arrives["收到命令、补丁、权限或 MCP 请求"] --> flush-before-approval["先固化正在流式显示的回答"]
+  flush-before-approval --> typing-recently{"用户刚刚是否仍在输入"}
+  typing-recently -->|是| delay-approval["短暂排队，避免吞掉输入按键"]
+  typing-recently -->|否| show-approval["立即打开审批视图"]
+  delay-approval --> show-approval
+  show-approval --> choose-decision{"用户选择决定"}
+  choose-decision -->|允许| allow-request["形成允许决定"]
+  choose-decision -->|拒绝或取消| deny-request["形成拒绝或中止决定"]
+  allow-request --> send-decision["按来源任务提交审批操作"]
+  deny-request --> send-decision
+  send-decision --> advance-approval{"队列中还有请求吗"}
+  advance-approval -->|有| show-approval
+  advance-approval -->|无| restore-composer["恢复状态提示与普通编辑器"]
+</pre>
+
+<ul>
+  <li>边界：TUI 不执行模型推理或工具，它把用户意图和审批决定交给 app-server；核心执行链由 core 模块负责。</li>
+  <li>状态机重点：空闲、turn 运行、等待审批、被中断、结束并不是独立页面，而是 ChatWidget、BottomPane、流控制器共同维护的正交状态。</li>
+  <li>恢复选择器对远程工作区不过滤本地路径；分页、搜索 token 与预览加载 token 防止较旧的异步结果覆盖新选择。</li>
+  <li>Ctrl+C 优先取消当前模态或运行任务；在没有可取消工作时才进入双击退出窗口，避免一次误触直接丢失会话。</li>
+</ul>
+
+<script>
+window.__sourceMap = {
+  "launch-tui":{"file":"codex-rs/tui/src/lib.rs","startLine":844,"endLine":1262},
+  "init-terminal":{"file":"codex-rs/tui/src/lib.rs","startLine":1265,"endLine":1662},
+  "choose-session":{"file":"codex-rs/tui/src/resume_picker.rs","startLine":340,"endLine":386},
+  "load-session-page":{"file":"codex-rs/tui/src/resume_picker.rs","startLine":733,"endLine":764},
+  "filter-session":{"file":"codex-rs/tui/src/resume_picker.rs","startLine":1397,"endLine":1417},
+  "preview-transcript":{"file":"codex-rs/tui/src/resume_picker.rs","startLine":765,"endLine":807},
+  "start-app":{"file":"codex-rs/tui/src/app.rs","startLine":759,"endLine":1216},
+  "event-loop":{"file":"codex-rs/tui/src/app.rs","startLine":759,"endLine":1216},
+  "internal-event":{"file":"codex-rs/tui/src/app.rs","startLine":759,"endLine":1216},
+  "terminal-event":{"file":"codex-rs/tui/src/app.rs","startLine":1254,"endLine":1336},
+  "thread-event":{"file":"codex-rs/tui/src/chatwidget/protocol.rs","startLine":4,"endLine":227},
+  "server-event":{"file":"codex-rs/tui/src/app.rs","startLine":759,"endLine":1216},
+  "draw-frame":{"file":"codex-rs/tui/src/app.rs","startLine":1338,"endLine":1351},
+  "key-input":{"file":"codex-rs/tui/src/chatwidget/interaction.rs","startLine":6,"endLine":172},
+  "route-key":{"file":"codex-rs/tui/src/bottom_pane/mod.rs","startLine":572,"endLine":664},
+  "active-view":{"file":"codex-rs/tui/src/bottom_pane/mod.rs","startLine":572,"endLine":664},
+  "composer":{"file":"codex-rs/tui/src/bottom_pane/mod.rs","startLine":572,"endLine":664},
+  "submit-result":{"file":"codex-rs/tui/src/chatwidget/interaction.rs","startLine":6,"endLine":172},
+  "redraw-input":{"file":"codex-rs/tui/src/chatwidget/interaction.rs","startLine":328,"endLine":350},
+  "classify-input":{"file":"codex-rs/tui/src/chatwidget/input_submission.rs","startLine":98,"endLine":421},
+  "shell-command":{"file":"codex-rs/tui/src/chatwidget/input_submission.rs","startLine":24,"endLine":39},
+  "slash-command":{"file":"codex-rs/tui/src/chatwidget/input_submission.rs","startLine":98,"endLine":421},
+  "validate-message":{"file":"codex-rs/tui/src/chatwidget/input_submission.rs","startLine":98,"endLine":421},
+  "submission-ready":{"file":"codex-rs/tui/src/chatwidget/input_submission.rs","startLine":98,"endLine":421},
+  "restore-draft":{"file":"codex-rs/tui/src/chatwidget/input_submission.rs","startLine":430,"endLine":451},
+  "running-turn":{"file":"codex-rs/tui/src/chatwidget/input_submission.rs","startLine":98,"endLine":421},
+  "start-turn":{"file":"codex-rs/tui/src/chatwidget/input_submission.rs","startLine":98,"endLine":421},
+  "queue-steer":{"file":"codex-rs/tui/src/chatwidget/input_submission.rs","startLine":98,"endLine":421},
+  "persist-history":{"file":"codex-rs/tui/src/chatwidget/input_submission.rs","startLine":98,"endLine":421},
+  "receive-notification":{"file":"codex-rs/tui/src/chatwidget/protocol.rs","startLine":4,"endLine":227},
+  "notification-kind":{"file":"codex-rs/tui/src/chatwidget/protocol.rs","startLine":4,"endLine":227},
+  "mark-running":{"file":"codex-rs/tui/src/chatwidget/protocol.rs","startLine":4,"endLine":227},
+  "collect-delta":{"file":"codex-rs/tui/src/chatwidget/streaming.rs","startLine":383,"endLine":422},
+  "stable-line":{"file":"codex-rs/tui/src/streaming/controller.rs","startLine":129,"endLine":145},
+  "live-tail":{"file":"codex-rs/tui/src/streaming/controller.rs","startLine":214,"endLine":217},
+  "commit-lines":{"file":"codex-rs/tui/src/streaming/controller.rs","startLine":168,"endLine":186},
+  "tool-cell":{"file":"codex-rs/tui/src/chatwidget/protocol.rs","startLine":279,"endLine":323},
+  "finalize-item":{"file":"codex-rs/tui/src/chatwidget/protocol.rs","startLine":325,"endLine":335},
+  "turn-status":{"file":"codex-rs/tui/src/chatwidget/protocol.rs","startLine":229,"endLine":277},
+  "finalize-stream":{"file":"codex-rs/tui/src/chatwidget/streaming.rs","startLine":19,"endLine":59},
+  "interrupted":{"file":"codex-rs/tui/src/chatwidget/protocol.rs","startLine":229,"endLine":277},
+  "show-error":{"file":"codex-rs/tui/src/chatwidget/protocol.rs","startLine":229,"endLine":277},
+  "idle-state":{"file":"codex-rs/tui/src/chatwidget/protocol.rs","startLine":229,"endLine":277},
+  "approval-arrives":{"file":"codex-rs/tui/src/chatwidget/tool_requests.rs","startLine":288,"endLine":312},
+  "flush-before-approval":{"file":"codex-rs/tui/src/chatwidget/streaming.rs","startLine":19,"endLine":59},
+  "typing-recently":{"file":"codex-rs/tui/src/bottom_pane/mod.rs","startLine":1349,"endLine":1384},
+  "delay-approval":{"file":"codex-rs/tui/src/bottom_pane/mod.rs","startLine":1349,"endLine":1384},
+  "show-approval":{"file":"codex-rs/tui/src/bottom_pane/mod.rs","startLine":1349,"endLine":1384},
+  "choose-decision":{"file":"codex-rs/tui/src/bottom_pane/approval_overlay.rs","startLine":302,"endLine":348},
+  "allow-request":{"file":"codex-rs/tui/src/bottom_pane/approval_overlay.rs","startLine":349,"endLine":387},
+  "deny-request":{"file":"codex-rs/tui/src/bottom_pane/approval_overlay.rs","startLine":349,"endLine":387},
+  "send-decision":{"file":"codex-rs/tui/src/app_event_sender.rs","startLine":80,"endLine":114},
+  "advance-approval":{"file":"codex-rs/tui/src/bottom_pane/approval_overlay.rs","startLine":473,"endLine":480},
+  "restore-composer":{"file":"codex-rs/tui/src/bottom_pane/approval_overlay.rs","startLine":473,"endLine":480}
+};
+</script>
+<aside id="source-panel"><div id="source-header"></div><div id="monaco-container"></div></aside><script src="assets/codeindex-runtime.js"></script><script src="assets/codeindex.js"></script></body></html>

@@ -1,126 +1,30 @@
-<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Codex CLI</title>
-<link rel="stylesheet" href="assets/codeindex.css">
-</head>
-<body>
-<h1>Codex CLI</h1>
+<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>OpenAI Codex</title><link rel="stylesheet" href="assets/codeindex.css"></head><body><h1>OpenAI Codex</h1>
+<p>这是 Codex 开源单仓库的代码理解地图。项目以 Rust 为主体，提供 CLI、终端交互界面与 App Server；TypeScript 和 Python SDK 将这些能力嵌入其他应用。核心工作是把用户目标变成带上下文的模型请求，在审批与沙箱约束下调用本地或远程工具，并持续保存线程历史、状态和事件。</p>
 
-<p>这个仓库实现 OpenAI Codex CLI:一个在本机运行的 coding agent。核心产品代码集中在 <code>codex-rs</code> Rust workspace,外部入口包括交互式 TUI、非交互 <code>codex exec</code>、JSON-RPC app-server/API,以及所有入口共用的 core session、模型采样和工具执行链路。围绕核心有一圈支撑子系统:登录认证、配置管理、沙箱与命令隔离、MCP/插件/技能、状态与记忆、遥测、云端后端与云任务、网络代理。</p>
-
-<h2>用户能做什么</h2>
+<h2>用户和外部系统可以做什么</h2>
 <ul>
-  <li>运行 <code>codex</code> 打开终端 TUI,输入 prompt、查看流式回答、审批工具和权限请求 → 交互式终端会话 / TUI渲染与交互输入</li>
-  <li>运行 <code>codex exec</code> 或 <code>codex review</code>,在脚本/CI 风格环境中提交一次任务并消费文本或 JSONL 输出 → 非交互执行任务</li>
-  <li>通过 app-server JSON-RPC 创建线程、启动回合、订阅通知、读取历史 → 应用服务器线程与回合 API</li>
-  <li>从任一入口触发 core agent 回合,让模型读取上下文、调用工具、处理权限并产出最终事件 → 模型回合与工具执行</li>
-  <li>让模型进入"代码模式",在 V8 沙箱里写 JS 循环/并行调工具完成子任务 → 代码模式</li>
-  <li>登录 ChatGPT 账号、用 API key/PAT/Bedrock、刷新 token、管理凭据存储 → 登录与认证</li>
-  <li>用 <code>codex login</code> 之外的本地 OSS(Ollama / LM Studio)跑模型 → 云端后端与云任务</li>
-  <li>连外部 MCP server 扩展工具,或把 codex 编码能力作为 MCP server 暴露给 IDE → MCP与外部工具接入</li>
-  <li>安装插件/技能、配置 hooks 来扩展行为 → 插件与技能系统</li>
-  <li>把远程云任务跑出的 diff apply 到本地仓库 → 云端后端与云任务</li>
-  <li>恢复历史会话、查看记忆、回放 rollout → 状态与记忆 / 遥测与分析</li>
-  <li>依赖沙箱隔离模型执行的命令与文件改动、审批越权操作 → 沙箱与命令执行隔离</li>
-  <li>经网络代理统一管控出站流量、按 host 策略放行/拦截 → 网络代理</li>
+  <li>从 CLI 输入任务、恢复会话并运行完整代理回合 → 用户从 CLI 发起并完成一次代理回合</li>
+  <li>在终端中编辑输入、查看流式输出并响应审批 → 终端交互</li>
+  <li>从桌面端或 IDE 通过 RPC 创建线程、启动/引导/中断回合 → App Server RPC</li>
+  <li>通过 TypeScript 或 Python SDK 嵌入、流式消费和控制 Codex → SDK 集成与运行时</li>
+  <li>选择配置、登录方式和模型供应商 → 配置、认证与模型连接</li>
+  <li>让代理执行命令、应用补丁、调用 MCP，并接受审批与沙箱保护 → 工具执行、审批、沙箱与 MCP</li>
+  <li>保存、恢复、压缩和迁移线程历史 → 核心状态与历史</li>
+  <li>安装插件、技能与扩展，连接云任务、网络代理和遥测 → 支撑服务</li>
 </ul>
 
-<a class="module-card" href="Interactive%20Terminal%20Session.html"><section>
-  <h2>交互式终端会话</h2>
-  <p>把用户在终端输入的一段 prompt 转成一次可审批、可流式展示、可续跑的 Codex 对话回合。</p>
-</section></a>
+<a href="cli-agent-turn.html"><section><h2>用户从 CLI 发起并完成一次代理回合</h2><p>从一条用户输入到模型采样、工具调用、审批执行，再到最终答案回到终端。</p></section></a>
+<a href="tui-interaction.html"><section><h2>终端交互：把用户输入变成持续更新、可审批的对话</h2><p>解释 TUI 的启动恢复、编辑提交、流式渲染和审批状态机。</p></section></a>
+<a href="app-server-rpc.html"><section><h2>桌面端或 IDE 通过 App Server 管理线程并运行代理回合</h2><p>展示多种传输上的 RPC 如何进入线程与回合生命周期并返回通知。</p></section></a>
+<a href="appserver-cli-surface.html"><section><h2>App Server 与 CLI 管理面</h2><p>汇总对外协议、非核心 RPC、CLI 子命令和执行服务器的管理能力。</p></section></a>
+<a href="sdk-integration.html"><section><h2>开发者通过 TypeScript 或 Python SDK 嵌入 Codex</h2><p>比较两套 SDK 如何启动或恢复线程、消费事件、取消和处理错误。</p></section></a>
+<a href="sdk-runtime-details.html"><section><h2>SDK 公共能力与本地运行时打包</h2><p>补充 SDK 公共类型、目标生命周期、平台二进制解析与 Python wheel 运行时。</p></section></a>
+<a href="config-auth-model.html"><section><h2>配置、认证与模型连接</h2><p>从配置合并和受管约束，到登录刷新、模型目录缓存和推理连接。</p></section></a>
+<a href="tools-sandbox-mcp.html"><section><h2>工具执行、审批、沙箱与 MCP</h2><p>跟踪工具选择、审批缓存、沙箱升级重试、命令/补丁/MCP/扩展执行。</p></section></a>
+<a href="core-state-history.html"><section><h2>代理线程的协议、状态、历史持久化与恢复</h2><p>说明 Op/Event 协议、活动线程、rollout、SQLite 索引和派生状态。</p></section></a>
+<a href="core-remaining-capabilities.html"><section><h2>Codex Core 剩余代理能力全景</h2><p>覆盖上下文压缩、技能插件、子代理、Guardian、权限、环境与重试。</p></section></a>
+<a href="supporting-services.html"><section><h2>支撑服务：把配置与扩展变成可控、可通信、可观测的代理能力</h2><p>串起插件、扩展、Hook、网络代理、云任务、连接器与遥测。</p></section></a>
+<a href="foundation-crates.html"><section><h2>基础能力 crate：把配置与请求变成可执行、受约束的 Codex 行为</h2><p>归纳策略、特性开关、文件搜索、秘密管理和平台基础组件。</p></section></a>
 
-<a class="module-card" href="Non-Interactive%20Task%20Execution.html"><section>
-  <h2>非交互执行任务</h2>
-  <p>把命令行参数、stdin、图片和 schema 转成一次 headless app-server 任务,并把结果输出为文本或 JSONL。</p>
-</section></a>
-
-<a class="module-card" href="App-Server%20Threads%20and%20Turn%20API.html"><section>
-  <h2>应用服务器线程与回合 API</h2>
-  <p>把外部 JSON-RPC 请求转成线程创建、回合启动、事件订阅和线程读取响应。</p>
-</section></a>
-
-<a class="module-card" href="Model%20Turn%20and%20Tool%20Execution.html"><section>
-  <h2>模型回合与工具执行</h2>
-  <p>把统一入口提交的用户输入转成模型采样、工具调用、权限处理和最终事件流。</p>
-</section></a>
-
-<a class="module-card" href="Code%20Mode.html"><section>
-  <h2>代码模式</h2>
-  <p>给模型的"会写代码的子大脑":模型调 exec 工具把 JS 丢进 V8 沙箱,JS 可循环、判断、并行调工具并跨 cell 存中间值。</p>
-</section></a>
-
-<a class="module-card" href="Login%20and%20Authentication.html"><section>
-  <h2>登录与认证</h2>
-  <p>把浏览器 OAuth / 设备码登录、token 刷新与 401 恢复、固定优先级的凭据选择、多后端存储串成一条认证链。</p>
-</section></a>
-
-<a class="module-card" href="Configuration%20Loading%20and%20Management.html"><section>
-  <h2>配置加载与管理</h2>
-  <p>把 7 类配置源(MDM/系统/云端/用户/profile/项目/CLI)按数字优先级叠加合并,施加硬约束与命令行覆盖,产出运行时 Config。</p>
-</section></a>
-
-<a class="module-card" href="MCP%20and%20External%20Tool%20Integration.html"><section>
-  <h2>MCP与外部工具接入</h2>
-  <p>codex 在 MCP 协议里双向身份:作为 client 聚合外部 MCP server 工具喂模型,作为 server 把编码能力暴露给 Claude/IDE,含插件接入与审批通道。</p>
-</section></a>
-
-<a class="module-card" href="State%20and%20Memory.html"><section>
-  <h2>状态与记忆</h2>
-  <p>管 4 个独立 SQLite 库的会话运行时状态、rollout JSONL 持久化、记忆两阶段提取合并、线程存储与 agent 父子图。</p>
-</section></a>
-
-<a class="module-card" href="Telemetry%20and%20Analytics.html"><section>
-  <h2>遥测与分析</h2>
-  <p>把协议事件聚合成 Analytics 事实并上报,经 OTLP 导出 trace/metrics/logs,rollout 双路径持久化与确定性回放追踪。</p>
-</section></a>
-
-<a class="module-card" href="Sandbox%20and%20Command%20Execution%20Isolation.html"><section>
-  <h2>沙箱与命令执行隔离</h2>
-  <p>三平台(macOS seatbelt / Linux bubblewrap+landlock / Windows 降权)沙箱 + exec-server 执行端 + Starlark execpolicy 审批 + shell 提权拦截。</p>
-</section></a>
-
-<a class="module-card" href="TUI%20Rendering%20and%20Interactive%20Input.html"><section>
-  <h2>TUI渲染与交互输入</h2>
-  <p>BottomPane 的 view 栈、聊天合成器与文本区、用户输入请求 overlay、会话恢复选择器——把键盘输入流转成渲染拼装与提交。</p>
-</section></a>
-
-<a class="module-card" href="Plugin%20and%20Skill%20System.html"><section>
-  <h2>插件与技能系统</h2>
-  <p>插件作为"能力集装箱"分流到 skills/tools/hooks 三个子系统,含 marketplace 安装、系统/用户技能加载、10 事件点钩子矩阵。</p>
-</section></a>
-
-<a class="module-card" href="Cloud%20Backend%20and%20Cloud%20Tasks.html"><section>
-  <h2>云端后端与云任务</h2>
-  <p>Responses API 请求主链路、按 provider 的认证分发(Bearer/AgentIdentity/Bedrock SigV4)、云任务远程执行与 diff apply、模型提供商管理与本地 OSS。</p>
-</section></a>
-
-<a class="module-card" href="Network%20Proxy.html"><section>
-  <h2>网络代理</h2>
-  <p>HTTP/SOCKS5 MITM 代理统一管控出站流量:host 策略评估(防 DNS rebinding)、per-host CA 签发终结 TLS、环境变量注入、uds 桥接。</p>
-</section></a>
-
-<h2>Coverage</h2>
-<pre>=== Coverage Status ===
-Total lines:     1280889
-Deep:            93784 (7.3%)
-Mapped:          1028101
-Ignored:         159004
-Uncovered:       0
-Coverage:        100.0%
-
-Stale files (1, excluded from stats):
-  - .DS_Store
-
-Uncovered files (2):
-  - codex-rs/core/src/agent/builtins/explorer.toml
-  - sdk/python/src/openai_codex/py.typed
-</pre>
-
-<script src="assets/codeindex-runtime.js"></script>
-<script src="assets/codeindex.js"></script>
-</body>
-</html>
+<h2>代码阅读覆盖率</h2><p>96.4%（Deep 64,232 行，Mapped 579,945 行，Ignored 590,704 行，Uncovered 46,011 行）</p>
+<script src="assets/codeindex-runtime.js"></script><script src="assets/codeindex.js"></script></body></html>

@@ -1,0 +1,108 @@
+<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>工具执行、审批、沙箱与 MCP</title><link rel="stylesheet" href="assets/codeindex.css"></head><body><p><a href="index.html">← 返回总览</a></p><h1>工具执行、审批、沙箱与 MCP</h1>
+<p>当模型请求运行本地命令、修改文件、调用 MCP 或扩展工具时，系统把响应项转换成统一工具调用，经注册表与生命周期钩子分派，再按权限策略选择审批和沙箱；结果最终被整理成模型可消费的输出。本模块只下钻工具域，不重复 CLI 主链。</p>
+<dl><dt>输入</dt><dd>模型产生的函数/自定义工具调用、用户权限策略、工作目录与环境</dd><dt>输出</dt><dd>受控执行的命令输出、文件变更、MCP/扩展结果，或明确的拒绝与沙箱错误</dd></dl>
+<pre class="mermaid">
+graph TD
+  response-item["模型返回工具调用项"] --> decode-call{"识别函数、自定义或搜索调用"}
+  decode-call -->|不是客户端工具| ignore-call["不在本地执行"]
+  decode-call -->|可执行| registry-dispatch["按命名空间与名称查找执行器"]
+  registry-dispatch --> exposure-check{"工具是否已暴露且参数类型匹配"}
+  exposure-check -->|否| unsupported["返回不支持的工具错误"]
+  exposure-check -->|是| pre-hook["运行工具开始与前置钩子"]
+  pre-hook --> invoke-handler["进入 Shell、补丁、MCP、Code Mode 或扩展处理器"]
+  invoke-handler --> post-hook["记录结果并运行后置钩子"]
+  post-hook --> model-output["转换并截断为模型输出"]
+</pre>
+<p>注册表同时控制工具对模型的可见性、是否允许并行以及取消语义。扩展贡献的执行器会在每轮构造路由时加入，因此内建与扩展工具共用同一生命周期边界。</p>
+<pre class="mermaid">
+graph TD
+  local-request["本地命令或补丁形成运行请求"] --> approval-rule{"计算审批要求"}
+  approval-rule -->|禁止| reject-now["立即拒绝"]
+  approval-rule -->|需要审批| approval-cache{"检查缓存或请求用户/Guardian"}
+  approval-cache -->|拒绝| reject-review["返回拒绝原因"]
+  approval-cache -->|批准| choose-sandbox["根据策略和权限选择首次沙箱"]
+  approval-rule -->|跳过| choose-sandbox
+  choose-sandbox --> network-gate["建立托管网络审批与取消信号"]
+  network-gate --> transform-command["把命令转换为平台沙箱请求"]
+  transform-command --> execute-process["启动进程并采集输出"]
+  execute-process --> attempt-ok{"执行是否成功"}
+  attempt-ok -->|成功| finish-network["收束网络审批并返回结果"]
+  attempt-ok -->|沙箱拒绝且可升级| retry-check{"策略允许无沙箱重试吗"}
+  retry-check -->|否| sandbox-error["返回沙箱错误"]
+  retry-check -->|是| escalated-run["复用批准，提升权限重试"]
+  escalated-run --> finish-network
+  execute-process --> linux-path["Linux: bubblewrap/Landlock/seccomp"]
+  execute-process --> windows-path["Windows: 受限令牌、ACL、作业对象"]
+  execute-process --> unix-escalation["Unix: 可经套接字请求 execve 升级"]
+</pre>
+<p>Shell 会先解析命令安全性和审批键，并保留被拒绝的读取规则；补丁则先解析、验证目标路径和写权限，再执行逐文件变更，失败时仍返回已经提交的增量，避免把部分成功误报成完全未修改。</p>
+<pre class="mermaid">
+graph TD
+  tool-kind{"工具类型"} -->|apply_patch| parse-patch["流式/完整解析补丁"]
+  parse-patch --> verify-patch{"验证语法、目标文件与沙箱写权限"}
+  verify-patch -->|失败| patch-error["返回验证错误"]
+  verify-patch -->|安全内联| patch-files["按块计算并写入文件"]
+  verify-patch -->|需审批| patch-orchestrator["交给统一审批与沙箱运行器"]
+  patch-orchestrator --> patch-files
+  patch-files --> patch-delta["汇总已提交文件增量"]
+  tool-kind -->|MCP| mcp-handler["解析参数并保留服务器命名空间"]
+  mcp-handler --> mcp-manager["连接管理器选择已就绪客户端"]
+  mcp-manager --> remote-call["通过 MCP 传输调用远端工具"]
+  remote-call --> mcp-result["附服务器元数据并返回内容"]
+  tool-kind -->|Code Mode| code-cell["在 V8 单元中执行脚本"]
+  code-cell --> nested-call["委托回核心路由调用嵌套工具"]
+  nested-call --> code-result["等待、通知、截断并返回单元结果"]
+  tool-kind -->|扩展| extension-adapter["转换为扩展调用契约"]
+  extension-adapter --> extension-lifecycle["扩展贡献器执行工具生命周期"]
+  extension-lifecycle --> extension-result["把扩展输出转回核心回合项"]
+</pre>
+<ul><li>权限边界：审批要求、附加文件权限、网络许可与平台沙箱是分层的；提升权限会移除 Codex 管理的代理环境，避免把受控网络配置泄漏到无沙箱进程。</li><li>通信边界：MCP 连接管理器负责服务器启动、工具发现、调用和资源读取；mcp-server 反向把 Codex 会话包装成 MCP 工具，并通过消息处理器转发审批。</li><li>生命周期：Code Mode 单元可执行、等待、终止；扩展可贡献工具并观察开始/完成事件；统一 exec 会话则支持持续进程和后续 stdin。</li></ul>
+<script>
+window.__sourceMap = {
+  "response-item":{"file":"codex-rs/core/src/tools/router.rs","startLine":113,"endLine":162},
+  "decode-call":{"file":"codex-rs/core/src/tools/router.rs","startLine":113,"endLine":162},
+  "ignore-call":{"file":"codex-rs/core/src/tools/router.rs","startLine":113,"endLine":162},
+  "registry-dispatch":{"file":"codex-rs/core/src/tools/registry.rs","startLine":325,"endLine":669},
+  "exposure-check":{"file":"codex-rs/core/src/tools/registry.rs","startLine":325,"endLine":669},
+  "unsupported":{"file":"codex-rs/core/src/tools/registry.rs","startLine":732,"endLine":740},
+  "pre-hook":{"file":"codex-rs/core/src/tools/registry.rs","startLine":684,"endLine":709},
+  "invoke-handler":{"file":"codex-rs/core/src/tools/router.rs","startLine":210,"endLine":241},
+  "post-hook":{"file":"codex-rs/core/src/tools/registry.rs","startLine":684,"endLine":709},
+  "model-output":{"file":"codex-rs/core/src/tools/mod.rs","startLine":57,"endLine":79},
+  "local-request":{"file":"codex-rs/core/src/tools/sandboxing.rs","startLine":386,"endLine":406},
+  "approval-rule":{"file":"codex-rs/core/src/tools/orchestrator.rs","startLine":54,"endLine":579},
+  "reject-now":{"file":"codex-rs/core/src/tools/orchestrator.rs","startLine":54,"endLine":579},
+  "approval-cache":{"file":"codex-rs/core/src/tools/sandboxing.rs","startLine":70,"endLine":96},
+  "reject-review":{"file":"codex-rs/core/src/tools/orchestrator.rs","startLine":54,"endLine":579},
+  "choose-sandbox":{"file":"codex-rs/core/src/tools/sandboxing.rs","startLine":246,"endLine":281},
+  "network-gate":{"file":"codex-rs/core/src/tools/orchestrator.rs","startLine":54,"endLine":579},
+  "transform-command":{"file":"codex-rs/core/src/tools/sandboxing.rs","startLine":424,"endLine":455},
+  "execute-process":{"file":"codex-rs/core/src/tools/runtimes/shell.rs","startLine":257,"endLine":326},
+  "attempt-ok":{"file":"codex-rs/core/src/tools/orchestrator.rs","startLine":54,"endLine":579},
+  "finish-network":{"file":"codex-rs/core/src/tools/orchestrator.rs","startLine":54,"endLine":579},
+  "retry-check":{"file":"codex-rs/core/src/tools/orchestrator.rs","startLine":54,"endLine":579},
+  "sandbox-error":{"file":"codex-rs/core/src/tools/orchestrator.rs","startLine":581,"endLine":588},
+  "escalated-run":{"file":"codex-rs/core/src/tools/orchestrator.rs","startLine":54,"endLine":579},
+  "linux-path":{"file":"codex-rs/linux-sandbox/src/linux_run_main.rs","startLine":147,"endLine":267},
+  "windows-path":{"file":"codex-rs/windows-sandbox-rs/src/process.rs","startLine":227,"endLine":327},
+  "unix-escalation":{"file":"codex-rs/shell-escalation/src/unix/escalate_client.rs","startLine":36,"endLine":142},
+  "tool-kind":{"file":"codex-rs/core/src/tools/router.rs","startLine":210,"endLine":241},
+  "parse-patch":{"file":"codex-rs/core/src/tools/handlers/apply_patch.rs","startLine":324,"endLine":473},
+  "verify-patch":{"file":"codex-rs/core/src/tools/handlers/apply_patch.rs","startLine":324,"endLine":473},
+  "patch-error":{"file":"codex-rs/core/src/tools/handlers/apply_patch.rs","startLine":324,"endLine":473},
+  "patch-files":{"file":"codex-rs/apply-patch/src/lib.rs","startLine":316,"endLine":360},
+  "patch-orchestrator":{"file":"codex-rs/core/src/tools/runtimes/apply_patch.rs","startLine":118,"endLine":213},
+  "patch-delta":{"file":"codex-rs/core/src/tools/runtimes/apply_patch.rs","startLine":215,"endLine":269},
+  "mcp-handler":{"file":"codex-rs/core/src/tools/handlers/mcp.rs","startLine":120,"endLine":162},
+  "mcp-manager":{"file":"codex-rs/codex-mcp/src/connection_manager.rs","startLine":677,"endLine":712},
+  "remote-call":{"file":"codex-rs/codex-mcp/src/connection_manager.rs","startLine":677,"endLine":712},
+  "mcp-result":{"file":"codex-rs/core/src/tools/handlers/mcp.rs","startLine":120,"endLine":162},
+  "code-cell":{"file":"codex-rs/core/src/tools/code_mode/execute_handler.rs","startLine":29,"endLine":92},
+  "nested-call":{"file":"codex-rs/core/src/tools/code_mode/mod.rs","startLine":236,"endLine":276},
+  "code-result":{"file":"codex-rs/code-mode/src/service.rs","startLine":104,"endLine":268},
+  "extension-adapter":{"file":"codex-rs/core/src/tools/handlers/extension_tools.rs","startLine":34,"endLine":58},
+  "extension-lifecycle":{"file":"codex-rs/ext/extension-api/src/registry.rs","startLine":45,"endLine":243},
+  "extension-result":{"file":"codex-rs/core/src/tools/handlers/extension_tools.rs","startLine":71,"endLine":110}
+};
+</script>
+<aside id="source-panel"><div id="source-header"></div><div id="monaco-container"></div></aside><script src="assets/codeindex-runtime.js"></script><script src="assets/codeindex.js"></script></body></html>

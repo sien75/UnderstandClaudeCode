@@ -1,0 +1,200 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Configuration, Authentication, and Model Connection</title><link rel="stylesheet" href="assets/codeindex.css"></head><body><p><a href="index.html">← Back to Overview</a></p><h1>Configuration, Authentication, and Model Connection</h1>
+<p>After a user starts Codex, layered configurations are merged into a runtime configuration constrained by managed policies; the system then selects a model service, reads or refreshes login credentials, discovers available models, and finally passes authenticated requests to the HTTP/SSE transport layer. The construction of model turn content belongs to the upper boundary; this module stops at "the connection is ready to send inference requests."</p>
+<dl>
+  <dt>Input</dt>
+  <dd>System, user, project, session and command-line configuration, credentials from CODEX_HOME or system keychain, and optional external authentication commands</dd>
+  <dt>Output</dt>
+  <dd>A determined model provider, a currently valid identity, available model metadata, and an authenticated HTTP client capable of accessing the model or ChatGPT backend</dd>
+</dl>
+<p>The first data flow decides "where to request." Higher-priority configuration overrides lower-priority configuration, but requirements and permission constraints can still reject disallowed final values.</p>
+<pre class="mermaid">
+graph TD
+  config-build["Collect configuration layers at startup"] --> config-deserialize["Merge and deserialize valid configuration"]
+  config-deserialize --> config-lock{"Is a configuration lock specified?"}
+  config-lock -->|Yes| replay-lock["Rebuild only from locked snapshot"]
+  config-lock -->|No| validate-config["Validate provider and mutually exclusive overrides"]
+  replay-lock --> validate-config
+  validate-config --> managed-constraints["Apply organization requirements and permission constraints"]
+  managed-constraints --> merge-providers["Merge built-in and custom model services"]
+  merge-providers --> choose-provider["Command-line first, then config, default is openai"]
+  choose-provider --> provider-found{"Does the service identifier exist?"}
+  provider-found -->|No| provider-error["Startup fails indicating unknown service"]
+  provider-found -->|Yes| runtime-config["Produce unambiguous runtime Config"]
+</pre>
+<p>The authentication data flow deliberately maintains a single snapshot: running components do not each read auth.json independently. Files, system keychains, and temporary external credentials share a storage interface; auto mode prefers the keychain and falls back to the file on failure.</p>
+<pre class="mermaid">
+graph TD
+  auth-manager-new["Create authentication manager from runtime configuration"] --> load-auth["Read current credential source"]
+  load-auth --> auth-source{"Where do credentials come from?"}
+  auth-source -->|environment API Key| api-key-auth["Form API Key identity"]
+  auth-source -->|file or keychain| storage-select["Choose storage by file/keyring/auto"]
+  auth-source -->|external host or command| external-auth["Establish refreshable external identity"]
+  storage-select --> stored-kind{"What type of identity is stored?"}
+  stored-kind -->|ChatGPT OAuth| chatgpt-auth["Parse account, workspace, and token"]
+  stored-kind -->|Agent/PAT/Bedrock| specialized-auth["Establish specialized identity and validate scope"]
+  chatgpt-auth --> restrictions{"Do mandatory login mode and workspace restrictions apply?"}
+  specialized-auth --> restrictions
+  restrictions -->|No| restriction-error["Log out or reject startup"]
+  restrictions -->|Yes| cached-auth["Cache unified authentication snapshot"]
+  api-key-auth --> cached-auth
+  external-auth --> cached-auth
+  cached-auth --> proactive{"Is OAuth token close to expiring?"}
+  proactive -->|No| usable-auth["Return current identity"]
+  proactive -->|Yes| refresh-token["Serialize refresh and persist new token"]
+  refresh-token --> refresh-ok{"Refresh successful?"}
+  refresh-ok -->|Yes| usable-auth
+  refresh-ok -->|temporary failure| old-auth["Retain old snapshot for this attempt"]
+  refresh-ok -->|permanent failure| cache-failure["Cache failure for this identity, avoid repeated requests"]
+</pre>
+<p>Requests encountering a 401 do not retry indefinitely. Managed ChatGPT identities reload from storage once, then go through OAuth refresh; external identities only notify the host or re-run the authentication command once; API Keys and non-refreshable personal tokens bubble the error directly to the caller.</p>
+<pre class="mermaid">
+graph TD
+  unauthorized["Service returns 401"] --> recovery-kind{"What recovery does the identity support?"}
+  recovery-kind -->|managed ChatGPT| reload-auth["Reload from storage with the same account"]
+  recovery-kind -->|external identity| external-refresh["Request host or command to refresh once"]
+  recovery-kind -->|non-refreshable| auth-bubble["Stop recovery and return authentication error"]
+  reload-auth --> account-match{"Account still the same?"}
+  account-match -->|No| auth-bubble
+  account-match -->|Yes| retry-after-reload["Retry with reloaded snapshot"]
+  retry-after-reload --> still-401{"Still 401?"}
+  still-401 -->|No| recovered["Recovery successful"]
+  still-401 -->|Yes| authority-refresh["Refresh against OAuth authority"]
+  authority-refresh --> final-retry["Final retry after updating snapshot"]
+  external-refresh --> final-retry
+  final-retry --> final-result{"Request successful?"}
+  final-result -->|Yes| recovered
+  final-result -->|No| auth-bubble
+</pre>
+<p>The provider combines configuration and identity into runtime capabilities. Bedrock uses a dedicated implementation; general compatible services decide whether to use OpenAI identity, static token, environment variable, or external command based on configuration. The model catalog can be fully fixed by configuration, or coordinated between bundled, disk cache, and remote /models.</p>
+<pre class="mermaid">
+graph TD
+  build-manager["Create model manager when thread starts"] --> provider-type{"Is it Amazon Bedrock?"}
+  provider-type -->|Yes| bedrock-provider["Create Bedrock provider and AWS authentication"]
+  provider-type -->|No| configured-provider["Create configuration-driven provider"]
+  configured-provider --> provider-auth{"What authentication does this service require?"}
+  provider-auth -->|OpenAI login| shared-auth["Reuse AuthManager snapshot"]
+  provider-auth -->|static/env/command token| bearer-auth["Establish provider-specific bearer source"]
+  provider-auth -->|no authentication| no-auth["Use empty authentication provider"]
+  bedrock-provider --> catalog-mode
+  shared-auth --> catalog-mode{"Does the configuration provide a complete model catalog?"}
+  bearer-auth --> catalog-mode
+  no-auth --> catalog-mode
+  catalog-mode -->|Yes| static-catalog["Use authoritative static catalog"]
+  catalog-mode -->|No| remote-manager["Create remote model manager"]
+  remote-manager --> refresh-policy{"Refresh policy?"}
+  refresh-policy -->|Offline| load-cache["Only try fresh disk cache"]
+  refresh-policy -->|OnlineIfUncached| cache-first["Use cache if hit, otherwise go online"]
+  refresh-policy -->|Online| fetch-models["Request /models with provider authentication"]
+  cache-first --> fetch-models
+  fetch-models --> merge-catalog{"ChatGPT and remote contains visible models?"}
+  merge-catalog -->|Yes| remote-authoritative["Remote catalog as single source of truth"]
+  merge-catalog -->|No| merge-bundled["Override bundled catalog by slug"]
+  remote-authoritative --> persist-cache["Save catalog, ETag, and client version"]
+  merge-bundled --> persist-cache
+  load-cache --> picker-filter["Generate selectable models by identity and visibility"]
+  static-catalog --> picker-filter
+  persist-cache --> picker-filter
+</pre>
+<p>The final communication boundary is divided into two types: the ChatGPT backend client handles path style, account/FedRAMP and other business headers; the generic Codex client handles proxy, custom CA, compression, trace headers, normal responses, and SSE byte streams. Both inject Authorization from a unified authentication provider, avoiding token logic duplication at business call sites.</p>
+<pre class="mermaid">
+graph TD
+  inference-boundary["Upper layer submits a constructed model request"] --> client-kind{"Which service surface is the target?"}
+  client-kind -->|ChatGPT backend| backend-client["Normalize backend-api base URL and path"]
+  client-kind -->|Model Responses API| request-builder["Construct method, URL, headers, and JSON body"]
+  backend-client --> backend-headers["Inject bearer, account, FedRAMP, and User-Agent"]
+  request-builder --> transport-config["Apply system proxy, custom CA, Cookie, and trace"]
+  backend-headers --> network-call["Initiate HTTPS request"]
+  transport-config --> network-call
+  network-call --> status-ok{"HTTP status successful?"}
+  status-ok -->|No| transport-error["Preserve status, response headers, and error body"]
+  status-ok -->|normal response| response-bytes["Read complete response bytes"]
+  status-ok -->|streaming response| byte-stream["Maintain async byte stream"]
+  byte-stream --> sse-decode["Continuously decode events via SSE framing"]
+  sse-decode --> model-turn-boundary["Return to upper layer model turn processing"]
+  response-bytes --> model-turn-boundary
+</pre>
+<ul>
+  <li>Permission boundary: managed requirements constrain user choices before Config is formed; login mode and ChatGPT workspace can also be enforced by organization configuration.</li>
+  <li>Secret boundary: authentication debug output does not expose tokens; keychain mode entrusts long-term credentials to the operating system, external bearer can exist only within the process.</li>
+  <li>Cache boundary: model cache determines freshness by client version and TTL, and preserves ETag; current implementation notes that provider identity is not yet included in cache eligibility determination.</li>
+  <li>Failure strategy: model catalog network failure retains the existing catalog; HTTP non-success status preserves sufficient context for the upper layer to classify, and the 401 recovery state machine is strictly bounded.</li>
+</ul>
+<script>
+window.__sourceMap = {
+  "config-build":{"file":"codex-rs/core/src/config/mod.rs","startLine":1207,"endLine":1323},
+  "config-deserialize":{"file":"codex-rs/core/src/config/mod.rs","startLine":1207,"endLine":1323},
+  "config-lock":{"file":"codex-rs/core/src/config/mod.rs","startLine":1207,"endLine":1323},
+  "replay-lock":{"file":"codex-rs/core/src/config/mod.rs","startLine":1207,"endLine":1323},
+  "validate-config":{"file":"codex-rs/core/src/config/mod.rs","startLine":2668,"endLine":3581},
+  "managed-constraints":{"file":"codex-rs/core/src/config/mod.rs","startLine":2668,"endLine":3581},
+  "merge-providers":{"file":"codex-rs/core/src/config/mod.rs","startLine":2668,"endLine":3581},
+  "choose-provider":{"file":"codex-rs/core/src/config/mod.rs","startLine":2668,"endLine":3581},
+  "provider-found":{"file":"codex-rs/core/src/config/mod.rs","startLine":2668,"endLine":3581},
+  "provider-error":{"file":"codex-rs/core/src/config/mod.rs","startLine":2668,"endLine":3581},
+  "runtime-config":{"file":"codex-rs/core/src/config/mod.rs","startLine":2668,"endLine":3581},
+  "auth-manager-new":{"file":"codex-rs/login/src/auth/manager.rs","startLine":1538,"endLine":2190},
+  "load-auth":{"file":"codex-rs/login/src/auth/manager.rs","startLine":912,"endLine":991},
+  "auth-source":{"file":"codex-rs/login/src/auth/manager.rs","startLine":912,"endLine":991},
+  "api-key-auth":{"file":"codex-rs/login/src/auth/manager.rs","startLine":214,"endLine":524},
+  "storage-select":{"file":"codex-rs/login/src/auth/storage.rs","startLine":445,"endLine":491},
+  "external-auth":{"file":"codex-rs/login/src/auth/external_bearer.rs","startLine":1,"endLine":184},
+  "stored-kind":{"file":"codex-rs/login/src/auth/manager.rs","startLine":912,"endLine":991},
+  "chatgpt-auth":{"file":"codex-rs/login/src/auth/manager.rs","startLine":214,"endLine":524},
+  "specialized-auth":{"file":"codex-rs/login/src/auth/manager.rs","startLine":214,"endLine":524},
+  "restrictions":{"file":"codex-rs/login/src/auth/manager.rs","startLine":769,"endLine":865},
+  "restriction-error":{"file":"codex-rs/login/src/auth/manager.rs","startLine":769,"endLine":865},
+  "cached-auth":{"file":"codex-rs/login/src/auth/manager.rs","startLine":1538,"endLine":2190},
+  "proactive":{"file":"codex-rs/login/src/auth/manager.rs","startLine":1538,"endLine":2190},
+  "usable-auth":{"file":"codex-rs/login/src/auth/manager.rs","startLine":1538,"endLine":2190},
+  "refresh-token":{"file":"codex-rs/login/src/auth/manager.rs","startLine":1538,"endLine":2190},
+  "refresh-ok":{"file":"codex-rs/login/src/auth/manager.rs","startLine":1538,"endLine":2190},
+  "old-auth":{"file":"codex-rs/login/src/auth/manager.rs","startLine":1538,"endLine":2190},
+  "cache-failure":{"file":"codex-rs/login/src/auth/manager.rs","startLine":1538,"endLine":2190},
+  "unauthorized":{"file":"codex-rs/login/src/auth/manager.rs","startLine":1313,"endLine":1478},
+  "recovery-kind":{"file":"codex-rs/login/src/auth/manager.rs","startLine":1313,"endLine":1478},
+  "reload-auth":{"file":"codex-rs/login/src/auth/manager.rs","startLine":1313,"endLine":1478},
+  "external-refresh":{"file":"codex-rs/login/src/auth/manager.rs","startLine":1313,"endLine":1478},
+  "auth-bubble":{"file":"codex-rs/login/src/auth/manager.rs","startLine":1313,"endLine":1478},
+  "account-match":{"file":"codex-rs/login/src/auth/manager.rs","startLine":1313,"endLine":1478},
+  "retry-after-reload":{"file":"codex-rs/login/src/auth/manager.rs","startLine":1313,"endLine":1478},
+  "still-401":{"file":"codex-rs/login/src/auth/manager.rs","startLine":1313,"endLine":1478},
+  "authority-refresh":{"file":"codex-rs/login/src/auth/manager.rs","startLine":1313,"endLine":1478},
+  "final-retry":{"file":"codex-rs/login/src/auth/manager.rs","startLine":1313,"endLine":1478},
+  "final-result":{"file":"codex-rs/login/src/auth/manager.rs","startLine":1313,"endLine":1478},
+  "recovered":{"file":"codex-rs/login/src/auth/manager.rs","startLine":1313,"endLine":1478},
+  "build-manager":{"file":"codex-rs/core/src/thread_manager.rs","startLine":225,"endLine":234},
+  "provider-type":{"file":"codex-rs/model-provider/src/provider.rs","startLine":188,"endLine":197},
+  "bedrock-provider":{"file":"codex-rs/model-provider/src/amazon_bedrock/mod.rs","startLine":36,"endLine":294},
+  "configured-provider":{"file":"codex-rs/model-provider/src/provider.rs","startLine":201,"endLine":318},
+  "provider-auth":{"file":"codex-rs/model-provider/src/provider.rs","startLine":201,"endLine":318},
+  "shared-auth":{"file":"codex-rs/model-provider/src/auth.rs","startLine":1,"endLine":168},
+  "bearer-auth":{"file":"codex-rs/model-provider/src/bearer_auth_provider.rs","startLine":1,"endLine":110},
+  "no-auth":{"file":"codex-rs/model-provider/src/auth.rs","startLine":1,"endLine":168},
+  "catalog-mode":{"file":"codex-rs/model-provider/src/provider.rs","startLine":201,"endLine":318},
+  "static-catalog":{"file":"codex-rs/models-manager/src/manager.rs","startLine":410,"endLine":441},
+  "remote-manager":{"file":"codex-rs/models-manager/src/manager.rs","startLine":213,"endLine":231},
+  "refresh-policy":{"file":"codex-rs/models-manager/src/manager.rs","startLine":275,"endLine":408},
+  "load-cache":{"file":"codex-rs/models-manager/src/manager.rs","startLine":275,"endLine":408},
+  "cache-first":{"file":"codex-rs/models-manager/src/manager.rs","startLine":275,"endLine":408},
+  "fetch-models":{"file":"codex-rs/models-manager/src/manager.rs","startLine":275,"endLine":408},
+  "merge-catalog":{"file":"codex-rs/models-manager/src/manager.rs","startLine":275,"endLine":408},
+  "remote-authoritative":{"file":"codex-rs/models-manager/src/manager.rs","startLine":275,"endLine":408},
+  "merge-bundled":{"file":"codex-rs/models-manager/src/manager.rs","startLine":275,"endLine":408},
+  "persist-cache":{"file":"codex-rs/models-manager/src/cache.rs","startLine":1,"endLine":183},
+  "picker-filter":{"file":"codex-rs/models-manager/src/manager.rs","startLine":79,"endLine":189},
+  "inference-boundary":{"file":"codex-rs/core/src/client.rs","startLine":367,"endLine":397},
+  "client-kind":{"file":"codex-rs/core/src/client.rs","startLine":367,"endLine":397},
+  "backend-client":{"file":"codex-rs/backend-client/src/client.rs","startLine":148,"endLine":948},
+  "request-builder":{"file":"codex-rs/codex-client/src/request.rs","startLine":86,"endLine":323},
+  "backend-headers":{"file":"codex-rs/backend-client/src/client.rs","startLine":148,"endLine":948},
+  "transport-config":{"file":"codex-rs/codex-client/src/default_client.rs","startLine":21,"endLine":142},
+  "network-call":{"file":"codex-rs/codex-client/src/transport.rs","startLine":96,"endLine":162},
+  "status-ok":{"file":"codex-rs/codex-client/src/transport.rs","startLine":96,"endLine":162},
+  "transport-error":{"file":"codex-rs/codex-client/src/transport.rs","startLine":96,"endLine":162},
+  "response-bytes":{"file":"codex-rs/codex-client/src/transport.rs","startLine":96,"endLine":162},
+  "byte-stream":{"file":"codex-rs/codex-client/src/transport.rs","startLine":96,"endLine":162},
+  "sse-decode":{"file":"codex-rs/codex-client/src/sse.rs","startLine":12,"endLine":48},
+  "model-turn-boundary":{"file":"codex-rs/core/src/client.rs","startLine":367,"endLine":397}
+};
+</script>
+<aside id="source-panel"><div id="source-header"></div><div id="monaco-container"></div></aside><script src="assets/codeindex-runtime.js"></script><script src="assets/codeindex.js"></script></body></html>

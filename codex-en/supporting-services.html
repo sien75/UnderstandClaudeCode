@@ -1,0 +1,107 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Supporting Services: Turning Configuration and Extensions into Controllable, Communicable, Observable Agent Capabilities</title><link rel="stylesheet" href="assets/codeindex.css"></head><body><p><a href="index.html">← Back to Overview</a></p><h1>Supporting Services: Turning Configuration and Extensions into Controllable, Communicable, Observable Agent Capabilities</h1>
+
+<p>This set of crates does not directly determine how the agent reasons, but instead connects local configuration, plugin marketplace, skills, Hooks, MCP, network access, cloud tasks, and telemetry into the agent runtime. For users, the trigger points are usually enabling a plugin, adding a marketplace, starting a task, allowing network access, or configuring an observability exporter; the system then handles discovery, validation, materialization, registration, execution, and reporting back.</p>
+
+<dl>
+  <dt>Input</dt>
+  <dd>Layered configuration, plugin or skill declarations, Hook events, MCP calls, model API requests, network policy, and cloud task commands</dd>
+  <dt>Output</dt>
+  <dd>Registered agent capabilities, policy-constrained external communication, resumable cloud task results, and log, metric, and analytics events</dd>
+</dl>
+
+<p>The plugin data flow starts from merging configuration layers with remote installation status. The loader reads each plugin's manifest and combines skills, MCP servers, App connectors, and Hooks into a unified result; the manager serializes refresh, caching, and installation, materializing the source first during installation, then atomically writing to the plugin repository and user configuration. Product restrictions are enforced during the "admission" phase; the runtime only consumes what has already been admitted.</p>
+
+<pre class="mermaid">
+graph TD
+  plugin-entry["Call plugin public entry point"] --> manager-create["Create plugin manager and bind CODEX_HOME"]
+  manager-create --> load-stack["Merge layered configuration with remote installation status"]
+  load-stack --> load-scope{"Load only Hooks, or all capabilities?"}
+  load-scope -->|all| capability-load["Load skills, MCP, App, and Hooks"]
+  load-scope -->|Hook| hook-only["Only parse enabled plugin Hooks"]
+  plugin-entry --> install-request["User requests plugin installation"]
+  install-request --> remote-sync{"Need to sync remote installation status?"}
+  remote-sync -->|Yes| remote-enable["First notify remote to enable plugin"]
+  remote-sync -->|No| materialize["Materialize local or Git source"]
+  remote-enable --> materialize
+  materialize --> persist-enable["Write version repository and enable in user config"]
+  persist-enable --> analytics-install["Record installation analytics event"]
+</pre>
+
+<p>The extension API consolidates different capabilities into a typed contributor registry: configuration, context, tools, MCP, approval, thread, and turn lifecycle each have independent slots. Hooks are another explicit lifecycle boundary; they serialize events, pass them to discovered commands for execution according to matching rules, and allow pre-hooks to reject tools or modify input. Permission requests can thus be decided both by built-in policy and reviewed by external Hooks.</p>
+
+<pre class="mermaid">
+graph TD
+  extension-registry["Host creates extension registry"] --> register-slots["Register contributors by capability"]
+  register-slots --> runtime-contribution{"What type of contribution does the runtime need?"}
+  runtime-contribution -->|context and tools| prompt-tools["Inject prompts, tools, and MCP into turn"]
+  runtime-contribution -->|lifecycle| hook-build["Build Hook engine from config and plugin declarations"]
+  hook-build --> dispatch-hook["Execute Hooks in sequence when event arrives"]
+  dispatch-hook --> abort-check{"Does Hook require abort?"}
+  abort-check -->|Yes| deny-operation["Stop subsequent processing and return rejection"]
+  abort-check -->|No| continue-operation["Continue tool, turn, or compression flow"]
+</pre>
+
+<p>The communication side is divided into three layers: codex-api encodes internal requests into HTTP protocols such as Responses, WebSocket, search, and image and parses streams; rmcp-client handles stdio, in-process, or streamable HTTP MCP sessions and OAuth; network-proxy uniformly applies domain, Unix socket, MITM, and dynamic approval policies before actually going outbound. Network rejections are recorded by the observer rather than silently failing.</p>
+
+<pre class="mermaid">
+graph TD
+  api-client["Agent generates model or tool request"] --> encode-response["Encode request and append session trace headers"]
+  encode-response --> transport-choice{"Target communication protocol?"}
+  transport-choice -->|OpenAI API| stream-api["Send HTTP request and parse SSE stream"]
+  transport-choice -->|MCP| mcp-connect["Establish in-process, stdio, or HTTP session"]
+  mcp-connect --> oauth-check{"Does the remote require OAuth?"}
+  oauth-check -->|Yes| oauth-login["Discover authorization endpoint and save token"]
+  oauth-check -->|No| proxy-policy["Enter unified network proxy policy"]
+  oauth-login --> proxy-policy
+  stream-api --> proxy-policy
+  proxy-policy --> network-decision{"Is the domain and protocol allowed?"}
+  network-decision -->|rejected| blocked-observer["Report blocked request and reason"]
+  network-decision -->|allowed| upstream["Connect upstream and stream back results"]
+</pre>
+
+<p>The remaining support chains each bear clear boundaries: config merges system, user, project, cloud requirements, and runtime overrides, preserving source and diagnostics; core-skills discovers, filters, renders, and injects skills by mention; connectors merge App metadata from directory and cache; cloud-tasks provides cloud task creation, environment detection, polling, and diff display; external-agent module migrates other agents' MCP, Hooks, commands, and sessions; analytics coalesces raw facts into product events; otel installs log, trace, and metric exporters, flushing on shutdown. The small crates under utils provide path, PTY, streaming text parsing, images, templates, caching, sleep suppression, and other stateless foundational capabilities.</p>
+
+<ul>
+  <li>Configuration is the common root of permissions and lifecycle: plugin admission, skill disabling, Hook trust, and network constraints all derive from traceable configuration layers.</li>
+  <li>Remote plugins, MCP OAuth, model API, cloud tasks, and OTLP exporters are all external communication boundaries; failures are converted into domain errors or diagnostic information.</li>
+  <li>Plugin caching and remote refresh use serialized state to avoid concurrent refresh overwrites; telemetry and analytics events use queuing and deduplication limits for capacity control.</li>
+  <li>Tests, generated schema/protobuf, and fixed templates are not expanded as runtime implementations; small utility crates have been mapped by public API and ownership.</li>
+</ul>
+
+<script>
+window.__sourceMap = {
+  "plugin-entry": {"file":"codex-rs/core-plugins/src/lib.rs","startLine":1,"endLine":59},
+  "manager-create": {"file":"codex-rs/core-plugins/src/manager.rs","startLine":388,"endLine":423},
+  "load-stack": {"file":"codex-rs/core-plugins/src/loader.rs","startLine":132,"endLine":169},
+  "load-scope": {"file":"codex-rs/core-plugins/src/loader.rs","startLine":70,"endLine":77},
+  "capability-load": {"file":"codex-rs/core-plugins/src/loader.rs","startLine":111,"endLine":130},
+  "hook-only": {"file":"codex-rs/core-plugins/src/loader.rs","startLine":171,"endLine":197},
+  "install-request": {"file":"codex-rs/core-plugins/src/manager.rs","startLine":1078,"endLine":1088},
+  "remote-sync": {"file":"codex-rs/core-plugins/src/manager.rs","startLine":1090,"endLine":1111},
+  "remote-enable": {"file":"codex-rs/core-plugins/src/manager.rs","startLine":1090,"endLine":1111},
+  "materialize": {"file":"codex-rs/core-plugins/src/manager.rs","startLine":1113,"endLine":1171},
+  "persist-enable": {"file":"codex-rs/core-plugins/src/manager.rs","startLine":1113,"endLine":1171},
+  "analytics-install": {"file":"codex-rs/core-plugins/src/manager.rs","startLine":1113,"endLine":1171},
+  "extension-registry": {"file":"codex-rs/ext/extension-api/src/registry.rs","startLine":35,"endLine":80},
+  "register-slots": {"file":"codex-rs/ext/extension-api/src/registry.rs","startLine":82,"endLine":158},
+  "runtime-contribution": {"file":"codex-rs/ext/extension-api/src/registry.rs","startLine":160,"endLine":177},
+  "prompt-tools": {"file":"codex-rs/ext/extension-api/src/registry.rs","startLine":179,"endLine":241},
+  "hook-build": {"file":"codex-rs/hooks/src/registry.rs","startLine":60,"endLine":82},
+  "dispatch-hook": {"file":"codex-rs/hooks/src/registry.rs","startLine":94,"endLine":107},
+  "abort-check": {"file":"codex-rs/hooks/src/registry.rs","startLine":94,"endLine":107},
+  "deny-operation": {"file":"codex-rs/hooks/src/registry.rs","startLine":94,"endLine":107},
+  "continue-operation": {"file":"codex-rs/hooks/src/registry.rs","startLine":94,"endLine":107},
+  "api-client": {"file":"codex-rs/codex-api/src/lib.rs","startLine":1,"endLine":109},
+  "encode-response": {"file":"codex-rs/codex-api/src/endpoint/responses.rs","startLine":71,"endLine":107},
+  "transport-choice": {"file":"codex-rs/rmcp-client/src/lib.rs","startLine":1,"endLine":39},
+  "stream-api": {"file":"codex-rs/codex-api/src/endpoint/responses.rs","startLine":137,"endLine":172},
+  "mcp-connect": {"file":"codex-rs/rmcp-client/src/rmcp_client.rs","startLine":314,"endLine":332},
+  "oauth-check": {"file":"codex-rs/rmcp-client/src/auth_status.rs","startLine":46,"endLine":112},
+  "oauth-login": {"file":"codex-rs/rmcp-client/src/perform_oauth_login.rs","startLine":164,"endLine":229},
+  "proxy-policy": {"file":"codex-rs/network-proxy/src/proxy.rs","startLine":167,"endLine":287},
+  "network-decision": {"file":"codex-rs/network-proxy/src/network_policy.rs","startLine":335,"endLine":398},
+  "blocked-observer": {"file":"codex-rs/network-proxy/src/runtime.rs","startLine":124,"endLine":155},
+  "upstream": {"file":"codex-rs/network-proxy/src/proxy.rs","startLine":697,"endLine":770}
+};
+</script>
+<aside id="source-panel"><div id="source-header"></div><div id="monaco-container"></div></aside><script src="assets/codeindex-runtime.js"></script><script src="assets/codeindex.js"></script></body></html>

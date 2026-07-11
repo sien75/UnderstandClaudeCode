@@ -1,0 +1,163 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Terminal Interaction: Turning User Input into a Continuously Updated, Approvable Conversation</title><link rel="stylesheet" href="assets/codeindex.css"></head><body><p><a href="index.html">← Back to Overview</a></p><h1>Terminal Interaction: Turning User Input into a Continuously Updated, Approvable Conversation</h1>
+
+<p>After the user starts Codex, they can resume an old task or start a new one, entering text, images, mentions, and slash commands in the bottom editor; during execution, the model's responses, reasoning, plans, and tool execution gradually appear in the conversation area. When encountering commands, file modifications, permissions, or MCP requests, normal input temporarily yields to an approval view; after the user decides, the result is sent back to the running task.</p>
+
+<dl>
+  <dt>Input</dt>
+  <dd>Startup parameters, tasks to resume, keyboard and paste events, user messages, and task events and approval requests continuously sent from the app-server.</dd>
+  <dt>Output</dt>
+  <dd>Chronologically updated terminal conversation, current running status, approval interface requiring user action, and messages, interruptions, and approval decisions submitted to the app-server.</dd>
+</dl>
+
+<p>Startup and event convergence: The TUI first completes configuration, terminal, and app-server initialization; the session selector loads tasks page by page and can asynchronously preview history. Once in chat, all input sources converge into a single event loop, so rendering, network notifications, and user keystrokes do not independently modify the terminal.</p>
+
+<pre class="mermaid">
+graph TD
+  launch-tui["Launch TUI and parse security and configuration options"] --> init-terminal["Initialize terminal and connect to app-server"]
+  init-terminal --> choose-session{"Resume old task or start new task"}
+  choose-session -->|resume| load-session-page["Load resumable tasks with pagination"]
+  load-session-page --> filter-session["Search, sort, and select a task"]
+  filter-session --> preview-transcript["Asynchronously load history preview"]
+  preview-transcript --> start-app["Create chat interface with selected task"]
+  choose-session -->|new| start-app
+  start-app --> event-loop["Concurrently wait for four types of events"]
+  event-loop --> internal-event["Process internal AppEvent"]
+  event-loop --> terminal-event["Process keystrokes, paste, redraw, and resize"]
+  event-loop --> thread-event["Process current task notifications"]
+  event-loop --> server-event["Process app-server global events"]
+  terminal-event --> draw-frame["Compose conversation, activity units, and bottom input area"]
+  internal-event --> event-loop
+  thread-event --> event-loop
+  server-event --> event-loop
+  draw-frame --> event-loop
+</pre>
+
+<p>Input data flow: Keystrokes are first handed to the current modal view; only when no modal is active do they enter the editor. Upon submission, image capability is checked, shell escapes and slash commands are parsed, mentions are encoded, and the current model, permissions, and collaboration mode are attached. Empty or non-submittable messages remain local; a new turn is created when the task is idle, or queued as a steer when the task is running.</p>
+
+<pre class="mermaid">
+graph TD
+  key-input["User keystroke or paste content"] --> route-key{"Is there a current modal view"}
+  route-key -->|yes| active-view["Hand off to approval, selector, or prompt view"]
+  route-key -->|no| composer["Editor updates text, images, and mentions"]
+  composer --> submit-result{"Did the editor submit"}
+  submit-result -->|no| redraw-input["Request next frame to show draft"]
+  submit-result -->|yes| classify-input{"Is it a shell, slash command, or normal message"}
+  classify-input -->|shell| shell-command["Submit local shell command and record history"]
+  classify-input -->|slash command| slash-command["Dispatch local action or convert to message"]
+  classify-input -->|normal message| validate-message["Validate images and assemble full user content"]
+  validate-message --> submission-ready{"Is the session configured and content valid"}
+  submission-ready -->|no| restore-draft["Keep draft and show reason"]
+  submission-ready -->|yes| running-turn{"Is the current task still running"}
+  running-turn -->|no| start-turn["Submit new turn and immediately display user message"]
+  running-turn -->|yes| queue-steer["Submit steer and add to pending send preview"]
+  start-turn --> persist-history["Encode mentions and write to cross-session input history"]
+  queue-steer --> persist-history
+</pre>
+
+<p>Output and lifecycle: App-server notifications are first filtered by task, then update the turn status, tool units, or streaming controller based on the event type. Text deltas are not written character-by-character directly to the scroll buffer; instead, they are accumulated in source, and only complete lines that have stabilized are committed, while the mutable tail is preserved. When complete, canonical history units are generated from the full Markdown. This way, when the terminal width is adjusted, the committed scroll buffer and the active tail remain in order.</p>
+
+<pre class="mermaid">
+graph TD
+  receive-notification["Received current task notification"] --> notification-kind{"Which category does the notification belong to"}
+  notification-kind -->|turn start| mark-running["Enter running state and clear old errors"]
+  notification-kind -->|text delta| collect-delta["Collect response, plan, or reasoning delta"]
+  collect-delta --> stable-line{"Has a complete and structurally stable line appeared"}
+  stable-line -->|no| live-tail["Only update the mutable screen tail"]
+  stable-line -->|yes| commit-lines["Commit stable lines to scroll buffer at pace"]
+  commit-lines --> live-tail
+  notification-kind -->|tool start or output| tool-cell["Create or update active tool unit"]
+  notification-kind -->|item complete| finalize-item["Solidify active unit into history"]
+  notification-kind -->|turn complete| turn-status{"Completed, interrupted, or failed"}
+  turn-status -->|completed| finalize-stream["Solidify final response from full Markdown"]
+  turn-status -->|interrupted| interrupted["Stop animation and preserve resumable input"]
+  turn-status -->|failed| show-error["Show error or wait for automatic retry"]
+  finalize-stream --> idle-state["Return to idle state and send next queued input"]
+  interrupted --> idle-state
+  show-error --> idle-state
+</pre>
+
+<p>Approval state machine: When a request arrives, the active tail of the response is first flushed to avoid the approval box being inserted mid-text. If the user is typing, approval may be briefly delayed; the request then enters a unified queue. After the user chooses allow once, allow session, deny, or cancel, the view wraps the decision into a specified task operation, sends it back to the app-server via AppEvent, and then displays the next item in the queue.</p>
+
+<pre class="mermaid">
+graph TD
+  approval-arrives["Received command, patch, permission, or MCP request"] --> flush-before-approval["First solidify the currently streaming response"]
+  flush-before-approval --> typing-recently{"Has the user been typing recently"}
+  typing-recently -->|yes| delay-approval["Briefly queue to avoid swallowing keystrokes"]
+  typing-recently -->|no| show-approval["Open approval view immediately"]
+  delay-approval --> show-approval
+  show-approval --> choose-decision{"User selects a decision"}
+  choose-decision -->|allow| allow-request["Form an allow decision"]
+  choose-decision -->|deny or cancel| deny-request["Form a deny or abort decision"]
+  allow-request --> send-decision["Submit approval action by source task"]
+  deny-request --> send-decision
+  send-decision --> advance-approval{"Are there more requests in the queue"}
+  advance-approval -->|yes| show-approval
+  advance-approval -->|no| restore-composer["Restore status prompt and normal editor"]
+</pre>
+
+<ul>
+  <li>Boundary: The TUI does not perform model inference or tool execution; it passes user intent and approval decisions to the app-server; the core execution chain is handled by the core module.</li>
+  <li>State machine emphasis: Idle, turn running, waiting for approval, interrupted, and finished are not independent pages, but orthogonal states jointly maintained by ChatWidget, BottomPane, and the streaming controller.</li>
+  <li>The resume picker does not filter local paths for remote workspaces; pagination, search tokens, and preview loading tokens prevent older asynchronous results from overwriting a new selection.</li>
+  <li>Ctrl+C first cancels the current modal or running task; only when there is nothing cancellable does it enter the double-tap exit window, avoiding accidental session loss from a single mis-press.</li>
+</ul>
+
+<script>
+window.__sourceMap = {
+  "launch-tui":{"file":"codex-rs/tui/src/lib.rs","startLine":844,"endLine":1262},
+  "init-terminal":{"file":"codex-rs/tui/src/lib.rs","startLine":1265,"endLine":1662},
+  "choose-session":{"file":"codex-rs/tui/src/resume_picker.rs","startLine":340,"endLine":386},
+  "load-session-page":{"file":"codex-rs/tui/src/resume_picker.rs","startLine":733,"endLine":764},
+  "filter-session":{"file":"codex-rs/tui/src/resume_picker.rs","startLine":1397,"endLine":1417},
+  "preview-transcript":{"file":"codex-rs/tui/src/resume_picker.rs","startLine":765,"endLine":807},
+  "start-app":{"file":"codex-rs/tui/src/app.rs","startLine":759,"endLine":1216},
+  "event-loop":{"file":"codex-rs/tui/src/app.rs","startLine":759,"endLine":1216},
+  "internal-event":{"file":"codex-rs/tui/src/app.rs","startLine":759,"endLine":1216},
+  "terminal-event":{"file":"codex-rs/tui/src/app.rs","startLine":1254,"endLine":1336},
+  "thread-event":{"file":"codex-rs/tui/src/chatwidget/protocol.rs","startLine":4,"endLine":227},
+  "server-event":{"file":"codex-rs/tui/src/app.rs","startLine":759,"endLine":1216},
+  "draw-frame":{"file":"codex-rs/tui/src/app.rs","startLine":1338,"endLine":1351},
+  "key-input":{"file":"codex-rs/tui/src/chatwidget/interaction.rs","startLine":6,"endLine":172},
+  "route-key":{"file":"codex-rs/tui/src/bottom_pane/mod.rs","startLine":572,"endLine":664},
+  "active-view":{"file":"codex-rs/tui/src/bottom_pane/mod.rs","startLine":572,"endLine":664},
+  "composer":{"file":"codex-rs/tui/src/bottom_pane/mod.rs","startLine":572,"endLine":664},
+  "submit-result":{"file":"codex-rs/tui/src/chatwidget/interaction.rs","startLine":6,"endLine":172},
+  "redraw-input":{"file":"codex-rs/tui/src/chatwidget/interaction.rs","startLine":328,"endLine":350},
+  "classify-input":{"file":"codex-rs/tui/src/chatwidget/input_submission.rs","startLine":98,"endLine":421},
+  "shell-command":{"file":"codex-rs/tui/src/chatwidget/input_submission.rs","startLine":24,"endLine":39},
+  "slash-command":{"file":"codex-rs/tui/src/chatwidget/input_submission.rs","startLine":98,"endLine":421},
+  "validate-message":{"file":"codex-rs/tui/src/chatwidget/input_submission.rs","startLine":98,"endLine":421},
+  "submission-ready":{"file":"codex-rs/tui/src/chatwidget/input_submission.rs","startLine":98,"endLine":421},
+  "restore-draft":{"file":"codex-rs/tui/src/chatwidget/input_submission.rs","startLine":430,"endLine":451},
+  "running-turn":{"file":"codex-rs/tui/src/chatwidget/input_submission.rs","startLine":98,"endLine":421},
+  "start-turn":{"file":"codex-rs/tui/src/chatwidget/input_submission.rs","startLine":98,"endLine":421},
+  "queue-steer":{"file":"codex-rs/tui/src/chatwidget/input_submission.rs","startLine":98,"endLine":421},
+  "persist-history":{"file":"codex-rs/tui/src/chatwidget/input_submission.rs","startLine":98,"endLine":421},
+  "receive-notification":{"file":"codex-rs/tui/src/chatwidget/protocol.rs","startLine":4,"endLine":227},
+  "notification-kind":{"file":"codex-rs/tui/src/chatwidget/protocol.rs","startLine":4,"endLine":227},
+  "mark-running":{"file":"codex-rs/tui/src/chatwidget/protocol.rs","startLine":4,"endLine":227},
+  "collect-delta":{"file":"codex-rs/tui/src/chatwidget/streaming.rs","startLine":383,"endLine":422},
+  "stable-line":{"file":"codex-rs/tui/src/streaming/controller.rs","startLine":129,"endLine":145},
+  "live-tail":{"file":"codex-rs/tui/src/streaming/controller.rs","startLine":214,"endLine":217},
+  "commit-lines":{"file":"codex-rs/tui/src/streaming/controller.rs","startLine":168,"endLine":186},
+  "tool-cell":{"file":"codex-rs/tui/src/chatwidget/protocol.rs","startLine":279,"endLine":323},
+  "finalize-item":{"file":"codex-rs/tui/src/chatwidget/protocol.rs","startLine":325,"endLine":335},
+  "turn-status":{"file":"codex-rs/tui/src/chatwidget/protocol.rs","startLine":229,"endLine":277},
+  "finalize-stream":{"file":"codex-rs/tui/src/chatwidget/streaming.rs","startLine":19,"endLine":59},
+  "interrupted":{"file":"codex-rs/tui/src/chatwidget/protocol.rs","startLine":229,"endLine":277},
+  "show-error":{"file":"codex-rs/tui/src/chatwidget/protocol.rs","startLine":229,"endLine":277},
+  "idle-state":{"file":"codex-rs/tui/src/chatwidget/protocol.rs","startLine":229,"endLine":277},
+  "approval-arrives":{"file":"codex-rs/tui/src/chatwidget/tool_requests.rs","startLine":288,"endLine":312},
+  "flush-before-approval":{"file":"codex-rs/tui/src/chatwidget/streaming.rs","startLine":19,"endLine":59},
+  "typing-recently":{"file":"codex-rs/tui/src/bottom_pane/mod.rs","startLine":1349,"endLine":1384},
+  "delay-approval":{"file":"codex-rs/tui/src/bottom_pane/mod.rs","startLine":1349,"endLine":1384},
+  "show-approval":{"file":"codex-rs/tui/src/bottom_pane/mod.rs","startLine":1349,"endLine":1384},
+  "choose-decision":{"file":"codex-rs/tui/src/bottom_pane/approval_overlay.rs","startLine":302,"endLine":348},
+  "allow-request":{"file":"codex-rs/tui/src/bottom_pane/approval_overlay.rs","startLine":349,"endLine":387},
+  "deny-request":{"file":"codex-rs/tui/src/bottom_pane/approval_overlay.rs","startLine":349,"endLine":387},
+  "send-decision":{"file":"codex-rs/tui/src/app_event_sender.rs","startLine":80,"endLine":114},
+  "advance-approval":{"file":"codex-rs/tui/src/bottom_pane/approval_overlay.rs","startLine":473,"endLine":480},
+  "restore-composer":{"file":"codex-rs/tui/src/bottom_pane/approval_overlay.rs","startLine":473,"endLine":480}
+};
+</script>
+<aside id="source-panel"><div id="source-header"></div><div id="monaco-container"></div></aside><script src="assets/codeindex-runtime.js"></script><script src="assets/codeindex.js"></script></body></html>

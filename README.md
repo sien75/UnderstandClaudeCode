@@ -6,7 +6,9 @@ Source-code analyses of [Claude Code](https://github.com/codeaashu/claude-code),
 
 ## How it was generated
 
-All source-code analyses were generated using **Claude Code + GLM 5.2**, with the help of [CodeIndex](https://github.com/sien75/CodeIndex).
+All source-code analyses were generated using [CodeIndex](https://github.com/sien75/CodeIndex):
+- **Claude Code** & **Pi** — analyzed with **Claude Code + GLM 5.2**
+- **Codex** — analyzed with **Codex + GPT-5.6 Sol**
 
 ## License
 
@@ -22,7 +24,9 @@ The analysis content is provided for educational and research purposes. The orig
 
 ## 生成方式
 
-所有源码分析均使用 **Claude Code + GLM 5.2** 完成，并借助 [CodeIndex](https://github.com/sien75/CodeIndex)。
+所有源码分析均使用 [CodeIndex](https://github.com/sien75/CodeIndex) 生成：
+- **Claude Code** 与 **Pi** — 使用 **Claude Code + GLM 5.2** 分析
+- **Codex** — 使用 **Codex + GPT-5.6 Sol** 分析
 
 ## 许可
 

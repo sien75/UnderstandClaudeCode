@@ -1,0 +1,128 @@
+<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>App Server 与 CLI 管理面</title><link rel="stylesheet" href="assets/codeindex.css"></head><body><p><a href="index.html">← 返回总览</a></p><h1>App Server 与 CLI 管理面</h1>
+
+<p>这一模块说明桌面端、IDE、脚本或管理员如何通过 Codex 的公开 JSON-RPC API 和命令行控制会话、回合、账号、插件、MCP、远程控制与隔离执行。外部输入先被协议层还原成有类型的请求，再经过连接初始化、实验能力和权限边界，最后按资源作用域串行送到对应处理器；结果和持续事件沿原连接返回。</p>
+
+<dl>
+  <dt>输入</dt>
+  <dd>CLI 子命令，或来自 stdio、WebSocket、Unix socket、远程控制通道的 JSON-RPC 请求与通知</dd>
+  <dt>输出</dt>
+  <dd>类型化响应、错误与持续通知；或者一个受会话和文件系统边界约束的远程执行环境</dd>
+</dl>
+
+<p>公开 API 的主干不是一组彼此独立的 handler。协议宏先给每个方法绑定参数、响应、实验标记和串行化作用域；消息处理器再执行连接级检查，并把调用分派到 thread、turn、account、plugin、MCP、文件系统或进程处理器。这样同一 thread 或进程上的写操作不会互相越过，而无关资源仍可并发。</p>
+
+<pre class="mermaid">
+graph TD
+  api-catalog["声明公开方法、参数、响应和资源作用域"] --> decode-request["把 JSON-RPC 还原成类型化请求"]
+  decode-request --> initialized-check{"连接是否已初始化？"}
+  initialized-check -->|否且不是初始化| init-error["返回未初始化错误"]
+  initialized-check -->|初始化请求| initialize-connection["记录客户端能力并建立连接会话"]
+  initialized-check -->|是| experimental-check{"实验方法是否获客户端声明？"}
+  experimental-check -->|否| experimental-error["拒绝未协商的实验 API"]
+  experimental-check -->|是| permission-check{"请求是否通过连接权限门？"}
+  permission-check -->|否| permission-error["返回权限错误"]
+  permission-check -->|是| serialize-scope["按 thread、进程、watch 或全局资源排队"]
+  serialize-scope --> dispatch-domain["分派到对应业务处理器"]
+  dispatch-domain --> processor-result{"处理器结果"}
+  processor-result -->|成功且有响应| typed-response["编码类型化成功响应"]
+  processor-result -->|异步操作已接管| async-events["后续通过通知持续回传"]
+  processor-result -->|失败| typed-error["编码 JSON-RPC 错误"]
+</pre>
+
+<p>通信层把相同的消息语义放到不同载体上：本地 CLI 常用 stdio，桌面应用和守护进程可使用 Unix socket 或 WebSocket，远程控制则在认证、配对和期望状态同步后转发连接。传输层只负责连接、帧和出站背压；请求语义仍由统一消息处理器掌握。</p>
+
+<pre class="mermaid">
+graph TD
+  choose-transport["选择 stdio、WebSocket、Unix socket 或远程控制"] --> start-app-server["启动 App Server 并建立共享服务状态"]
+  start-app-server --> accept-connection["接受连接并创建连接级会话"]
+  accept-connection --> auth-boundary{"该传输是否要求认证或配对？"}
+  auth-boundary -->|失败| close-connection["拒绝并关闭连接"]
+  auth-boundary -->|通过或本地可信| read-message["读取 JSON-RPC 消息"]
+  read-message --> route-message{"消息种类"}
+  route-message -->|请求| process-api["进入公开 API 检查与分派"]
+  route-message -->|通知| process-notification["处理无需响应的客户端事件"]
+  route-message -->|响应| resolve-server-call["完成服务器发起的反向调用"]
+  process-api --> outbound-queue["把响应或通知送入有界出站队列"]
+  process-notification --> outbound-queue
+  resolve-server-call --> outbound-queue
+  outbound-queue --> write-frame["写回原连接"]
+</pre>
+
+<p>命令行管理面既能直接启动交互式 Codex，也能管理长期运行的 App Server。`app-server` 子命令负责服务生命周期、远控开关、代理和协议产物；独立的 `exec-server` 面向执行器，把进程、文件系统和 HTTP 请求统一包装成 JSON-RPC，并用初始化会话、进程登记表及沙箱上下文约束资源。</p>
+
+<pre class="mermaid">
+graph TD
+  parse-cli["解析顶层 CLI 与配置覆盖"] --> choose-command{"用户选择哪类操作？"}
+  choose-command -->|交互、执行、恢复、审查| run-product["进入交互或批处理产品流程"]
+  choose-command -->|app-server| appserver-command{"选择服务管理操作"}
+  appserver-command -->|直接运行| run-appserver-cli["以前台传输启动 App Server"]
+  appserver-command -->|start、stop、restart、status| daemon-lifecycle["由守护进程管理 PID、版本和更新"]
+  appserver-command -->|远程控制| remote-control["启停并探测远控连接状态"]
+  appserver-command -->|proxy| proxy-server["代理到已运行的本地服务"]
+  appserver-command -->|生成协议产物| export-schema["导出 TypeScript 或 JSON Schema"]
+  choose-command -->|exec-server| run-execserver["启动隔离执行 JSON-RPC 服务"]
+  run-execserver --> exec-transport{"选择 stdio 或本地 WebSocket"}
+  exec-transport --> exec-processor["为连接建立 RPC 处理循环"]
+  exec-processor --> exec-router{"按方法路由"}
+  exec-router -->|进程| process-handler["启动、读写、发信号或终止进程"]
+  exec-router -->|文件系统| filesystem-handler["在沙箱上下文内读写和遍历文件"]
+  exec-router -->|HTTP| http-handler["代发请求并流式返回响应体"]
+  exec-router -->|未知或未初始化| exec-error["返回协议错误"]
+</pre>
+
+<ul>
+  <li>类型边界：v2 请求字段在 wire 上使用 camelCase，配置 RPC 例外地保持与 config.toml 一致的 snake_case；方法参数、响应和通知可共同生成 TypeScript 与 JSON Schema。</li>
+  <li>权限边界：初始化能力决定实验 API 是否可见，连接权限门限制高风险方法；exec-server 另外校验初始化顺序、会话归属和文件系统沙箱上下文。</li>
+  <li>兼容边界：协议仍保留 v1 映射，但新 API 集中在 v2；客户端既可嵌入同进程服务，也可通过 Unix socket 或 WebSocket 连接远端。</li>
+  <li>执行结果可能不是一次性响应：长命令输出、回合 item、审批请求、账号状态和远控状态均可通过服务器通知继续推送。</li>
+</ul>
+
+<script>
+window.__sourceMap = {
+  "api-catalog": {"file":"codex-rs/app-server-protocol/src/protocol/common.rs","startLine":466,"endLine":1412},
+  "decode-request": {"file":"codex-rs/app-server/src/message_processor.rs","startLine":98,"endLine":112},
+  "initialized-check": {"file":"codex-rs/app-server/src/message_processor.rs","startLine":807,"endLine":850},
+  "init-error": {"file":"codex-rs/app-server/src/message_processor.rs","startLine":807,"endLine":850},
+  "initialize-connection": {"file":"codex-rs/app-server/src/message_processor.rs","startLine":704,"endLine":711},
+  "experimental-check": {"file":"codex-rs/app-server/src/message_processor.rs","startLine":852,"endLine":913},
+  "experimental-error": {"file":"codex-rs/app-server/src/message_processor.rs","startLine":852,"endLine":913},
+  "permission-check": {"file":"codex-rs/app-server/src/message_processor.rs","startLine":915,"endLine":1486},
+  "permission-error": {"file":"codex-rs/app-server/src/message_processor.rs","startLine":915,"endLine":1486},
+  "serialize-scope": {"file":"codex-rs/app-server/src/message_processor.rs","startLine":687,"endLine":702},
+  "dispatch-domain": {"file":"codex-rs/app-server/src/message_processor.rs","startLine":915,"endLine":1486},
+  "processor-result": {"file":"codex-rs/app-server/src/message_processor.rs","startLine":915,"endLine":1486},
+  "typed-response": {"file":"codex-rs/app-server/src/message_processor.rs","startLine":915,"endLine":1486},
+  "async-events": {"file":"codex-rs/app-server/src/message_processor.rs","startLine":915,"endLine":1486},
+  "typed-error": {"file":"codex-rs/app-server/src/message_processor.rs","startLine":915,"endLine":1486},
+  "choose-transport": {"file":"codex-rs/app-server-transport/src/transport/mod.rs","startLine":73,"endLine":79},
+  "start-app-server": {"file":"codex-rs/app-server/src/lib.rs","startLine":388,"endLine":431},
+  "accept-connection": {"file":"codex-rs/app-server/src/lib.rs","startLine":433,"endLine":675},
+  "auth-boundary": {"file":"codex-rs/app-server-transport/src/transport/auth.rs","startLine":21,"endLine":91},
+  "close-connection": {"file":"codex-rs/app-server-transport/src/transport/auth.rs","startLine":21,"endLine":91},
+  "read-message": {"file":"codex-rs/app-server/src/message_processor.rs","startLine":572,"endLine":628},
+  "route-message": {"file":"codex-rs/app-server/src/message_processor.rs","startLine":572,"endLine":628},
+  "process-api": {"file":"codex-rs/app-server/src/message_processor.rs","startLine":630,"endLine":672},
+  "process-notification": {"file":"codex-rs/app-server/src/message_processor.rs","startLine":674,"endLine":685},
+  "resolve-server-call": {"file":"codex-rs/app-server/src/message_processor.rs","startLine":795,"endLine":805},
+  "outbound-queue": {"file":"codex-rs/app-server-transport/src/outgoing_message.rs","startLine":13,"endLine":47},
+  "write-frame": {"file":"codex-rs/app-server-transport/src/transport/websocket.rs","startLine":91,"endLine":190},
+  "parse-cli": {"file":"codex-rs/cli/src/main.rs","startLine":963,"endLine":1647},
+  "choose-command": {"file":"codex-rs/cli/src/main.rs","startLine":123,"endLine":212},
+  "run-product": {"file":"codex-rs/cli/src/main.rs","startLine":963,"endLine":1647},
+  "appserver-command": {"file":"codex-rs/cli/src/main.rs","startLine":591,"endLine":608},
+  "run-appserver-cli": {"file":"codex-rs/app-server/src/lib.rs","startLine":388,"endLine":431},
+  "daemon-lifecycle": {"file":"codex-rs/app-server-daemon/src/lib.rs","startLine":190,"endLine":193},
+  "remote-control": {"file":"codex-rs/app-server-daemon/src/lib.rs","startLine":228,"endLine":231},
+  "proxy-server": {"file":"codex-rs/cli/src/main.rs","startLine":963,"endLine":1647},
+  "export-schema": {"file":"codex-rs/app-server-protocol/src/export.rs","startLine":106,"endLine":185},
+  "run-execserver": {"file":"codex-rs/cli/src/main.rs","startLine":1676,"endLine":1723},
+  "exec-transport": {"file":"codex-rs/exec-server/src/server/transport.rs","startLine":80,"endLine":90},
+  "exec-processor": {"file":"codex-rs/exec-server/src/server/processor.rs","startLine":44,"endLine":186},
+  "exec-router": {"file":"codex-rs/exec-server/src/server/registry.rs","startLine":44,"endLine":161},
+  "process-handler": {"file":"codex-rs/exec-server/src/server/process_handler.rs","startLine":21,"endLine":66},
+  "filesystem-handler": {"file":"codex-rs/exec-server/src/server/file_system_handler.rs","startLine":50,"endLine":235},
+  "http-handler": {"file":"codex-rs/exec-server/src/server/handler.rs","startLine":73,"endLine":402},
+  "exec-error": {"file":"codex-rs/exec-server/src/server/processor.rs","startLine":44,"endLine":186}
+};
+</script>
+<aside id="source-panel"><div id="source-header"></div><div id="monaco-container"></div></aside><script src="assets/codeindex-runtime.js"></script><script src="assets/codeindex.js"></script></body></html>

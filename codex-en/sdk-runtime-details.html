@@ -1,0 +1,80 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>SDK Public API and Local Runtime Distribution</title><link rel="stylesheet" href="assets/codeindex.css"></head><body><p><a href="index.html">← Back to Overview</a></p><h1>SDK Public API and Local Runtime Distribution</h1>
+<p>SDK users enter Codex through stable TypeScript exports or Python top-level objects. Both implementations ultimately need to find a Codex executable matching the current platform, but TypeScript resolves the binary via npm optional dependencies and starts a process per turn, while Python prefers using a standalone wheel runtime package and lets an App Server connection carry account, thread, turn, and goal operations.</p>
+<dl><dt>Input</dt><dd>SDK configuration, account and thread operations, user input, goal budget, and the current operating system and CPU architecture.</dd><dt>Output</dt><dd>Typed synchronous/asynchronous SDK results; or an installable wheel containing the correct platform's Codex CLI for the SDK to launch at runtime.</dd></dl>
+<p>The TypeScript entry point only exports selected public types and classes. The client resolves npm platform packages at construction time; at runtime it converts nested configuration into TOML overrides understandable by the CLI, and prepends bundled tool directories to PATH.</p>
+<pre class="mermaid">
+graph TD
+  ts-entry["Application selects public API from SDK entry"] --> ts-client["Create client and retain global configuration"]
+  ts-client --> ts-platform{"Identify operating system and CPU"}
+  ts-platform -->|not supported| ts-platform-error["Report platform not supported"]
+  ts-platform -->|supported| ts-package["Locate platform package from npm optional dependencies"]
+  ts-package --> ts-layout{"Package uses new or old layout?"}
+  ts-layout -->|new layout| ts-native["Verify metadata and select bin/codex"]
+  ts-layout -->|old layout| ts-legacy["Compatibly select codex/codex"]
+  ts-layout -->|neither exists| ts-missing["Prompt to reinstall platform dependencies"]
+  ts-native --> ts-path["Prepend bundled tool directory to PATH"]
+  ts-legacy --> ts-path
+  ts-path --> ts-thread{"Caller creates or resumes a thread?"}
+  ts-thread --> ts-input["Split text and local images into CLI input"]
+  ts-input --> ts-config["Flatten and encode nested configuration as TOML"]
+  ts-config --> ts-exec["Start codex exec and read JSONL"]
+  ts-exec --> ts-event{"Event is start, project, completion, or error?"}
+  ts-event --> ts-stream["Stream delivery one by one"]
+  ts-event --> ts-result["Summarize final answer, projects, and usage"]
+</pre>
+<p>Python's public layer provides both synchronous and asynchronous facades; the async version offloads blocking client work to a thread. In addition to regular turns, goal operations collapse multiple physical turns into one logical flow: it truly ends only when the goal pauses, blocks, reaches its limit, or completes, and maintains consistent logical turn numbering across interruptions and turn-rolling races.</p>
+<pre class="mermaid">
+graph TD
+  py-api["Application selects synchronous or asynchronous public facade"] --> py-start["Start and initialize App Server"]
+  py-start --> py-actions{"Select account, thread, turn, or model operation"}
+  py-actions --> py-login["Login start, cancel, and wait for result"]
+  py-actions --> py-thread["Create, resume, list, read, fork, archive, or compress thread"]
+  py-actions --> py-turn["Start, append, or interrupt regular turn"]
+  py-actions --> py-goal["Create a continuous goal with a budget"]
+  py-goal --> py-reserve{"Thread already has a goal operation?"}
+  py-reserve -->|Yes| py-busy["Reject duplicate goal operation"]
+  py-reserve -->|No| py-clear["Clear stale goals if necessary and activate routing"]
+  py-clear --> py-physical["Receive one or more physical turn events"]
+  py-physical --> py-state{"How does the goal state change?"}
+  py-state -->|still active| py-roll["Wait for next physical turn and maintain logical numbering"]
+  py-roll --> py-physical
+  py-state -->|paused, blocked, limit reached, or completed| py-complete["Synthesize into a single logical completion event"]
+  py-state -->|caller cancels| py-interrupt["Resolve current turn and request interruption"]
+  py-interrupt --> py-complete
+  py-actions --> py-router["JSON-RPC router dispatches by request, login, turn, and goal"]
+  py-router --> py-errors{"What type of error does the server return?"}
+  py-errors --> py-typed["Map to recognizable SDK exceptions"]
+  py-typed --> py-retry{"Is it a temporary overload and the caller chooses to retry?"}
+  py-retry -->|Yes| py-backoff["Exponential backoff with jitter"]
+  py-retry -->|No| py-fail["Return exception to caller"]
+</pre>
+<p>Python's CLI binary is independently published as a platform wheel. The build hook prohibits source distributions and pins non-pure-Python platform tags; the development/release helper pipeline derives the version from the SDK's exact dependency pin, downloads the corresponding GitHub Release assets, stages the runtime package and force-installs it, then finally verifies version and binary availability again.</p>
+<pre class="mermaid">
+graph TD
+  rt-pin["Read SDK's exact version pin for runtime package"] --> rt-installed{"Target Python already has a binary at the same version available?"}
+  rt-installed -->|Yes| rt-reuse["Reuse existing runtime directly"]
+  rt-installed -->|No| rt-platform["Map system and architecture to release assets"]
+  rt-platform -->|not supported| rt-unsupported["Report no available platform build"]
+  rt-platform -->|supported| rt-download["Prefer downloading tarball from Release URL"]
+  rt-download --> rt-fallback{"Direct download failed?"}
+  rt-fallback -->|Yes| rt-api["Query Release API, using token or gh if necessary"]
+  rt-fallback -->|No| rt-stage["Call packaging script to stage wheel contents"]
+  rt-api --> rt-stage
+  rt-stage --> rt-install["Force-install with pip without resolving additional dependencies"]
+  rt-install --> rt-check{"Version and binary both correct after installation?"}
+  rt-check -->|No| rt-error["Report incomplete runtime installation"]
+  rt-check -->|Yes| rt-ready["SDK can obtain bundled_codex_path"]
+  rt-wheel["Build platform wheel"] --> rt-sdist{"Target is a source distribution?"}
+  rt-sdist -->|Yes| rt-wheel-error["Refuse to publish source distribution"]
+  rt-sdist -->|No| rt-tag["Write py3-none-platform tag"]
+  rt-tag --> rt-ready
+</pre>
+<ul><li>TypeScript's type schema defines a discriminated union of events and thread items; Python's protocol model is primarily provided by generated code, and this report marks generated files as ignored, only delving into handwritten adaptation, validation, and lifecycle logic.</li><li>Python's approval mode configures both sandbox and approval policy simultaneously, avoiding dangerous combinations being scattered to the caller; initialization metadata and version resolution ensure the server can identify the SDK source.</li><li>Runtime download includes multiple levels of fallback: anonymous direct link, token-authenticated GitHub API, and finally authenticated gh. Any step failure retains diagnostic context rather than silently selecting the wrong platform.</li></ul>
+<script>
+window.__sourceMap = {
+"ts-entry":{"file":"sdk/typescript/src/index.ts","startLine":1,"endLine":40},"ts-client":{"file":"sdk/typescript/src/codex.ts","startLine":11,"endLine":39},"ts-platform":{"file":"sdk/typescript/src/exec.ts","startLine":334,"endLine":410},"ts-platform-error":{"file":"sdk/typescript/src/exec.ts","startLine":334,"endLine":410},"ts-package":{"file":"sdk/typescript/src/exec.ts","startLine":334,"endLine":410},"ts-layout":{"file":"sdk/typescript/src/exec.ts","startLine":412,"endLine":435},"ts-native":{"file":"sdk/typescript/src/exec.ts","startLine":412,"endLine":435},"ts-legacy":{"file":"sdk/typescript/src/exec.ts","startLine":412,"endLine":435},"ts-missing":{"file":"sdk/typescript/src/exec.ts","startLine":334,"endLine":410},"ts-path":{"file":"sdk/typescript/src/exec.ts","startLine":441,"endLine":459},"ts-thread":{"file":"sdk/typescript/src/codex.ts","startLine":11,"endLine":39},"ts-input":{"file":"sdk/typescript/src/thread.ts","startLine":141,"endLine":155},"ts-config":{"file":"sdk/typescript/src/exec.ts","startLine":252,"endLine":290},"ts-exec":{"file":"sdk/typescript/src/exec.ts","startLine":63,"endLine":244},"ts-event":{"file":"sdk/typescript/src/thread.ts","startLine":41,"endLine":139},"ts-stream":{"file":"sdk/typescript/src/thread.ts","startLine":41,"endLine":139},"ts-result":{"file":"sdk/typescript/src/thread.ts","startLine":41,"endLine":139},
+	"py-api":{"file":"sdk/python/src/openai_codex/api.py","startLine":75,"endLine":286},"py-start":{"file":"sdk/python/src/openai_codex/client.py","startLine":212,"endLine":864},"py-actions":{"file":"sdk/python/src/openai_codex/client.py","startLine":212,"endLine":864},"py-login":{"file":"sdk/python/src/openai_codex/_login.py","startLine":15,"endLine":172},"py-thread":{"file":"sdk/python/src/openai_codex/api.py","startLine":293,"endLine":620},"py-turn":{"file":"sdk/python/src/openai_codex/api.py","startLine":622,"endLine":760},"py-goal":{"file":"sdk/python/src/openai_codex/_goal.py","startLine":36,"endLine":193},"py-reserve":{"file":"sdk/python/src/openai_codex/_message_router.py","startLine":121,"endLine":149},"py-busy":{"file":"sdk/python/src/openai_codex/_message_router.py","startLine":121,"endLine":149},"py-clear":{"file":"sdk/python/src/openai_codex/client.py","startLine":551,"endLine":600},"py-physical":{"file":"sdk/python/src/openai_codex/_goal.py","startLine":248,"endLine":345},"py-state":{"file":"sdk/python/src/openai_codex/_goal.py","startLine":248,"endLine":345},"py-roll":{"file":"sdk/python/src/openai_codex/_goal.py","startLine":248,"endLine":345},"py-complete":{"file":"sdk/python/src/openai_codex/_goal.py","startLine":225,"endLine":245},"py-interrupt":{"file":"sdk/python/src/openai_codex/client.py","startLine":524,"endLine":549},"py-router":{"file":"sdk/python/src/openai_codex/_message_router.py","startLine":17,"endLine":278},"py-errors":{"file":"sdk/python/src/openai_codex/errors.py","startLine":86,"endLine":109},"py-typed":{"file":"sdk/python/src/openai_codex/errors.py","startLine":86,"endLine":109},"py-retry":{"file":"sdk/python/src/openai_codex/retry.py","startLine":12,"endLine":41},"py-backoff":{"file":"sdk/python/src/openai_codex/retry.py","startLine":12,"endLine":41},"py-fail":{"file":"sdk/python/src/openai_codex/retry.py","startLine":12,"endLine":41},
+	"rt-pin":{"file":"sdk/python/_runtime_setup.py","startLine":25,"endLine":41},"rt-installed":{"file":"sdk/python/_runtime_setup.py","startLine":44,"endLine":87},"rt-reuse":{"file":"sdk/python/_runtime_setup.py","startLine":44,"endLine":87},"rt-platform":{"file":"sdk/python/_runtime_setup.py","startLine":90,"endLine":113},"rt-unsupported":{"file":"sdk/python/_runtime_setup.py","startLine":90,"endLine":113},"rt-download":{"file":"sdk/python/_runtime_setup.py","startLine":169,"endLine":251},"rt-fallback":{"file":"sdk/python/_runtime_setup.py","startLine":169,"endLine":251},"rt-api":{"file":"sdk/python/_runtime_setup.py","startLine":137,"endLine":166},"rt-stage":{"file":"sdk/python/_runtime_setup.py","startLine":254,"endLine":265},"rt-install":{"file":"sdk/python/_runtime_setup.py","startLine":268,"endLine":296},"rt-check":{"file":"sdk/python/_runtime_setup.py","startLine":44,"endLine":87},"rt-error":{"file":"sdk/python/_runtime_setup.py","startLine":44,"endLine":87},"rt-ready":{"file":"sdk/python-runtime/src/codex_cli_bin/__init__.py","startLine":18,"endLine":25},"rt-wheel":{"file":"sdk/python-runtime/hatch_build.py","startLine":14,"endLine":30},"rt-sdist":{"file":"sdk/python-runtime/hatch_build.py","startLine":14,"endLine":30},"rt-wheel-error":{"file":"sdk/python-runtime/hatch_build.py","startLine":14,"endLine":30},"rt-tag":{"file":"sdk/python-runtime/hatch_build.py","startLine":14,"endLine":30}
+};
+</script>
+<aside id="source-panel"><div id="source-header"></div><div id="monaco-container"></div></aside><script src="assets/codeindex-runtime.js"></script><script src="assets/codeindex.js"></script></body></html>

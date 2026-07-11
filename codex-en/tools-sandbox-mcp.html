@@ -1,0 +1,108 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Tool Execution, Approval, Sandbox, and MCP</title><link rel="stylesheet" href="assets/codeindex.css"></head><body><p><a href="index.html">← Back to Overview</a></p><h1>Tool Execution, Approval, Sandbox, and MCP</h1>
+<p>When the model requests running a local command, modifying a file, calling an MCP or extension tool, the system converts response items into unified tool calls, dispatches them through the registry and lifecycle hooks, then selects approval and sandbox according to permission policy; the results are finally collated into model-consumable output. This module only drills down into the tool domain and does not duplicate the CLI main chain.</p>
+<dl><dt>Input</dt><dd>Function/custom tool calls produced by the model, user permission policy, working directory and environment</dd><dt>Output</dt><dd>Controlled execution of command output, file changes, MCP/extension results, or explicit rejection and sandbox errors</dd></dl>
+<pre class="mermaid">
+graph TD
+  response-item["Model returns tool call items"] --> decode-call{"Identify function, custom, or search call"}
+  decode-call -->|not a client tool| ignore-call["Do not execute locally"]
+  decode-call -->|executable| registry-dispatch["Look up executor by namespace and name"]
+  registry-dispatch --> exposure-check{"Is the tool exposed and do parameter types match?"}
+  exposure-check -->|No| unsupported["Return unsupported tool error"]
+  exposure-check -->|Yes| pre-hook["Run tool start and pre-hooks"]
+  pre-hook --> invoke-handler["Enter Shell, Patch, MCP, Code Mode, or Extension handler"]
+  invoke-handler --> post-hook["Record result and run post-hooks"]
+  post-hook --> model-output["Transform and truncate for model output"]
+</pre>
+<p>The registry simultaneously controls tool visibility to the model, whether parallel execution is allowed, and cancellation semantics. Executors contributed by extensions are added to the routing table on each turn construction, so built-in and extension tools share the same lifecycle boundary.</p>
+<pre class="mermaid">
+graph TD
+  local-request["Local command or patch forms a run request"] --> approval-rule{"Calculate approval requirements"}
+  approval-rule -->|forbidden| reject-now["Reject immediately"]
+  approval-rule -->|needs approval| approval-cache{"Check cache or request user/Guardian"}
+  approval-cache -->|rejected| reject-review["Return rejection reason"]
+  approval-cache -->|approved| choose-sandbox["Select initial sandbox based on policy and permissions"]
+  approval-rule -->|skip| choose-sandbox
+  choose-sandbox --> network-gate["Establish managed network approval and cancellation signal"]
+  network-gate --> transform-command["Convert command to platform sandbox request"]
+  transform-command --> execute-process["Start process and capture output"]
+  execute-process --> attempt-ok{"Execution successful?"}
+  attempt-ok -->|success| finish-network["Finalize network approval and return result"]
+  attempt-ok -->|sandbox refused and can escalate| retry-check{"Does policy allow retry without sandbox?"}
+  retry-check -->|No| sandbox-error["Return sandbox error"]
+  retry-check -->|Yes| escalated-run["Reuse approval, escalate privileges and retry"]
+  escalated-run --> finish-network
+  execute-process --> linux-path["Linux: bubblewrap/Landlock/seccomp"]
+  execute-process --> windows-path["Windows: restricted token, ACL, job object"]
+  execute-process --> unix-escalation["Unix: can request execve escalation via socket"]
+</pre>
+<p>Shell first parses command safety and approval keys, and retains rejected read rules; Patch first parses, validates target paths and write permissions, then applies file-by-file changes, returning already committed deltas even on failure, avoiding reporting a partial success as completely unmodified.</p>
+<pre class="mermaid">
+graph TD
+  tool-kind{"Tool type"} -->|apply_patch| parse-patch["Streaming/full parse of patch"]
+  parse-patch --> verify-patch{"Validate syntax, target file, and sandbox write permissions"}
+  verify-patch -->|failed| patch-error["Return validation error"]
+  verify-patch -->|safe inline| patch-files["Compute and write files by chunk"]
+  verify-patch -->|needs approval| patch-orchestrator["Hand off to unified approval and sandbox runner"]
+  patch-orchestrator --> patch-files
+  patch-files --> patch-delta["Summarize committed file deltas"]
+  tool-kind -->|MCP| mcp-handler["Parse parameters and preserve server namespace"]
+  mcp-handler --> mcp-manager["Connection manager selects ready client"]
+  mcp-manager --> remote-call["Invoke remote tool via MCP transport"]
+  remote-call --> mcp-result["Attach server metadata and return content"]
+  tool-kind -->|Code Mode| code-cell["Execute script in V8 sandbox"]
+  code-cell --> nested-call["Delegate back to core routing for nested tools"]
+  nested-call --> code-result["Wait, notify, truncate, and return cell result"]
+  tool-kind -->|extension| extension-adapter["Convert to extension call contract"]
+  extension-adapter --> extension-lifecycle["Extension contributor executes tool lifecycle"]
+  extension-lifecycle --> extension-result["Convert extension output back to core turn item"]
+</pre>
+<ul><li>Permission boundary: approval requirements, additional file permissions, network permission, and platform sandbox are layered; privilege escalation removes the Codex-managed proxy environment to avoid leaking controlled network configuration into unsandboxed processes.</li><li>Communication boundary: the MCP connection manager handles server startup, tool discovery, invocation, and resource reading; mcp-server conversely wraps the Codex session as MCP tools and forwards approval through the message handler.</li><li>Lifecycle: Code Mode cells can execute, wait, and terminate; extensions can contribute tools and observe start/completion events; the unified exec session supports continuous processes and subsequent stdin.</li></ul>
+<script>
+window.__sourceMap = {
+  "response-item":{"file":"codex-rs/core/src/tools/router.rs","startLine":113,"endLine":162},
+  "decode-call":{"file":"codex-rs/core/src/tools/router.rs","startLine":113,"endLine":162},
+  "ignore-call":{"file":"codex-rs/core/src/tools/router.rs","startLine":113,"endLine":162},
+  "registry-dispatch":{"file":"codex-rs/core/src/tools/registry.rs","startLine":325,"endLine":669},
+  "exposure-check":{"file":"codex-rs/core/src/tools/registry.rs","startLine":325,"endLine":669},
+  "unsupported":{"file":"codex-rs/core/src/tools/registry.rs","startLine":732,"endLine":740},
+  "pre-hook":{"file":"codex-rs/core/src/tools/registry.rs","startLine":684,"endLine":709},
+  "invoke-handler":{"file":"codex-rs/core/src/tools/router.rs","startLine":210,"endLine":241},
+  "post-hook":{"file":"codex-rs/core/src/tools/registry.rs","startLine":684,"endLine":709},
+  "model-output":{"file":"codex-rs/core/src/tools/mod.rs","startLine":57,"endLine":79},
+  "local-request":{"file":"codex-rs/core/src/tools/sandboxing.rs","startLine":386,"endLine":406},
+  "approval-rule":{"file":"codex-rs/core/src/tools/orchestrator.rs","startLine":54,"endLine":579},
+  "reject-now":{"file":"codex-rs/core/src/tools/orchestrator.rs","startLine":54,"endLine":579},
+  "approval-cache":{"file":"codex-rs/core/src/tools/sandboxing.rs","startLine":70,"endLine":96},
+  "reject-review":{"file":"codex-rs/core/src/tools/orchestrator.rs","startLine":54,"endLine":579},
+  "choose-sandbox":{"file":"codex-rs/core/src/tools/sandboxing.rs","startLine":246,"endLine":281},
+  "network-gate":{"file":"codex-rs/core/src/tools/orchestrator.rs","startLine":54,"endLine":579},
+  "transform-command":{"file":"codex-rs/core/src/tools/sandboxing.rs","startLine":424,"endLine":455},
+  "execute-process":{"file":"codex-rs/core/src/tools/runtimes/shell.rs","startLine":257,"endLine":326},
+  "attempt-ok":{"file":"codex-rs/core/src/tools/orchestrator.rs","startLine":54,"endLine":579},
+  "finish-network":{"file":"codex-rs/core/src/tools/orchestrator.rs","startLine":54,"endLine":579},
+  "retry-check":{"file":"codex-rs/core/src/tools/orchestrator.rs","startLine":54,"endLine":579},
+  "sandbox-error":{"file":"codex-rs/core/src/tools/orchestrator.rs","startLine":581,"endLine":588},
+  "escalated-run":{"file":"codex-rs/core/src/tools/orchestrator.rs","startLine":54,"endLine":579},
+  "linux-path":{"file":"codex-rs/linux-sandbox/src/linux_run_main.rs","startLine":147,"endLine":267},
+  "windows-path":{"file":"codex-rs/windows-sandbox-rs/src/process.rs","startLine":227,"endLine":327},
+  "unix-escalation":{"file":"codex-rs/shell-escalation/src/unix/escalate_client.rs","startLine":36,"endLine":142},
+  "tool-kind":{"file":"codex-rs/core/src/tools/router.rs","startLine":210,"endLine":241},
+  "parse-patch":{"file":"codex-rs/core/src/tools/handlers/apply_patch.rs","startLine":324,"endLine":473},
+  "verify-patch":{"file":"codex-rs/core/src/tools/handlers/apply_patch.rs","startLine":324,"endLine":473},
+  "patch-error":{"file":"codex-rs/core/src/tools/handlers/apply_patch.rs","startLine":324,"endLine":473},
+  "patch-files":{"file":"codex-rs/apply-patch/src/lib.rs","startLine":316,"endLine":360},
+  "patch-orchestrator":{"file":"codex-rs/core/src/tools/runtimes/apply_patch.rs","startLine":118,"endLine":213},
+  "patch-delta":{"file":"codex-rs/core/src/tools/runtimes/apply_patch.rs","startLine":215,"endLine":269},
+  "mcp-handler":{"file":"codex-rs/core/src/tools/handlers/mcp.rs","startLine":120,"endLine":162},
+  "mcp-manager":{"file":"codex-rs/codex-mcp/src/connection_manager.rs","startLine":677,"endLine":712},
+  "remote-call":{"file":"codex-rs/codex-mcp/src/connection_manager.rs","startLine":677,"endLine":712},
+  "mcp-result":{"file":"codex-rs/core/src/tools/handlers/mcp.rs","startLine":120,"endLine":162},
+  "code-cell":{"file":"codex-rs/core/src/tools/code_mode/execute_handler.rs","startLine":29,"endLine":92},
+  "nested-call":{"file":"codex-rs/core/src/tools/code_mode/mod.rs","startLine":236,"endLine":276},
+  "code-result":{"file":"codex-rs/code-mode/src/service.rs","startLine":104,"endLine":268},
+  "extension-adapter":{"file":"codex-rs/core/src/tools/handlers/extension_tools.rs","startLine":34,"endLine":58},
+  "extension-lifecycle":{"file":"codex-rs/ext/extension-api/src/registry.rs","startLine":45,"endLine":243},
+  "extension-result":{"file":"codex-rs/core/src/tools/handlers/extension_tools.rs","startLine":71,"endLine":110}
+};
+</script>
+<aside id="source-panel"><div id="source-header"></div><div id="monaco-container"></div></aside><script src="assets/codeindex-runtime.js"></script><script src="assets/codeindex.js"></script></body></html>

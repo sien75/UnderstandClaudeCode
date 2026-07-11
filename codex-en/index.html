@@ -1,126 +1,30 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Codex CLI</title>
-<link rel="stylesheet" href="assets/codeindex.css">
-</head>
-<body>
-<h1>Codex CLI</h1>
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>OpenAI Codex</title><link rel="stylesheet" href="assets/codeindex.css"></head><body><h1>OpenAI Codex</h1>
+<p>This is the code understanding map for the Codex open-source monorepo. The project is primarily written in Rust, providing a CLI, terminal interactive interface, and App Server; TypeScript and Python SDKs embed these capabilities into other applications. The core task is to transform user goals into contextualized model requests, invoke local or remote tools under approval and sandbox constraints, and persistently save thread history, state, and events.</p>
 
-<p>This repository implements the OpenAI Codex CLI: a coding agent that runs locally. The core product code lives in the <code>codex-rs</code> Rust workspace. External entry points include the interactive TUI, non-interactive <code>codex exec</code>, the JSON-RPC app-server/API, plus the core session, model sampling, and tool execution pipeline shared by every entry point. Surrounding the core is a ring of supporting subsystems: login/authentication, configuration management, sandbox and command isolation, MCP/plugins/skills, state and memory, telemetry, cloud backend and cloud tasks, and network proxy.</p>
-
-<h2>What users can do</h2>
+<h2>What Users and External Systems Can Do</h2>
 <ul>
-  <li>Run <code>codex</code> to open the terminal TUI, enter a prompt, view streaming responses, and approve tools and permission requests → Interactive Terminal Session / TUI Rendering and Interactive Input</li>
-  <li>Run <code>codex exec</code> or <code>codex review</code> to submit a one-off task in a script/CI-style environment and consume text or JSONL output → Non-Interactive Task Execution</li>
-  <li>Create threads, start turns, subscribe to notifications, and read history via the app-server JSON-RPC API → App-Server Threads and Turn API</li>
-  <li>Trigger a core agent turn from any entry point so the model reads context, calls tools, handles permissions, and produces final events → Model Turn and Tool Execution</li>
-  <li>Let the model enter "code mode" and write JS loops/parallel tool calls inside a V8 sandbox to finish subtasks → Code Mode</li>
-  <li>Log in with a ChatGPT account, use an API key/PAT/Bedrock, refresh tokens, and manage credential storage → Login and Authentication</li>
-  <li>Run models locally via OSS (Ollama / LM Studio) without using <code>codex login</code> → Cloud Backend and Cloud Tasks</li>
-  <li>Connect external MCP servers to extend tools, or expose Codex coding capabilities as an MCP server to an IDE → MCP and External Tool Integration</li>
-  <li>Install plugins/skills and configure hooks to extend behavior → Plugin and Skill System</li>
-  <li>Apply diffs produced by remote cloud tasks back to the local repository → Cloud Backend and Cloud Tasks</li>
-  <li>Resume historical sessions, view memories, and replay rollouts → State and Memory / Telemetry and Analytics</li>
-  <li>Rely on sandbox isolation for model-executed commands and file changes, and approve overreach operations → Sandbox and Command Execution Isolation</li>
-  <li>Route outbound traffic through a unified network proxy and allow/block by host policy → Network Proxy</li>
+  <li>Enter tasks from CLI, resume sessions, and run full agent turns → A user initiates and completes an agent turn from the CLI</li>
+  <li>Edit input in the terminal, view streaming output, and respond to approvals → Terminal interaction</li>
+  <li>Create threads, start/guide/interrupt turns via RPC from desktop or IDE → App Server RPC</li>
+  <li>Embed, stream-consume, and control Codex through TypeScript or Python SDKs → SDK Integration and Runtime</li>
+  <li>Choose configuration, login methods, and model providers → Configuration, Authentication, and Model Connection</li>
+  <li>Let the agent execute commands, apply patches, invoke MCP, under approval and sandbox protection → Tool Execution, Approval, Sandbox, and MCP</li>
+  <li>Save, restore, compress, and migrate thread history → Core State and History</li>
+  <li>Install plugins, skills, and extensions, connect cloud tasks, network proxies, and telemetry → Supporting Services</li>
 </ul>
 
-<a class="module-card" href="Interactive%20Terminal%20Session.html"><section>
-  <h2>Interactive Terminal Session</h2>
-  <p>Turn a prompt the user types in the terminal into an approvable, streamable, resumable Codex conversation turn.</p>
-</section></a>
+<a href="cli-agent-turn.html"><section><h2>A User Initiates and Completes an Agent Turn from the CLI</h2><p>From user input to model sampling, tool invocation, approval execution, and finally the answer back to the terminal.</p></section></a>
+<a href="tui-interaction.html"><section><h2>Terminal Interaction: Turning User Input into a Continuously Updated, Approvable Conversation</h2><p>Explains the TUI's start/resume, edit/submit, streaming render, and approval state machine.</p></section></a>
+<a href="app-server-rpc.html"><section><h2>Desktop or IDE Manages Threads and Runs Agent Turns via App Server</h2><p>Shows how RPC over various transports enters the thread and turn lifecycle and returns notifications.</p></section></a>
+<a href="appserver-cli-surface.html"><section><h2>App Server and CLI Management Surface</h2><p>Summarizes external protocols, non-core RPCs, CLI subcommands, and exec server management capabilities.</p></section></a>
+<a href="sdk-integration.html"><section><h2>Developers Embed Codex via TypeScript or Python SDKs</h2><p>Compares how the two SDKs start or resume threads, consume events, cancel, and handle errors.</p></section></a>
+<a href="sdk-runtime-details.html"><section><h2>SDK Shared Capabilities and Local Runtime Packaging</h2><p>Supplementary SDK common types, target lifecycle, platform binary resolution, and Python wheel runtime.</p></section></a>
+<a href="config-auth-model.html"><section><h2>Configuration, Authentication, and Model Connection</h2><p>From config merging and managed constraints to login refresh, model directory caching, and inference connection.</p></section></a>
+<a href="tools-sandbox-mcp.html"><section><h2>Tool Execution, Approval, Sandbox, and MCP</h2><p>Traces tool selection, approval caching, sandbox escalation retry, command/patch/MCP/extension execution.</p></section></a>
+<a href="core-state-history.html"><section><h2>Agent Thread Protocol, State, History Persistence, and Recovery</h2><p>Explains the Op/Event protocol, active threads, rollout, SQLite indexing, and derived state.</p></section></a>
+<a href="core-remaining-capabilities.html"><section><h2>Codex Core Remaining Agent Capabilities Overview</h2><p>Covers context compression, skills/plugins, sub-agents, Guardian, permissions, environment, and retries.</p></section></a>
+<a href="supporting-services.html"><section><h2>Supporting Services: Turning Configuration and Extensions into Controllable, Communicable, Observable Agent Capabilities</h2><p>Connects plugins, extensions, hooks, network proxy, cloud tasks, connectors, and telemetry.</p></section></a>
+<a href="foundation-crates.html"><section><h2>Foundation Crates: Turning Configuration and Requests into Executable, Constrained Codex Behavior</h2><p>Summarizes policies, feature flags, file search, secret management, and platform base components.</p></section></a>
 
-<a class="module-card" href="Non-Interactive%20Task%20Execution.html"><section>
-  <h2>Non-Interactive Task Execution</h2>
-  <p>Turn command-line arguments, stdin, images, and schemas into a headless app-server task and output the result as text or JSONL.</p>
-</section></a>
-
-<a class="module-card" href="App-Server%20Threads%20and%20Turn%20API.html"><section>
-  <h2>App-Server Threads and Turn API</h2>
-  <p>Translate external JSON-RPC requests into thread creation, turn startup, event subscription, and thread-read responses.</p>
-</section></a>
-
-<a class="module-card" href="Model%20Turn%20and%20Tool%20Execution.html"><section>
-  <h2>Model Turn and Tool Execution</h2>
-  <p>Translate user input submitted through a unified entry point into model sampling, tool calls, permission handling, and a final event stream.</p>
-</section></a>
-
-<a class="module-card" href="Code%20Mode.html"><section>
-  <h2>Code Mode</h2>
-  <p>A "code-writing sub-brain" for the model: the model calls the <code>exec</code> tool to drop JS into a V8 sandbox, where the JS can loop, branch, call tools in parallel, and store intermediate values across cells.</p>
-</section></a>
-
-<a class="module-card" href="Login%20and%20Authentication.html"><section>
-  <h2>Login and Authentication</h2>
-  <p>Chain browser OAuth / device-code login, token refresh and 401 recovery, fixed-priority credential selection, and multi-backend storage into a single authentication flow.</p>
-</section></a>
-
-<a class="module-card" href="Configuration%20Loading%20and%20Management.html"><section>
-  <h2>Configuration Loading and Management</h2>
-  <p>Merge seven kinds of configuration sources (MDM/system/cloud/user/profile/project/CLI) by numeric precedence, apply hard constraints and command-line overrides, and produce the runtime Config.</p>
-</section></a>
-
-<a class="module-card" href="MCP%20and%20External%20Tool%20Integration.html"><section>
-  <h2>MCP and External Tool Integration</h2>
-  <p>Codex's dual role in the MCP protocol: as a client it aggregates external MCP server tools and feeds them to the model; as a server it exposes coding capabilities to Claude/IDEs, including plugin integration and an approval channel.</p>
-</section></a>
-
-<a class="module-card" href="State%20and%20Memory.html"><section>
-  <h2>State and Memory</h2>
-  <p>Manage four independent SQLite databases for session runtime state, rollout JSONL persistence, two-stage memory extraction and merging, thread storage, and agent parent-child graphs.</p>
-</section></a>
-
-<a class="module-card" href="Telemetry%20and%20Analytics.html"><section>
-  <h2>Telemetry and Analytics</h2>
-  <p>Aggregate protocol events into Analytics facts and report them, export traces/metrics/logs via OTLP, and provide dual-path rollout persistence and deterministic replay tracking.</p>
-</section></a>
-
-<a class="module-card" href="Sandbox%20and%20Command%20Execution%20Isolation.html"><section>
-  <h2>Sandbox and Command Execution Isolation</h2>
-  <p>Three-platform sandboxing (macOS seatbelt / Linux bubblewrap+landlock / Windows de-elevation) plus exec-server execution, Starlark execpolicy approval, and shell escalation interception.</p>
-</section></a>
-
-<a class="module-card" href="TUI%20Rendering%20and%20Interactive%20Input.html"><section>
-  <h2>TUI Rendering and Interactive Input</h2>
-  <p>BottomPane view stack, chat composer and text area, user-input-request overlay, and session-resume selector—turning keyboard input into rendering assembly and submission.</p>
-</section></a>
-
-<a class="module-card" href="Plugin%20and%20Skill%20System.html"><section>
-  <h2>Plugin and Skill System</h2>
-  <p>Plugins act as "capability containers" split into skills/tools/hooks subsystems, including marketplace installation, system/user skill loading, and a 10-event hook matrix.</p>
-</section></a>
-
-<a class="module-card" href="Cloud%20Backend%20and%20Cloud%20Tasks.html"><section>
-  <h2>Cloud Backend and Cloud Tasks</h2>
-  <p>Main Responses API request path, provider-specific auth distribution (Bearer/AgentIdentity/Bedrock SigV4), remote cloud task execution and diff apply, and model-provider management plus local OSS.</p>
-</section></a>
-
-<a class="module-card" href="Network%20Proxy.html"><section>
-  <h2>Network Proxy</h2>
-  <p>HTTP/SOCKS5 MITM proxy that unifies outbound traffic control: host policy evaluation (anti DNS rebinding), per-host CA issuance and TLS termination, environment-variable injection, and UDS bridging.</p>
-</section></a>
-
-<h2>Coverage</h2>
-<pre>=== Coverage Status ===
-Total lines:     1280889
-Deep:            93784 (7.3%)
-Mapped:          1028101
-Ignored:         159004
-Uncovered:       0
-Coverage:        100.0%
-
-Stale files (1, excluded from stats):
-  - .DS_Store
-
-Uncovered files (2):
-  - codex-rs/core/src/agent/builtins/explorer.toml
-  - sdk/python/src/openai_codex/py.typed
-</pre>
-
-<script src="assets/codeindex-runtime.js"></script>
-<script src="assets/codeindex.js"></script>
-</body>
-</html>
+<h2>Code Reading Coverage</h2><p>96.4% (Deep 64,232 lines, Mapped 579,945 lines, Ignored 590,704 lines, Uncovered 46,011 lines)</p>
+<script src="assets/codeindex-runtime.js"></script><script src="assets/codeindex.js"></script></body></html>

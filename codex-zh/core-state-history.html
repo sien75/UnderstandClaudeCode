@@ -1,0 +1,120 @@
+<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>代理线程的协议、状态、历史持久化与恢复</title><link rel="stylesheet" href="assets/codeindex.css"></head><body><p><a href="index.html">← 返回总览</a></p><h1>代理线程的协议、状态、历史持久化与恢复</h1>
+
+<p>外部客户端把一次用户输入、审批答复或线程控制动作提交给 Codex；系统把它变成带关联 ID 的事件流，同时把可恢复的会话条目写入 rollout，把可查询的索引与派生状态写入 SQLite。线程恢复时，系统先重新建立“活线程”句柄，再加载历史并重建元数据；初始化中途失败则主动丢弃半成品，避免留下看似可恢复但内容不完整的线程。</p>
+
+<dl>
+<dt>输入</dt>
+<dd>用户输入、线程设置、审批答复、线程回滚/压缩/关闭动作，以及代理之间的通信。</dd>
+<dt>输出</dt>
+<dd>可供客户端消费的关联事件流、可逐行重放的 JSONL 历史、可分页检索的 SQLite 线程索引，以及子代理关系、记忆和追踪等派生状态。</dd>
+</dl>
+
+<pre class="mermaid">
+graph TD
+  submit-op["客户端提交线程操作"] --> classify-op{"是哪类操作？"}
+  classify-op -->|新输入或设置| emit-event["产生带关联 ID 的事件"]
+  classify-op -->|审批或工具答复| emit-event
+  classify-op -->|中断、回滚、压缩或关闭| emit-event
+  classify-op -->|代理通信| agent-message["转换成模型可见的代理消息"]
+  agent-message --> emit-event
+  emit-event --> canonical-item["筛出可持久化的规范历史条目"]
+  canonical-item --> append-live["活线程追加条目并观察元数据"]
+  append-live --> metadata-change{"标题、预览或时间等元数据变化？"}
+  metadata-change -->|是| sync-metadata["同步线程元数据"]
+  metadata-change -->|否| continue-run["继续当前线程"]
+  sync-metadata --> continue-run
+</pre>
+
+<p>协议层把“提交什么”和“发生了什么”分开：Op 是客户端到线程的命令，EventMsg 是线程到客户端的状态与输出。Event.id 将异步事件重新关联到原提交；代理通信虽然走正常提交生命周期，但会先编码成模型历史条目，因此恢复后仍保留代理间上下文。</p>
+
+<pre class="mermaid">
+graph TD
+  create-or-resume{"创建还是恢复？"}
+  create-or-resume -->|创建| create-thread["登记新线程并准备元数据同步器"]
+  create-or-resume -->|恢复| resume-thread["登记恢复中的线程"]
+  resume-thread --> history-provided{"调用方已提供历史？"}
+  history-provided -->|是| ready-live["建立活线程句柄"]
+  history-provided -->|否| load-history["从存储加载规范历史"]
+  load-history --> load-ok{"历史加载成功？"}
+  load-ok -->|否| discard-partial["丢弃恢复中的半成品"]
+  load-ok -->|是| ready-live
+  create-thread --> init-ok{"上层初始化成功？"}
+  ready-live --> init-ok
+  init-ok -->|否| init-guard["初始化守卫自动清理持久化状态"]
+  init-ok -->|是| commit-live["提交守卫，线程进入正常运行"]
+  commit-live --> flush-choice{"需要何种落盘保证？"}
+  flush-choice -->|persist| persist-thread["强制物化历史文件"]
+  flush-choice -->|flush| flush-thread["等待此前写入刷盘"]
+  flush-choice -->|shutdown| shutdown-thread["刷元数据并关闭后台写入器"]
+</pre>
+
+<p>本地线程存储把 rollout 文件视为兼容且可重放的事实流，把 SQLite 视为快速查询与派生状态层。写入器通过单独任务串行接收追加、持久化、刷盘和关闭命令；尚未物化时可以延迟建文件，失败后保留终止错误供后续 API 返回。列表读取优先使用状态库，缺失或需要修复时回退扫描 rollout，并把发现的元数据补回索引。</p>
+
+<pre class="mermaid">
+graph TD
+  persist-items["发送规范条目给后台写入器"] --> deferred-file{"历史文件已物化？"}
+  deferred-file -->|否| queue-items["暂存条目，等待需要持久化"]
+  deferred-file -->|是| write-jsonl["逐条序列化为 JSONL"]
+  queue-items --> force-materialize{"收到 persist 或 shutdown？"}
+  force-materialize -->|否| keep-deferred["保持延迟状态"]
+  force-materialize -->|是| write-meta["先写会话元数据首行"]
+  write-meta --> write-jsonl
+  write-jsonl --> write-ok{"写入成功？"}
+  write-ok -->|否| recovery-mode["进入恢复模式并保留待写条目"]
+  write-ok -->|是| update-index["把线程摘要和时间写入 SQLite 索引"]
+  recovery-mode --> retry-open["下次操作重开文件并重试"]
+  retry-open --> write-jsonl
+  update-index --> derived-state["更新子代理图、记忆与追踪派生状态"]
+  derived-state --> searchable["线程可分页检索、恢复和审计"]
+</pre>
+
+<ul>
+<li>状态机边界：线程从初始化中、活跃、归档到删除；子代理边从 open 变为 closed，后代查询由 SQLite 图关系提供。</li>
+<li>恢复边界：rollout 保留原始顺序，SQLite 可由 rollout 回填；这让索引损坏不会等同于历史丢失。</li>
+<li>上下文片段通过显式起止标记识别，避免恢复或压缩时把普通用户文本误当成系统注入内容。</li>
+<li>记忆写入分阶段提取、整合并保存，读取侧再附带引用与使用信息；它是线程历史的派生结果，不替代 rollout。</li>
+<li>rollout-trace 把协议事件归约成线程、推理、工具和压缩轨迹，属于诊断视图；写入失败采用尽力而为策略，不阻断主线程。</li>
+</ul>
+
+<script>
+window.__sourceMap = {
+  "submit-op": {"file":"codex-rs/protocol/src/protocol.rs","startLine":499,"endLine":657},
+  "classify-op": {"file":"codex-rs/protocol/src/protocol.rs","startLine":499,"endLine":657},
+  "emit-event": {"file":"codex-rs/protocol/src/protocol.rs","startLine":1197,"endLine":1205},
+  "agent-message": {"file":"codex-rs/protocol/src/protocol.rs","startLine":668,"endLine":731},
+  "canonical-item": {"file":"codex-rs/thread-store/src/live_thread.rs","startLine":142,"endLine":174},
+  "append-live": {"file":"codex-rs/thread-store/src/live_thread.rs","startLine":142,"endLine":174},
+  "metadata-change": {"file":"codex-rs/thread-store/src/thread_metadata_sync.rs","startLine":103,"endLine":216},
+  "sync-metadata": {"file":"codex-rs/thread-store/src/live_thread.rs","startLine":142,"endLine":174},
+  "continue-run": {"file":"codex-rs/thread-store/src/live_thread.rs","startLine":86,"endLine":266},
+  "create-or-resume": {"file":"codex-rs/thread-store/src/live_thread.rs","startLine":86,"endLine":141},
+  "create-thread": {"file":"codex-rs/thread-store/src/live_thread.rs","startLine":87,"endLine":101},
+  "resume-thread": {"file":"codex-rs/thread-store/src/live_thread.rs","startLine":103,"endLine":141},
+  "history-provided": {"file":"codex-rs/thread-store/src/live_thread.rs","startLine":103,"endLine":141},
+  "ready-live": {"file":"codex-rs/thread-store/src/live_thread.rs","startLine":103,"endLine":141},
+  "load-history": {"file":"codex-rs/thread-store/src/live_thread.rs","startLine":103,"endLine":141},
+  "load-ok": {"file":"codex-rs/thread-store/src/live_thread.rs","startLine":103,"endLine":141},
+  "discard-partial": {"file":"codex-rs/thread-store/src/live_thread.rs","startLine":103,"endLine":141},
+  "init-ok": {"file":"codex-rs/thread-store/src/live_thread.rs","startLine":42,"endLine":84},
+  "init-guard": {"file":"codex-rs/thread-store/src/live_thread.rs","startLine":42,"endLine":84},
+  "commit-live": {"file":"codex-rs/thread-store/src/live_thread.rs","startLine":46,"endLine":67},
+  "flush-choice": {"file":"codex-rs/thread-store/src/live_thread.rs","startLine":176,"endLine":193},
+  "persist-thread": {"file":"codex-rs/thread-store/src/live_thread.rs","startLine":176,"endLine":179},
+  "flush-thread": {"file":"codex-rs/thread-store/src/live_thread.rs","startLine":181,"endLine":185},
+  "shutdown-thread": {"file":"codex-rs/thread-store/src/live_thread.rs","startLine":187,"endLine":193},
+  "persist-items": {"file":"codex-rs/rollout/src/recorder.rs","startLine":811,"endLine":827},
+  "deferred-file": {"file":"codex-rs/rollout/src/recorder.rs","startLine":1469,"endLine":1625},
+  "queue-items": {"file":"codex-rs/rollout/src/recorder.rs","startLine":1488,"endLine":1490},
+  "write-jsonl": {"file":"codex-rs/rollout/src/recorder.rs","startLine":1720,"endLine":1742},
+  "force-materialize": {"file":"codex-rs/rollout/src/recorder.rs","startLine":1501,"endLine":1517},
+  "keep-deferred": {"file":"codex-rs/rollout/src/recorder.rs","startLine":1546,"endLine":1548},
+  "write-meta": {"file":"codex-rs/rollout/src/recorder.rs","startLine":1583,"endLine":1590},
+  "write-ok": {"file":"codex-rs/rollout/src/recorder.rs","startLine":1519,"endLine":1544},
+  "recovery-mode": {"file":"codex-rs/rollout/src/recorder.rs","startLine":1550,"endLine":1563},
+  "update-index": {"file":"codex-rs/state/src/runtime/threads.rs","startLine":870,"endLine":914},
+  "retry-open": {"file":"codex-rs/rollout/src/recorder.rs","startLine":1565,"endLine":1581},
+  "derived-state": {"file":"codex-rs/agent-graph-store/src/local.rs","startLine":31,"endLine":92},
+  "searchable": {"file":"codex-rs/state/src/runtime/threads.rs","startLine":399,"endLine":450}
+};
+</script>
+<aside id="source-panel"><div id="source-header"></div><div id="monaco-container"></div></aside><script src="assets/codeindex-runtime.js"></script><script src="assets/codeindex.js"></script></body></html>

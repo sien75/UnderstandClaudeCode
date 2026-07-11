@@ -1,0 +1,75 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Developers embed Codex via TypeScript or Python SDK</title><link rel="stylesheet" href="assets/codeindex.css"></head><body><p><a href="index.html">← Back to Overview</a></p><h1>Developers embed Codex via TypeScript or Python SDK</h1>
+<p>Developers pass natural language, images, and run options to the SDK; the SDK is responsible for creating or resuming a session, sending a turn into Codex, and organizing events returned by the process or App Server into objects that can be synchronously awaited or consumed one by one. This document traces only up to the communication boundary between the SDK and the Codex process/App Server.</p>
+<dl><dt>Input</dt><dd>Thread options, text or local images, optional structured output constraints, and cancellation signals.</dd><dt>Output</dt><dd>Individual turn events, or aggregated final response, completed items, and usage; communication, parsing, and turn failures become SDK exceptions.</dd></dl>
+<p>The TypeScript SDK is a lightweight wrapper that "launches the CLI once per turn." The thread object first saves the session ID; the first run returns the ID from the CLI, and subsequent turns use that ID to resume. Synchronous results are also aggregated after consuming the same event stream.</p>
+<pre class="mermaid">
+graph TD
+  ts-client["Construct Codex client"] --> ts-thread{"New thread or resume thread"}
+  ts-thread -->|new thread| ts-start["Create thread object without an ID yet"]
+  ts-thread -->|resume| ts-resume["Put existing ID into thread object"]
+  ts-start --> ts-run{"Call streaming or aggregated run"}
+  ts-resume --> ts-run
+  ts-run --> ts-normalize["Assemble text into prompts, split local images into path list"]
+  ts-normalize --> ts-schema{"Provides structured output constraints"}
+  ts-schema -->|no| ts-spawn["Assemble arguments and start codex exec subprocess"]
+  ts-schema -->|yes and valid| ts-schema-file["Write temporary JSON Schema file"]
+  ts-schema -->|not a plain object| ts-schema-error["Immediately throw input error"]
+  ts-schema-file --> ts-spawn
+  ts-spawn --> ts-stdio{"Is subprocess stdin/stdout available"}
+  ts-stdio -->|no| ts-stdio-error["Terminate subprocess and throw communication error"]
+  ts-stdio -->|yes| ts-lines["Write prompt to stdin, read JSON events line by line"]
+  ts-lines --> ts-parse{"Can event be parsed"}
+  ts-parse -->|no| ts-parse-error["Throw event parse error"]
+  ts-parse -->|yes| ts-id["Save thread ID when thread start event is received"]
+  ts-id --> ts-deliver{"Consumption mode chosen by caller"}
+  ts-deliver -->|streaming| ts-yield["Yield to caller one by one"]
+  ts-deliver -->|aggregated| ts-collect["Collect completed items, final response, and usage"]
+  ts-collect --> ts-failed{"Did the turn fail"}
+  ts-failed -->|yes| ts-turn-error["Throw failure message"]
+  ts-failed -->|no| ts-result["Return complete turn result"]
+  ts-yield --> ts-cleanup["Delete temporary Schema after event stream ends"]
+  ts-result --> ts-cleanup
+  ts-lines --> ts-exit{"Did the process exit normally"}
+  ts-exit -->|no| ts-exit-error["Throw process error with stderr attached"]
+</pre>
+<p>The core difference between the Python SDK and TypeScript is the long-lived connection: constructing a high-level client starts codex app-server, using line-delimited JSON-RPC on the same process to carry multiple threads and turns. The reader thread returns responses to waiters by request ID and routes notifications by turn ID, so events that arrive before the caller registers are also buffered without loss.</p>
+<pre class="mermaid">
+graph TD
+  py-client["Construct sync or async Codex client"] --> py-server["Start app-server and establish stdio"]
+  py-server --> py-init{"Initialization successful"}
+  py-init -->|no| py-init-error["Close process and throw error to caller"]
+  py-init -->|yes| py-thread{"Create or resume thread"}
+  py-thread --> py-rpc["Send JSON-RPC with request ID"]
+  py-rpc --> py-response{"Is the response success or error"}
+  py-response -->|error| py-rpc-error["Map to specific SDK exception"]
+  py-response -->|success| py-thread-object["Return object holding thread ID"]
+  py-thread-object --> py-input["Convert text, remote/local images, skills, and mentions into wire protocol input"]
+  py-input --> py-turn["Send turn/start, structured output constraints passed directly with parameters"]
+  py-turn --> py-handle["Return controllable turn handle"]
+  py-handle --> py-action{"Consume, append input, or interrupt"}
+  py-action -->|append| py-steer["Send supplementary input to active turn"]
+  py-action -->|interrupt| py-interrupt["Send turn/interrupt request"]
+  py-action -->|consume| py-register["Register notification queue for this turn and replay earlier events"]
+  py-register --> py-route{"What message does the reader thread receive"}
+  py-route -->|request response| py-waiter["Wake waiter by request ID"]
+  py-route -->|this turn notification| py-stream["Hand off to streaming iterator by turn ID"]
+  py-route -->|no turn ID| py-global["Put into global notification queue"]
+  py-stream --> py-complete{"Received this turn's completion event"}
+  py-complete -->|no| py-stream
+  py-complete -->|yes| py-mode{"Does caller want events or result"}
+  py-mode -->|events| py-done["End iteration and deregister queue"]
+  py-mode -->|result| py-collect["Collect completed items, usage, and final answer"]
+  py-collect --> py-failed{"Is completion status failed"}
+  py-failed -->|yes| py-turn-error["Throw server failure message"]
+  py-failed -->|no| py-result["Return TurnResult"]
+  py-server --> py-closed{"Connection unexpectedly closed"}
+  py-closed -->|yes| py-fail-all["Wake all waiters with same transport exception"]
+</pre>
+<ul><li>TypeScript cancellation uses AbortSignal passed directly to the subprocess; Python exposes an explicit turn interrupt RPC, and also allows continuing to steer into an active turn.</li><li>TypeScript currently only accepts text and local images; Python also accepts remote images, skills, and resource mentions, with types validated by Pydantic-generated models.</li><li>Python's retry utility can wrap operations on the caller side, but the base turn chain does not replay silently; this prevents a single user input from being executed twice. The TypeScript chain similarly has no automatic retry.</li><li>The boundary stops here: how the CLI's exec implementation and the App Server enter Rust core after receiving thread/start and turn/start belongs to downstream modules.</li></ul>
+<script>
+window.__sourceMap = {
+"ts-client":{"file":"sdk/typescript/src/codex.ts","startLine":11,"endLine":39},"ts-thread":{"file":"sdk/typescript/src/codex.ts","startLine":11,"endLine":39},"ts-start":{"file":"sdk/typescript/src/codex.ts","startLine":11,"endLine":39},"ts-resume":{"file":"sdk/typescript/src/codex.ts","startLine":11,"endLine":39},"ts-run":{"file":"sdk/typescript/src/thread.ts","startLine":41,"endLine":139},"ts-normalize":{"file":"sdk/typescript/src/thread.ts","startLine":141,"endLine":155},"ts-schema":{"file":"sdk/typescript/src/outputSchemaFile.ts","startLine":10,"endLine":36},"ts-schema-file":{"file":"sdk/typescript/src/outputSchemaFile.ts","startLine":10,"endLine":36},"ts-schema-error":{"file":"sdk/typescript/src/outputSchemaFile.ts","startLine":10,"endLine":36},"ts-spawn":{"file":"sdk/typescript/src/exec.ts","startLine":63,"endLine":244},"ts-stdio":{"file":"sdk/typescript/src/exec.ts","startLine":63,"endLine":244},"ts-stdio-error":{"file":"sdk/typescript/src/exec.ts","startLine":63,"endLine":244},"ts-lines":{"file":"sdk/typescript/src/exec.ts","startLine":63,"endLine":244},"ts-parse":{"file":"sdk/typescript/src/thread.ts","startLine":41,"endLine":139},"ts-parse-error":{"file":"sdk/typescript/src/thread.ts","startLine":41,"endLine":139},"ts-id":{"file":"sdk/typescript/src/thread.ts","startLine":41,"endLine":139},"ts-deliver":{"file":"sdk/typescript/src/thread.ts","startLine":41,"endLine":139},"ts-yield":{"file":"sdk/typescript/src/thread.ts","startLine":41,"endLine":139},"ts-collect":{"file":"sdk/typescript/src/thread.ts","startLine":41,"endLine":139},"ts-failed":{"file":"sdk/typescript/src/thread.ts","startLine":41,"endLine":139},"ts-turn-error":{"file":"sdk/typescript/src/thread.ts","startLine":41,"endLine":139},"ts-result":{"file":"sdk/typescript/src/thread.ts","startLine":41,"endLine":139},"ts-cleanup":{"file":"sdk/typescript/src/thread.ts","startLine":41,"endLine":139},"ts-exit":{"file":"sdk/typescript/src/exec.ts","startLine":63,"endLine":244},"ts-exit-error":{"file":"sdk/typescript/src/exec.ts","startLine":63,"endLine":244},
+"py-client":{"file":"sdk/python/src/openai_codex/api.py","startLine":75,"endLine":286},"py-server":{"file":"sdk/python/src/openai_codex/client.py","startLine":212,"endLine":375},"py-init":{"file":"sdk/python/src/openai_codex/api.py","startLine":75,"endLine":286},"py-init-error":{"file":"sdk/python/src/openai_codex/api.py","startLine":75,"endLine":286},"py-thread":{"file":"sdk/python/src/openai_codex/api.py","startLine":75,"endLine":286},"py-rpc":{"file":"sdk/python/src/openai_codex/client.py","startLine":212,"endLine":375},"py-response":{"file":"sdk/python/src/openai_codex/_message_router.py","startLine":17,"endLine":278},"py-rpc-error":{"file":"sdk/python/src/openai_codex/_message_router.py","startLine":17,"endLine":278},"py-thread-object":{"file":"sdk/python/src/openai_codex/api.py","startLine":534,"endLine":620},"py-input":{"file":"sdk/python/src/openai_codex/_inputs.py","startLine":50,"endLine":73},"py-turn":{"file":"sdk/python/src/openai_codex/api.py","startLine":534,"endLine":620},"py-handle":{"file":"sdk/python/src/openai_codex/api.py","startLine":718,"endLine":760},"py-action":{"file":"sdk/python/src/openai_codex/api.py","startLine":718,"endLine":760},"py-steer":{"file":"sdk/python/src/openai_codex/api.py","startLine":718,"endLine":760},"py-interrupt":{"file":"sdk/python/src/openai_codex/api.py","startLine":718,"endLine":760},"py-register":{"file":"sdk/python/src/openai_codex/_message_router.py","startLine":17,"endLine":278},"py-route":{"file":"sdk/python/src/openai_codex/_message_router.py","startLine":17,"endLine":278},"py-waiter":{"file":"sdk/python/src/openai_codex/_message_router.py","startLine":17,"endLine":278},"py-stream":{"file":"sdk/python/src/openai_codex/api.py","startLine":718,"endLine":760},"py-global":{"file":"sdk/python/src/openai_codex/_message_router.py","startLine":17,"endLine":278},"py-complete":{"file":"sdk/python/src/openai_codex/api.py","startLine":718,"endLine":760},"py-mode":{"file":"sdk/python/src/openai_codex/api.py","startLine":718,"endLine":760},"py-done":{"file":"sdk/python/src/openai_codex/api.py","startLine":718,"endLine":760},"py-collect":{"file":"sdk/python/src/openai_codex/_run.py","startLine":68,"endLine":100},"py-failed":{"file":"sdk/python/src/openai_codex/_run.py","startLine":60,"endLine":65},"py-turn-error":{"file":"sdk/python/src/openai_codex/_run.py","startLine":60,"endLine":65},"py-result":{"file":"sdk/python/src/openai_codex/_run.py","startLine":68,"endLine":100},"py-closed":{"file":"sdk/python/src/openai_codex/client.py","startLine":212,"endLine":375},"py-fail-all":{"file":"sdk/python/src/openai_codex/_message_router.py","startLine":17,"endLine":278}
+};
+</script>
+<aside id="source-panel"><div id="source-header"></div><div id="monaco-container"></div></aside><script src="assets/codeindex-runtime.js"></script><script src="assets/codeindex.js"></script></body></html>

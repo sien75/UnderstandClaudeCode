@@ -1,0 +1,125 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Codex Core Remaining Agent Capabilities Overview</title><link rel="stylesheet" href="assets/codeindex.css"></head><body><p><a href="index.html">← Back to Overview</a></p><h1>Codex Core Remaining Agent Capabilities Overview</h1>
+
+<p>This module fills in the "agent infrastructure" of Codex Core that does not belong to single tool calls: after an external caller starts or continues a thread, the system organizes the environment, permissions, skills, and plugins into model context; compresses history when the conversation grows too long; spawns and resumes sub-agents when parallel work is needed; submits high-risk actions to the guardian for review; and retries remote response failures while maintaining session continuity. The main thread is how data flows from thread configuration into the model, and then into events, approvals, or new thread states.</p>
+
+<dl>
+  <dt>Input</dt>
+  <dd>Thread configuration, user messages, current environment and permissions, historical response items, model stream events, and pending high-risk actions</dd>
+  <dt>Output</dt>
+  <dd>Bounded and consistent model context, resumable sub-agent threads, actions reviewed by policy and guardian, and events continuously streamed back to the client</dd>
+</dl>
+
+<p>Context main chain: Core's public entry organizes thread services; at the start of each turn, changes to environment and permissions are encoded as context items, then call-output pairs are normalized. When approaching the window limit, local or remote compression preserves key user intent, recent tool results, and initial constraints, replacing old history with a summary.</p>
+
+<pre class="mermaid">
+graph TD
+  core-entry["External client enters Core thread capabilities"] --> env-select["Select thread and available environment for this turn"]
+  env-select --> settings-update["Write environment, permission, and collaboration mode changes into context"]
+  settings-update --> normalize-calls["Complete call outputs and remove orphaned items"]
+  normalize-calls --> context-history["Form model-visible and bounded history"]
+  context-history --> compact-choice{"Does the provider support remote compression?"}
+  compact-choice -->|No| local-compact["Locally request model to generate summary"]
+  compact-choice -->|Yes| remote-compact["Call remote compression endpoint"]
+  remote-compact --> remote-v2{"Enable new retention strategy?"}
+  remote-v2 -->|No| install-summary["Filter response items and install replacement history"]
+  remote-v2 -->|Yes| truncate-retained["Limit retained messages and image budget"]
+  truncate-retained --> install-summary
+  local-compact --> install-summary
+  install-summary --> next-turn["Re-inject necessary initial context for next turn"]
+</pre>
+
+<p>Agent lifecycle main chain: after the parent thread submits an independent task, the controller first checks depth, concurrency, and persistence capacity, then chooses to create a new thread or fork from parent history. Child threads inherit the environment and command policies that are allowed to propagate; completion, pause, resume, and interruption all return to the parent thread through unified registration status, and old rollouts can reconstruct the entire tree of unclosed agent relationships.</p>
+
+<pre class="mermaid">
+graph TD
+  delegate-start["Caller launches interactive or one-shot agent"] --> spawn-request["Parent agent submits child task"]
+  spawn-request --> capacity-check{"Depth and concurrency capacity allowed?"}
+  capacity-check -->|No| spawn-reject["Return capacity or level error"]
+  capacity-check -->|Yes| inherit-state["Inherit environment and command policies"]
+  inherit-state --> fork-choice{"Need to inherit parent history?"}
+  fork-choice -->|No| new-child["Create brand new child thread"]
+  fork-choice -->|Yes| fork-child["Trim rollout then create forked thread"]
+  new-child --> send-task["Send first task to child thread"]
+  fork-child --> send-task
+  send-task --> agent-state["Register running status and notify client"]
+  agent-state --> resume-choice{"Still have open descendants after process restart?"}
+  resume-choice -->|Yes| resume-tree["Restore layer by layer from persisted rollout"]
+  resume-choice -->|No| completion["Return completion result to parent thread"]
+  resume-tree --> completion
+</pre>
+
+<p>Permission and reliability main chain: commands are first evaluated against policy files and managed permission configuration; risk actions requiring human confirmation can be routed to guardian. Guardian uses an isolated review session, can reuse the same risk context, and sets a deadline; rejection is recorded in the thread state, only temporary failures trigger retries. Common Responses stream errors also distinguish between retryable, context-limit-exceeded, and terminal errors, avoiding blind replay.</p>
+
+<pre class="mermaid">
+graph TD
+  command-input["Model proposes command or sensitive tool action"] --> policy-eval["Evaluate against command policy and permission profile"]
+  policy-eval --> policy-result{"Allowed, ask, or forbidden?"}
+  policy-result -->|forbidden| deny-action["Return clear rejection reason"]
+  policy-result -->|allowed| execute-action["Enter constrained execution environment"]
+  policy-result -->|ask| guardian-route{"Configured for guardian review?"}
+  guardian-route -->|No| user-approval["Forward to user for approval"]
+  guardian-route -->|Yes| review-session["Create or reuse isolated review session"]
+  review-session --> review-outcome{"What is the review conclusion?"}
+  review-outcome -->|rejected| record-denial["Record rejection and block action"]
+  review-outcome -->|approved| execute-action
+  review-outcome -->|temporary failure| guardian-retry["Backoff and retry within deadline"]
+  guardian-retry --> review-session
+  execute-action --> stream-result["Result enters model response stream"]
+  stream-result --> retry-choice{"Is the response stream error retryable?"}
+  retry-choice -->|Yes| response-retry["Maintain client session and reconnect"]
+  retry-choice -->|No| terminal-error["Emit terminal error event"]
+</pre>
+
+<ul>
+  <li>Skills and plugins do not directly concatenate arbitrary text: the system first discovers, deduplicates, and budgets metadata, then generates bounded injection based on explicit mention or implicit matching, avoiding unbounded context growth.</li>
+  <li>Environment snapshots distinguish between thread-level selection and per-turn snapshots; sub-agents only inherit the portion that policy allows to propagate; permission changes form new context items rather than rewriting old history.</li>
+  <li>Compression preserves real user messages, filters old summaries and call items unsuitable for continued delivery; the new remote compression also imposes separate limits on text tokens and image counts.</li>
+  <li>Guardian review sessions have reuse keys, cancellation, and deadlines, preventing approval from blocking the main thread; rejection status affects subsequent same-turn actions.</li>
+  <li>Other production implementations (MCP resources, hooks, network proxy, live sessions, rollout, shell and unified exec, etc.) have been confirmed file-by-file with their responsibilities covered; tests, snapshots, static prompt templates, and artifacts are not expanded as business implementations.</li>
+</ul>
+
+<script>
+window.__sourceMap = {
+  "core-entry": {"file":"codex-rs/core/src/lib.rs","startLine":1,"endLine":199},
+  "env-select": {"file":"codex-rs/core/src/environment_selection.rs","startLine":43,"endLine":182},
+  "settings-update": {"file":"codex-rs/core/src/context_manager/updates.rs","startLine":210,"endLine":245},
+  "normalize-calls": {"file":"codex-rs/core/src/context_manager/normalize.rs","startLine":14,"endLine":119},
+  "context-history": {"file":"codex-rs/core/src/context_manager/history.rs","startLine":53,"endLine":425},
+  "compact-choice": {"file":"codex-rs/core/src/compact.rs","startLine":69,"endLine":71},
+  "local-compact": {"file":"codex-rs/core/src/compact.rs","startLine":197,"endLine":332},
+  "remote-compact": {"file":"codex-rs/core/src/compact_remote.rs","startLine":169,"endLine":295},
+  "remote-v2": {"file":"codex-rs/core/src/compact_remote_v2.rs","startLine":179,"endLine":322},
+  "install-summary": {"file":"codex-rs/core/src/compact_remote.rs","startLine":296,"endLine":333},
+  "truncate-retained": {"file":"codex-rs/core/src/compact_remote_v2.rs","startLine":467,"endLine":492},
+  "next-turn": {"file":"codex-rs/core/src/compact.rs","startLine":489,"endLine":535},
+  "delegate-start": {"file":"codex-rs/core/src/codex_delegate.rs","startLine":69,"endLine":179},
+  "spawn-request": {"file":"codex-rs/core/src/agent/control/spawn.rs","startLine":83,"endLine":715},
+  "capacity-check": {"file":"codex-rs/core/src/agent/control.rs","startLine":105,"endLine":674},
+  "spawn-reject": {"file":"codex-rs/core/src/agent/control.rs","startLine":58,"endLine":63},
+  "inherit-state": {"file":"codex-rs/core/src/agent/control/spawn.rs","startLine":6,"endLine":10},
+  "fork-choice": {"file":"codex-rs/core/src/agent/control.rs","startLine":64,"endLine":71},
+  "new-child": {"file":"codex-rs/core/src/agent/control.rs","startLine":72,"endLine":78},
+  "fork-child": {"file":"codex-rs/core/src/agent/control/spawn.rs","startLine":33,"endLine":66},
+  "send-task": {"file":"codex-rs/core/src/agent/control/execution.rs","startLine":1,"endLine":111},
+  "agent-state": {"file":"codex-rs/core/src/agent/registry.rs","startLine":1,"endLine":359},
+  "resume-choice": {"file":"codex-rs/core/src/agent/control/spawn.rs","startLine":83,"endLine":715},
+  "resume-tree": {"file":"codex-rs/core/src/agent/control/spawn.rs","startLine":83,"endLine":715},
+  "completion": {"file":"codex-rs/core/src/codex_delegate.rs","startLine":261,"endLine":402},
+  "command-input": {"file":"codex-rs/core/src/exec_policy.rs","startLine":240,"endLine":248},
+  "policy-eval": {"file":"codex-rs/core/src/exec_policy.rs","startLine":249,"endLine":473},
+  "policy-result": {"file":"codex-rs/core/src/exec_policy.rs","startLine":628,"endLine":746},
+  "deny-action": {"file":"codex-rs/core/src/exec_policy.rs","startLine":953,"endLine":981},
+  "execute-action": {"file":"codex-rs/core/src/exec.rs","startLine":1,"endLine":1571},
+  "guardian-route": {"file":"codex-rs/core/src/guardian/review.rs","startLine":168,"endLine":192},
+  "user-approval": {"file":"codex-rs/core/src/codex_delegate.rs","startLine":451,"endLine":533},
+  "review-session": {"file":"codex-rs/core/src/guardian/review_session.rs","startLine":291,"endLine":606},
+  "review-outcome": {"file":"codex-rs/core/src/guardian/review_session.rs","startLine":62,"endLine":72},
+  "record-denial": {"file":"codex-rs/core/src/guardian/review.rs","startLine":223,"endLine":263},
+  "guardian-retry": {"file":"codex-rs/core/src/guardian/review.rs","startLine":880,"endLine":900},
+  "stream-result": {"file":"codex-rs/core/src/codex_delegate.rs","startLine":420,"endLine":435},
+  "retry-choice": {"file":"codex-rs/core/src/responses_retry.rs","startLine":22,"endLine":80},
+  "response-retry": {"file":"codex-rs/core/src/responses_retry.rs","startLine":81,"endLine":106},
+  "terminal-error": {"file":"codex-rs/core/src/responses_retry.rs","startLine":15,"endLine":21}
+};
+</script>
+<aside id="source-panel"><div id="source-header"></div><div id="monaco-container"></div></aside><script src="assets/codeindex-runtime.js"></script><script src="assets/codeindex.js"></script></body></html>

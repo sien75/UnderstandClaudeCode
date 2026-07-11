@@ -1,0 +1,125 @@
+<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Codex Core 剩余代理能力全景</title><link rel="stylesheet" href="assets/codeindex.css"></head><body><p><a href="index.html">← 返回总览</a></p><h1>Codex Core 剩余代理能力全景</h1>
+
+<p>这一模块补齐 Codex Core 中不属于单一工具调用的“代理底座”：外部调用者启动或继续线程后，系统把环境、权限、技能与插件整理成模型上下文；对话过长时压缩历史；需要并行工作时派生和恢复子代理；高风险动作交给 guardian 复核；远程响应失败则在保持会话连续性的前提下重试。主线是数据如何从线程配置流入模型、又如何变成事件、审批或新的线程状态。</p>
+
+<dl>
+  <dt>输入</dt>
+  <dd>线程配置、用户消息、当前环境与权限、历史响应项、模型流事件，以及待执行的高风险动作</dd>
+  <dt>输出</dt>
+  <dd>有界且一致的模型上下文、可恢复的子代理线程、经过策略与 guardian 审核的动作，以及持续回传给客户端的事件</dd>
+</dl>
+
+<p>上下文主链：Core 的公开入口组织线程服务；每轮开始时将环境和权限等变化编码成上下文项，再规范化调用与输出的配对关系。接近窗口上限时，本地或远程压缩会保留关键用户意图、最近工具结果和初始约束，并用摘要替换旧历史。</p>
+
+<pre class="mermaid">
+graph TD
+  core-entry["外部客户端进入 Core 线程能力"] --> env-select["选择线程与本轮可用环境"]
+  env-select --> settings-update["把环境、权限和协作模式变化写入上下文"]
+  settings-update --> normalize-calls["补齐调用输出并移除孤立项"]
+  normalize-calls --> context-history["形成模型可见且有界的历史"]
+  context-history --> compact-choice{"提供方支持远程压缩吗？"}
+  compact-choice -->|否| local-compact["本地请求模型生成摘要"]
+  compact-choice -->|是| remote-compact["调用远程压缩端点"]
+  remote-compact --> remote-v2{"启用新版保留策略吗？"}
+  remote-v2 -->|否| install-summary["筛选响应项并安装替换历史"]
+  remote-v2 -->|是| truncate-retained["限制保留消息和图片预算"]
+  truncate-retained --> install-summary
+  local-compact --> install-summary
+  install-summary --> next-turn["下一轮重新注入必要初始上下文"]
+</pre>
+
+<p>代理生命周期主链：父线程提交独立任务后，控制器先检查深度、并发与驻留容量，再选择新建或从父历史分叉。子线程继承允许继承的环境与命令策略；完成、暂停、恢复和中断都通过统一注册状态回到父线程，旧 rollout 还可重建整棵未关闭的代理关系。</p>
+
+<pre class="mermaid">
+graph TD
+  delegate-start["调用者启动交互式或一次性代理"] --> spawn-request["父代理提交子任务"]
+  spawn-request --> capacity-check{"深度与并发容量允许吗？"}
+  capacity-check -->|否| spawn-reject["返回容量或层级错误"]
+  capacity-check -->|是| inherit-state["继承环境和命令策略"]
+  inherit-state --> fork-choice{"需要继承父历史吗？"}
+  fork-choice -->|否| new-child["创建全新子线程"]
+  fork-choice -->|是| fork-child["裁剪 rollout 后创建分叉线程"]
+  new-child --> send-task["向子线程发送首个任务"]
+  fork-child --> send-task
+  send-task --> agent-state["注册运行状态并通知客户端"]
+  agent-state --> resume-choice{"进程重启后仍有开放后代吗？"}
+  resume-choice -->|是| resume-tree["从持久化 rollout 逐层恢复"]
+  resume-choice -->|否| completion["完成结果回传父线程"]
+  resume-tree --> completion
+</pre>
+
+<p>权限与可靠性主链：命令先由策略文件和托管权限配置求值；需要人工确认的风险动作可被路由到 guardian。Guardian 使用隔离的审查会话，可复用同一风险上下文并设置截止时间；拒绝会记入线程状态，暂时性失败才会重试。普通 Responses 流错误同样区分可重试、上下文超限和终止错误，避免盲目重放。</p>
+
+<pre class="mermaid">
+graph TD
+  command-input["模型提出命令或敏感工具动作"] --> policy-eval["按命令策略与权限画像求值"]
+  policy-eval --> policy-result{"允许、询问还是禁止？"}
+  policy-result -->|禁止| deny-action["返回明确拒绝原因"]
+  policy-result -->|允许| execute-action["进入受约束执行环境"]
+  policy-result -->|询问| guardian-route{"配置为 guardian 审核吗？"}
+  guardian-route -->|否| user-approval["转发给用户审批"]
+  guardian-route -->|是| review-session["创建或复用隔离审查会话"]
+  review-session --> review-outcome{"审查结论是什么？"}
+  review-outcome -->|拒绝| record-denial["记录拒绝并阻止动作"]
+  review-outcome -->|批准| execute-action
+  review-outcome -->|暂时失败| guardian-retry["在截止时间内退避重试"]
+  guardian-retry --> review-session
+  execute-action --> stream-result["结果进入模型响应流"]
+  stream-result --> retry-choice{"响应流错误可重试吗？"}
+  retry-choice -->|是| response-retry["保持客户端会话并重连"]
+  retry-choice -->|否| terminal-error["发出终止错误事件"]
+</pre>
+
+<ul>
+  <li>技能与插件不是直接拼接任意文本：系统先发现、去重和预算化元数据，再根据显式提及或隐式匹配生成有界注入，避免上下文无限增长。</li>
+  <li>环境快照区分线程级选择和本轮快照，子代理只继承策略允许传播的部分；权限变化会形成新的上下文项，而不是改写旧历史。</li>
+  <li>压缩保留真实用户消息，过滤旧摘要与不适合继续发送的调用项；新版远程压缩还对文本 token 与图片数量分别设限。</li>
+  <li>Guardian 审查会话带复用键、取消和截止时间，防止审批阻塞主线程；拒绝状态会影响后续同轮动作。</li>
+  <li>其余生产实现（MCP 资源、hook、网络代理、实时会话、rollout、shell 与 unified exec 等）已逐文件确认职责并纳入覆盖；测试、快照、静态提示模板和生成物不作为业务实现展开。</li>
+</ul>
+
+<script>
+window.__sourceMap = {
+  "core-entry": {"file":"codex-rs/core/src/lib.rs","startLine":1,"endLine":199},
+  "env-select": {"file":"codex-rs/core/src/environment_selection.rs","startLine":43,"endLine":182},
+  "settings-update": {"file":"codex-rs/core/src/context_manager/updates.rs","startLine":210,"endLine":245},
+  "normalize-calls": {"file":"codex-rs/core/src/context_manager/normalize.rs","startLine":14,"endLine":119},
+  "context-history": {"file":"codex-rs/core/src/context_manager/history.rs","startLine":53,"endLine":425},
+  "compact-choice": {"file":"codex-rs/core/src/compact.rs","startLine":69,"endLine":71},
+  "local-compact": {"file":"codex-rs/core/src/compact.rs","startLine":197,"endLine":332},
+  "remote-compact": {"file":"codex-rs/core/src/compact_remote.rs","startLine":169,"endLine":295},
+  "remote-v2": {"file":"codex-rs/core/src/compact_remote_v2.rs","startLine":179,"endLine":322},
+  "install-summary": {"file":"codex-rs/core/src/compact_remote.rs","startLine":296,"endLine":333},
+  "truncate-retained": {"file":"codex-rs/core/src/compact_remote_v2.rs","startLine":467,"endLine":492},
+  "next-turn": {"file":"codex-rs/core/src/compact.rs","startLine":489,"endLine":535},
+  "delegate-start": {"file":"codex-rs/core/src/codex_delegate.rs","startLine":69,"endLine":179},
+  "spawn-request": {"file":"codex-rs/core/src/agent/control/spawn.rs","startLine":83,"endLine":715},
+  "capacity-check": {"file":"codex-rs/core/src/agent/control.rs","startLine":105,"endLine":674},
+  "spawn-reject": {"file":"codex-rs/core/src/agent/control.rs","startLine":58,"endLine":63},
+  "inherit-state": {"file":"codex-rs/core/src/agent/control/spawn.rs","startLine":6,"endLine":10},
+  "fork-choice": {"file":"codex-rs/core/src/agent/control.rs","startLine":64,"endLine":71},
+  "new-child": {"file":"codex-rs/core/src/agent/control.rs","startLine":72,"endLine":78},
+  "fork-child": {"file":"codex-rs/core/src/agent/control/spawn.rs","startLine":33,"endLine":66},
+  "send-task": {"file":"codex-rs/core/src/agent/control/execution.rs","startLine":1,"endLine":111},
+  "agent-state": {"file":"codex-rs/core/src/agent/registry.rs","startLine":1,"endLine":359},
+  "resume-choice": {"file":"codex-rs/core/src/agent/control/spawn.rs","startLine":83,"endLine":715},
+  "resume-tree": {"file":"codex-rs/core/src/agent/control/spawn.rs","startLine":83,"endLine":715},
+  "completion": {"file":"codex-rs/core/src/codex_delegate.rs","startLine":261,"endLine":402},
+  "command-input": {"file":"codex-rs/core/src/exec_policy.rs","startLine":240,"endLine":248},
+  "policy-eval": {"file":"codex-rs/core/src/exec_policy.rs","startLine":249,"endLine":473},
+  "policy-result": {"file":"codex-rs/core/src/exec_policy.rs","startLine":628,"endLine":746},
+  "deny-action": {"file":"codex-rs/core/src/exec_policy.rs","startLine":953,"endLine":981},
+  "execute-action": {"file":"codex-rs/core/src/exec.rs","startLine":1,"endLine":1571},
+  "guardian-route": {"file":"codex-rs/core/src/guardian/review.rs","startLine":168,"endLine":192},
+  "user-approval": {"file":"codex-rs/core/src/codex_delegate.rs","startLine":451,"endLine":533},
+  "review-session": {"file":"codex-rs/core/src/guardian/review_session.rs","startLine":291,"endLine":606},
+  "review-outcome": {"file":"codex-rs/core/src/guardian/review_session.rs","startLine":62,"endLine":72},
+  "record-denial": {"file":"codex-rs/core/src/guardian/review.rs","startLine":223,"endLine":263},
+  "guardian-retry": {"file":"codex-rs/core/src/guardian/review.rs","startLine":880,"endLine":900},
+  "stream-result": {"file":"codex-rs/core/src/codex_delegate.rs","startLine":420,"endLine":435},
+  "retry-choice": {"file":"codex-rs/core/src/responses_retry.rs","startLine":22,"endLine":80},
+  "response-retry": {"file":"codex-rs/core/src/responses_retry.rs","startLine":81,"endLine":106},
+  "terminal-error": {"file":"codex-rs/core/src/responses_retry.rs","startLine":15,"endLine":21}
+};
+</script>
+<aside id="source-panel"><div id="source-header"></div><div id="monaco-container"></div></aside><script src="assets/codeindex-runtime.js"></script><script src="assets/codeindex.js"></script></body></html>

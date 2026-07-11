@@ -1,0 +1,200 @@
+<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>配置、认证与模型连接</title><link rel="stylesheet" href="assets/codeindex.css"></head><body><p><a href="index.html">← 返回总览</a></p><h1>配置、认证与模型连接</h1>
+<p>用户启动 Codex 后，分层配置会被合并成一份受管理策略约束的运行时配置；系统据此选择模型服务、读取或刷新登录凭据、发现可用模型，最后把带认证信息的请求交给 HTTP/SSE 传输层。模型回合的内容构造属于上层边界，本模块停在“连接已具备发送推理请求的条件”。</p>
+<dl>
+  <dt>输入</dt>
+  <dd>系统、用户、项目、会话与命令行配置，CODEX_HOME 中的凭据或系统钥匙串，以及可选的外部认证命令</dd>
+  <dt>输出</dt>
+  <dd>确定的模型提供方、当前有效身份、可用模型元数据，以及能够访问模型或 ChatGPT 后端的认证 HTTP 客户端</dd>
+</dl>
+<p>第一段数据流决定“去哪里请求”。高优先级配置覆盖低优先级配置，但 requirements 与权限约束仍可拒绝不被允许的最终值。</p>
+<pre class="mermaid">
+graph TD
+  config-build["启动时收集配置层"] --> config-deserialize["合并并反序列化有效配置"]
+  config-deserialize --> config-lock{"是否指定配置锁?"}
+  config-lock -->|是| replay-lock["只按锁定快照重建"]
+  config-lock -->|否| validate-config["校验 provider 与互斥覆盖项"]
+  replay-lock --> validate-config
+  validate-config --> managed-constraints["应用组织 requirements 与权限约束"]
+  managed-constraints --> merge-providers["合并内置和自定义模型服务"]
+  merge-providers --> choose-provider["命令行优先，否则配置，默认 openai"]
+  choose-provider --> provider-found{"服务标识存在?"}
+  provider-found -->|否| provider-error["启动失败并指出未知服务"]
+  provider-found -->|是| runtime-config["产出不可歧义的运行时 Config"]
+</pre>
+<p>认证数据流刻意维护单一快照：运行中的各组件不会各自读取 auth.json。文件、系统钥匙串和临时外部凭据共享存储接口；自动模式会优先钥匙串，失败时回退文件。</p>
+<pre class="mermaid">
+graph TD
+  auth-manager-new["按运行时配置创建认证管理器"] --> load-auth["读取当前凭据来源"]
+  load-auth --> auth-source{"凭据来自哪里?"}
+  auth-source -->|环境 API Key| api-key-auth["形成 API Key 身份"]
+  auth-source -->|文件或钥匙串| storage-select["按 file/keyring/auto 选择存储"]
+  auth-source -->|外部宿主或命令| external-auth["建立可刷新的外部身份"]
+  storage-select --> stored-kind{"保存的身份类型?"}
+  stored-kind -->|ChatGPT OAuth| chatgpt-auth["解析账号、工作区与 token"]
+  stored-kind -->|Agent/PAT/Bedrock| specialized-auth["建立专用身份并校验范围"]
+  chatgpt-auth --> restrictions{"满足强制登录方式和工作区限制?"}
+  specialized-auth --> restrictions
+  restrictions -->|否| restriction-error["登出或拒绝启动"]
+  restrictions -->|是| cached-auth["缓存统一认证快照"]
+  api-key-auth --> cached-auth
+  external-auth --> cached-auth
+  cached-auth --> proactive{"OAuth token 接近过期?"}
+  proactive -->|否| usable-auth["返回当前身份"]
+  proactive -->|是| refresh-token["串行刷新并持久化新 token"]
+  refresh-token --> refresh-ok{"刷新成功?"}
+  refresh-ok -->|是| usable-auth
+  refresh-ok -->|临时失败| old-auth["保留旧快照供本次尝试"]
+  refresh-ok -->|永久失败| cache-failure["为该身份缓存失败，避免反复请求"]
+</pre>
+<p>请求遇到 401 时不会无限重试。受管 ChatGPT 身份先从存储重载一次，再走 OAuth 刷新；外部身份只通知宿主或重跑认证命令一次；API Key 与不可刷新的个人令牌直接把错误交还上层。</p>
+<pre class="mermaid">
+graph TD
+  unauthorized["服务返回 401"] --> recovery-kind{"身份支持哪种恢复?"}
+  recovery-kind -->|受管 ChatGPT| reload-auth["按同一账号从存储重载"]
+  recovery-kind -->|外部身份| external-refresh["请求宿主或命令刷新一次"]
+  recovery-kind -->|不可刷新| auth-bubble["停止恢复并返回认证错误"]
+  reload-auth --> account-match{"账号仍相同?"}
+  account-match -->|否| auth-bubble
+  account-match -->|是| retry-after-reload["用重载快照重试"]
+  retry-after-reload --> still-401{"仍是 401?"}
+  still-401 -->|否| recovered["恢复成功"]
+  still-401 -->|是| authority-refresh["向 OAuth authority 刷新"]
+  authority-refresh --> final-retry["更新快照后最后重试"]
+  external-refresh --> final-retry
+  final-retry --> final-result{"请求成功?"}
+  final-result -->|是| recovered
+  final-result -->|否| auth-bubble
+</pre>
+<p>provider 把配置和身份组合成运行时能力。Bedrock 走专用实现；普通兼容服务按配置决定是否使用 OpenAI 身份、静态 token、环境变量或外部命令。模型目录可以由配置完全固定，也可以在 bundled、磁盘缓存与远程 /models 之间协调。</p>
+<pre class="mermaid">
+graph TD
+  build-manager["线程启动时建立模型管理器"] --> provider-type{"是否为 Amazon Bedrock?"}
+  provider-type -->|是| bedrock-provider["创建 Bedrock provider 与 AWS 认证"]
+  provider-type -->|否| configured-provider["创建配置驱动 provider"]
+  configured-provider --> provider-auth{"该服务要求何种认证?"}
+  provider-auth -->|OpenAI 登录| shared-auth["复用 AuthManager 快照"]
+  provider-auth -->|静态/环境/命令 token| bearer-auth["建立 provider 专属 bearer 来源"]
+  provider-auth -->|无需认证| no-auth["使用空认证提供器"]
+  bedrock-provider --> catalog-mode
+  shared-auth --> catalog-mode{"配置是否给出完整模型目录?"}
+  bearer-auth --> catalog-mode
+  no-auth --> catalog-mode
+  catalog-mode -->|是| static-catalog["使用权威静态目录"]
+  catalog-mode -->|否| remote-manager["创建远程模型管理器"]
+  remote-manager --> refresh-policy{"刷新策略?"}
+  refresh-policy -->|Offline| load-cache["只尝试新鲜磁盘缓存"]
+  refresh-policy -->|OnlineIfUncached| cache-first["缓存命中则使用，否则联网"]
+  refresh-policy -->|Online| fetch-models["带 provider 认证请求 /models"]
+  cache-first --> fetch-models
+  fetch-models --> merge-catalog{"ChatGPT 且远端含可见模型?"}
+  merge-catalog -->|是| remote-authoritative["远端目录作为唯一真相"]
+  merge-catalog -->|否| merge-bundled["按 slug 覆盖 bundled 目录"]
+  remote-authoritative --> persist-cache["保存目录、ETag 与客户端版本"]
+  merge-bundled --> persist-cache
+  load-cache --> picker-filter["按身份和可见性生成可选模型"]
+  static-catalog --> picker-filter
+  persist-cache --> picker-filter
+</pre>
+<p>最终通信边界分为两类：ChatGPT 后端客户端负责路径风格、账号/FedRAMP 等业务头；通用 Codex 客户端负责代理、自定义 CA、压缩、trace 头、普通响应和 SSE 字节流。两者都从统一认证提供器注入 Authorization，避免业务调用点复制 token 逻辑。</p>
+<pre class="mermaid">
+graph TD
+  inference-boundary["上层提交已构造的模型请求"] --> client-kind{"目标是哪个服务面?"}
+  client-kind -->|ChatGPT backend| backend-client["规范化 backend-api 基址与路径"]
+  client-kind -->|模型 Responses API| request-builder["构造方法、URL、头和 JSON 请求体"]
+  backend-client --> backend-headers["注入 bearer、账号、FedRAMP 与 User-Agent"]
+  request-builder --> transport-config["应用系统代理、自定义 CA、Cookie 与 trace"]
+  backend-headers --> network-call["发起 HTTPS 请求"]
+  transport-config --> network-call
+  network-call --> status-ok{"HTTP 状态成功?"}
+  status-ok -->|否| transport-error["保留状态、响应头与错误正文"]
+  status-ok -->|普通响应| response-bytes["读取完整响应字节"]
+  status-ok -->|流式响应| byte-stream["保持异步字节流"]
+  byte-stream --> sse-decode["按 SSE 帧持续解码事件"]
+  sse-decode --> model-turn-boundary["交回上层模型回合处理"]
+  response-bytes --> model-turn-boundary
+</pre>
+<ul>
+  <li>权限边界：managed requirements 在 Config 形成前约束用户选择；登录方式与 ChatGPT workspace 也可被组织配置强制限定。</li>
+  <li>秘密边界：认证调试输出不暴露 token；钥匙串模式把长期凭据交给操作系统，外部 bearer 可只存在于进程内。</li>
+  <li>缓存边界：模型缓存以客户端版本和 TTL 判定新鲜度，并保存 ETag；当前实现注明 provider 身份尚未进入缓存资格判定。</li>
+  <li>失败策略：模型目录联网失败会保留已有目录；HTTP 非成功状态保留足够上下文供上层分类，401 恢复状态机严格有界。</li>
+</ul>
+<script>
+window.__sourceMap = {
+  "config-build":{"file":"codex-rs/core/src/config/mod.rs","startLine":1207,"endLine":1323},
+  "config-deserialize":{"file":"codex-rs/core/src/config/mod.rs","startLine":1207,"endLine":1323},
+  "config-lock":{"file":"codex-rs/core/src/config/mod.rs","startLine":1207,"endLine":1323},
+  "replay-lock":{"file":"codex-rs/core/src/config/mod.rs","startLine":1207,"endLine":1323},
+  "validate-config":{"file":"codex-rs/core/src/config/mod.rs","startLine":2668,"endLine":3581},
+  "managed-constraints":{"file":"codex-rs/core/src/config/mod.rs","startLine":2668,"endLine":3581},
+  "merge-providers":{"file":"codex-rs/core/src/config/mod.rs","startLine":2668,"endLine":3581},
+  "choose-provider":{"file":"codex-rs/core/src/config/mod.rs","startLine":2668,"endLine":3581},
+  "provider-found":{"file":"codex-rs/core/src/config/mod.rs","startLine":2668,"endLine":3581},
+  "provider-error":{"file":"codex-rs/core/src/config/mod.rs","startLine":2668,"endLine":3581},
+  "runtime-config":{"file":"codex-rs/core/src/config/mod.rs","startLine":2668,"endLine":3581},
+  "auth-manager-new":{"file":"codex-rs/login/src/auth/manager.rs","startLine":1538,"endLine":2190},
+  "load-auth":{"file":"codex-rs/login/src/auth/manager.rs","startLine":912,"endLine":991},
+  "auth-source":{"file":"codex-rs/login/src/auth/manager.rs","startLine":912,"endLine":991},
+  "api-key-auth":{"file":"codex-rs/login/src/auth/manager.rs","startLine":214,"endLine":524},
+  "storage-select":{"file":"codex-rs/login/src/auth/storage.rs","startLine":445,"endLine":491},
+  "external-auth":{"file":"codex-rs/login/src/auth/external_bearer.rs","startLine":1,"endLine":184},
+  "stored-kind":{"file":"codex-rs/login/src/auth/manager.rs","startLine":912,"endLine":991},
+  "chatgpt-auth":{"file":"codex-rs/login/src/auth/manager.rs","startLine":214,"endLine":524},
+  "specialized-auth":{"file":"codex-rs/login/src/auth/manager.rs","startLine":214,"endLine":524},
+  "restrictions":{"file":"codex-rs/login/src/auth/manager.rs","startLine":769,"endLine":865},
+  "restriction-error":{"file":"codex-rs/login/src/auth/manager.rs","startLine":769,"endLine":865},
+  "cached-auth":{"file":"codex-rs/login/src/auth/manager.rs","startLine":1538,"endLine":2190},
+  "proactive":{"file":"codex-rs/login/src/auth/manager.rs","startLine":1538,"endLine":2190},
+  "usable-auth":{"file":"codex-rs/login/src/auth/manager.rs","startLine":1538,"endLine":2190},
+  "refresh-token":{"file":"codex-rs/login/src/auth/manager.rs","startLine":1538,"endLine":2190},
+  "refresh-ok":{"file":"codex-rs/login/src/auth/manager.rs","startLine":1538,"endLine":2190},
+  "old-auth":{"file":"codex-rs/login/src/auth/manager.rs","startLine":1538,"endLine":2190},
+  "cache-failure":{"file":"codex-rs/login/src/auth/manager.rs","startLine":1538,"endLine":2190},
+  "unauthorized":{"file":"codex-rs/login/src/auth/manager.rs","startLine":1313,"endLine":1478},
+  "recovery-kind":{"file":"codex-rs/login/src/auth/manager.rs","startLine":1313,"endLine":1478},
+  "reload-auth":{"file":"codex-rs/login/src/auth/manager.rs","startLine":1313,"endLine":1478},
+  "external-refresh":{"file":"codex-rs/login/src/auth/manager.rs","startLine":1313,"endLine":1478},
+  "auth-bubble":{"file":"codex-rs/login/src/auth/manager.rs","startLine":1313,"endLine":1478},
+  "account-match":{"file":"codex-rs/login/src/auth/manager.rs","startLine":1313,"endLine":1478},
+  "retry-after-reload":{"file":"codex-rs/login/src/auth/manager.rs","startLine":1313,"endLine":1478},
+  "still-401":{"file":"codex-rs/login/src/auth/manager.rs","startLine":1313,"endLine":1478},
+  "authority-refresh":{"file":"codex-rs/login/src/auth/manager.rs","startLine":1313,"endLine":1478},
+  "final-retry":{"file":"codex-rs/login/src/auth/manager.rs","startLine":1313,"endLine":1478},
+  "final-result":{"file":"codex-rs/login/src/auth/manager.rs","startLine":1313,"endLine":1478},
+  "recovered":{"file":"codex-rs/login/src/auth/manager.rs","startLine":1313,"endLine":1478},
+  "build-manager":{"file":"codex-rs/core/src/thread_manager.rs","startLine":225,"endLine":234},
+  "provider-type":{"file":"codex-rs/model-provider/src/provider.rs","startLine":188,"endLine":197},
+  "bedrock-provider":{"file":"codex-rs/model-provider/src/amazon_bedrock/mod.rs","startLine":36,"endLine":294},
+  "configured-provider":{"file":"codex-rs/model-provider/src/provider.rs","startLine":201,"endLine":318},
+  "provider-auth":{"file":"codex-rs/model-provider/src/provider.rs","startLine":201,"endLine":318},
+  "shared-auth":{"file":"codex-rs/model-provider/src/auth.rs","startLine":1,"endLine":168},
+  "bearer-auth":{"file":"codex-rs/model-provider/src/bearer_auth_provider.rs","startLine":1,"endLine":110},
+  "no-auth":{"file":"codex-rs/model-provider/src/auth.rs","startLine":1,"endLine":168},
+  "catalog-mode":{"file":"codex-rs/model-provider/src/provider.rs","startLine":201,"endLine":318},
+  "static-catalog":{"file":"codex-rs/models-manager/src/manager.rs","startLine":410,"endLine":441},
+  "remote-manager":{"file":"codex-rs/models-manager/src/manager.rs","startLine":213,"endLine":231},
+  "refresh-policy":{"file":"codex-rs/models-manager/src/manager.rs","startLine":275,"endLine":408},
+  "load-cache":{"file":"codex-rs/models-manager/src/manager.rs","startLine":275,"endLine":408},
+  "cache-first":{"file":"codex-rs/models-manager/src/manager.rs","startLine":275,"endLine":408},
+  "fetch-models":{"file":"codex-rs/models-manager/src/manager.rs","startLine":275,"endLine":408},
+  "merge-catalog":{"file":"codex-rs/models-manager/src/manager.rs","startLine":275,"endLine":408},
+  "remote-authoritative":{"file":"codex-rs/models-manager/src/manager.rs","startLine":275,"endLine":408},
+  "merge-bundled":{"file":"codex-rs/models-manager/src/manager.rs","startLine":275,"endLine":408},
+  "persist-cache":{"file":"codex-rs/models-manager/src/cache.rs","startLine":1,"endLine":183},
+  "picker-filter":{"file":"codex-rs/models-manager/src/manager.rs","startLine":79,"endLine":189},
+  "inference-boundary":{"file":"codex-rs/core/src/client.rs","startLine":367,"endLine":397},
+  "client-kind":{"file":"codex-rs/core/src/client.rs","startLine":367,"endLine":397},
+  "backend-client":{"file":"codex-rs/backend-client/src/client.rs","startLine":148,"endLine":948},
+  "request-builder":{"file":"codex-rs/codex-client/src/request.rs","startLine":86,"endLine":323},
+  "backend-headers":{"file":"codex-rs/backend-client/src/client.rs","startLine":148,"endLine":948},
+  "transport-config":{"file":"codex-rs/codex-client/src/default_client.rs","startLine":21,"endLine":142},
+  "network-call":{"file":"codex-rs/codex-client/src/transport.rs","startLine":96,"endLine":162},
+  "status-ok":{"file":"codex-rs/codex-client/src/transport.rs","startLine":96,"endLine":162},
+  "transport-error":{"file":"codex-rs/codex-client/src/transport.rs","startLine":96,"endLine":162},
+  "response-bytes":{"file":"codex-rs/codex-client/src/transport.rs","startLine":96,"endLine":162},
+  "byte-stream":{"file":"codex-rs/codex-client/src/transport.rs","startLine":96,"endLine":162},
+  "sse-decode":{"file":"codex-rs/codex-client/src/sse.rs","startLine":12,"endLine":48},
+  "model-turn-boundary":{"file":"codex-rs/core/src/client.rs","startLine":367,"endLine":397}
+};
+</script>
+<aside id="source-panel"><div id="source-header"></div><div id="monaco-container"></div></aside><script src="assets/codeindex-runtime.js"></script><script src="assets/codeindex.js"></script></body></html>
